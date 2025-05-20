@@ -161,16 +161,15 @@ def verify_browser():
         logger.error(f"Error in verify_browser: {str(e)}", exc_info=True)
         return True
 
-def proof_of_work(challenge):
+def proof_of_work(challenge, nonce):
     try:
-        nonce = request.form.get('pow_nonce')
         if not nonce:
             logger.warning("No PoW nonce provided")
             return False
         hash_input = f"{challenge}{nonce}".encode()
         digest = hashlib.sha256(hash_input).hexdigest()
         result = digest.startswith('0000')
-        logger.debug(f"PoW result: {result} for challenge: {challenge[:10]}...")
+        logger.debug(f"PoW verification: challenge={challenge[:10]}..., nonce={nonce}, hash={digest[:10]}..., result={result}")
         return result
     except Exception as e:
         logger.error(f"Error in proof_of_work: {str(e)}", exc_info=True)
@@ -542,25 +541,52 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                     <script>
                         async function computePoW(challenge) {
                             let nonce = 0;
-                            while (true) {
-                                let hash = new TextEncoder().encode(challenge + nonce);
-                                let digest = await crypto.subtle.digest('SHA-256', hash);
-                                let hex = Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
-                                if (hex.startsWith('0000')) return nonce;
-                                nonce++;
-                                if (nonce > 1000000) break;
+                            try {
+                                while (true) {
+                                    let hashInput = challenge + nonce.toString();
+                                    let encoder = new TextEncoder();
+                                    let data = encoder.encode(hashInput);
+                                    let hashBuffer = await crypto.subtle.digest('SHA-256', data);
+                                    let hashArray = Array.from(new Uint8Array(hashBuffer));
+                                    let hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+                                    if (hashHex.startsWith('0000')) {
+                                        console.log('PoW computed: nonce=' + nonce + ', hash=' + hashHex);
+                                        return nonce;
+                                    }
+                                    nonce++;
+                                    if (nonce > 1000000) {
+                                        console.error('PoW computation failed: max iterations reached');
+                                        break;
+                                    }
+                                }
+                            } catch (e) {
+                                console.error('PoW computation error: ' + e.message);
                             }
-                            return nonce;
+                            return null;
                         }
                         async function verify() {
-                            let nonce = await computePoW('{{ challenge }}');
-                            fetch('/verify', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                                body: 'pow_nonce=' + nonce + '&challenge={{ challenge }}'
-                            }).then(response => {
-                                if (response.ok) window.location.reload();
-                            });
+                            try {
+                                let nonce = await computePoW('{{ challenge }}');
+                                if (!nonce) {
+                                    alert('Verification failed. Please try again.');
+                                    return;
+                                }
+                                let response = await fetch('/verify', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                                    body: 'pow_nonce=' + nonce + '&challenge={{ challenge }}'
+                                });
+                                if (response.ok) {
+                                    console.log('Verification successful, reloading...');
+                                    window.location.reload();
+                                } else {
+                                    console.error('Verification failed: ' + response.status);
+                                    alert('Verification failed. Please try again.');
+                                }
+                            } catch (e) {
+                                console.error('Verification error: ' + e.message);
+                                alert('Verification error. Please try again.');
+                            }
                         }
                     </script>
                 </head>
@@ -639,8 +665,17 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
 def verify():
     try:
         challenge = request.form.get('challenge')
-        if redis_client and redis_client.exists(f"pow:{challenge}") and proof_of_work(challenge):
+        nonce = request.form.get('pow_nonce')
+        logger.debug(f"Verify accessed: challenge={challenge[:10]}..., nonce={nonce}")
+        if not challenge or not nonce:
+            logger.warning("Missing challenge or nonce")
+            return {"status": "denied"}, 403
+        if redis_client and not redis_client.exists(f"pow:{challenge}"):
+            logger.warning(f"PoW challenge not found: {challenge[:10]}...")
+            return {"status": "denied"}, 403
+        if proof_of_work(challenge, nonce):
             fingerprint = generate_fingerprint()
+            session['js_verified'] = True
             if redis_client:
                 redis_client.setex(f"browser:{fingerprint}", 3600, 1)
                 redis_client.delete(f"pow:{challenge}")

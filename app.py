@@ -25,7 +25,7 @@ logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler()  # Ensure logs go to stdout for Vercel
+        logging.StreamHandler()  # Ensure logs go to Vercel
     ]
 )
 logger = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", secrets.token_urlsafe(16))
 MAXMIND_KEY = os.environ.get("MAXMIND_KEY", "")
 BASE_DOMAIN = "nvclerks.com"
 
-# Log environment variables (mask sensitive values)
+# Log environment variables
 logger.debug(f"ENCRYPTION_KEY: {'set' if ENCRYPTION_KEY else 'not set'}")
 logger.debug(f"HMAC_KEY: {'set' if HMAC_KEY else 'not set'}")
 logger.debug(f"REDIS_URL: {REDIS_URL[:50]}...")
@@ -66,7 +66,7 @@ try:
     logger.debug("Redis connection established successfully")
 except Exception as e:
     logger.error(f"Redis connection failed: {str(e)}", exc_info=True)
-    redis_client = None  # Fallback to avoid crashes
+    redis_client = None
 
 # Bot detection
 BOT_PATTERNS = [
@@ -126,7 +126,7 @@ def rate_limit(limit=10, per=60):
                 return f(*args, **kwargs)
             except Exception as e:
                 logger.error(f"Error in rate_limit: {str(e)}", exc_info=True)
-                return f(*args, **kwargs)  # Proceed without rate limiting
+                return f(*args, **kwargs)
         return wrapped_function
     return decorator
 
@@ -176,7 +176,7 @@ def verify_browser():
         return True
     except Exception as e:
         logger.error(f"Error in verify_browser: {str(e)}", exc_info=True)
-        return True  # Allow to proceed if Redis fails
+        return True
 
 def proof_of_work(challenge):
     try:
@@ -610,12 +610,16 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             logger.error("All decryption methods failed")
             abort(400, "Invalid payload")
 
-        data = json.loads(payload)
-        redirect_url = data.get("student_link")
-        if not redirect_url or not re.match(r"^https?://", redirect_url):
-            logger.error(f"Invalid redirect URL: {redirect_url}")
-            abort(400, "Invalid redirect URL")
-        logger.debug(f"Parsed payload: redirect_url={redirect_url}")
+        try:
+            data = json.loads(payload)
+            redirect_url = data.get("student_link")
+            if not redirect_url or not re.match(r"^https?://", redirect_url):
+                logger.error(f"Invalid redirect URL: {redirect_url}")
+                abort(400, "Invalid redirect URL")
+            logger.debug(f"Parsed payload: redirect_url={redirect_url}")
+        except Exception as e:
+            logger.error(f"Payload parsing error: {str(e)}", exc_info=True)
+            abort(400, "Invalid payload")
 
         final_url = f"{redirect_url.rstrip('/')}/{path_segment}"
         logger.info(f"Redirecting to {final_url}")

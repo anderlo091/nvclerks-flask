@@ -554,7 +554,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                                         return nonce;
                                     }
                                     nonce++;
-                                    if (nonce > 1000000) {
+                                    if (nonce > 100000) {
                                         console.error('PoW computation failed: max iterations reached');
                                         break;
                                     }
@@ -670,16 +670,20 @@ def verify():
         if not challenge or not nonce:
             logger.warning("Missing challenge or nonce")
             return {"status": "denied"}, 403
-        if redis_client and not redis_client.exists(f"pow:{challenge}"):
-            logger.warning(f"PoW challenge not found: {challenge[:10]}...")
-            return {"status": "denied"}, 403
+        # Skip Redis check if unavailable
+        if redis_client:
+            if not redis_client.exists(f"pow:{challenge}"):
+                logger.warning(f"PoW challenge not found: {challenge[:10]}...")
+                return {"status": "denied"}, 403
         if proof_of_work(challenge, nonce):
             fingerprint = generate_fingerprint()
             session['js_verified'] = True
+            session.modified = True  # Ensure session is saved
             if redis_client:
                 redis_client.setex(f"browser:{fingerprint}", 3600, 1)
                 redis_client.delete(f"pow:{challenge}")
                 logger.debug(f"PoW verified, fingerprint stored: {fingerprint[:10]}...")
+            logger.info("Verification successful")
             return {"status": "ok"}, 200
         logger.warning("Invalid PoW verification")
         return {"status": "denied"}, 403

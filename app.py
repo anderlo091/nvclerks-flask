@@ -161,20 +161,6 @@ def verify_browser():
         logger.error(f"Error in verify_browser: {str(e)}", exc_info=True)
         return True
 
-def proof_of_work(challenge, nonce):
-    try:
-        if not nonce:
-            logger.warning("No PoW nonce provided")
-            return False
-        hash_input = f"{challenge}{nonce}".encode()
-        digest = hashlib.sha256(hash_input).hexdigest()
-        result = digest.startswith('0000')
-        logger.debug(f"PoW verification: challenge={challenge[:10]}..., nonce={nonce}, hash={digest[:10]}..., result={result}")
-        return result
-    except Exception as e:
-        logger.error(f"Error in proof_of_work: {str(e)}", exc_info=True)
-        return False
-
 # Encryption Methods
 def encrypt_heap_x3(payload, fingerprint):
     try:
@@ -356,7 +342,7 @@ def index():
                     button:hover { transform: scale(1.05); }
                 </style>
             </head>
-            <body class="min-h-screen flex items-center justify-center p-4">
+            <body class="min-h-screen flex items-center justify-center食品安全p-4">
                 <div class="container bg-white p-8 rounded-xl shadow-2xl max-w-md w-full">
                     <h1 class="text-3xl font-extrabold mb-6 text-center text-gray-900">Secure URL Generator</h1>
                     <form method="POST" action="{{ url_for('generate') }}" class="space-y-5">
@@ -483,7 +469,7 @@ def generate():
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <meta name="robots" content="noindex, nofollow">
-                <title>Generated URL</title>
+                < जबtitle>Generated URL</title>
                 <script src="https://cdn.tailwindcss.com"></script>
                 <style>
                     body { background: {{ primary_color }}; }
@@ -497,7 +483,7 @@ def generate():
                     <h3 class="text-2xl font-bold mb-4 text-gray-900">Your Secure URL</h3>
                     <p class="text-gray-600 mb-4">Copy or click your generated URL below:</p>
                     <a href="{{ url }}" target="_blank" class="text-indigo-600 break-all">{{ url }}</a>
-                    <p class="mt-4 text-sm text-gray-500">This URL requires verification to access the destination.</p>
+                    <p class="mt-4 text-sm text-gray-500">This URL will redirect to the destination after a brief delay.</p>
                 </div>
             </body>
             </html>
@@ -526,87 +512,88 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
 
         if is_bot(user_agent) or check_asn(ip) or not verify_browser() or not session.get('js_verified'):
             logger.warning("Bot or unverified browser detected")
-            challenge = secrets.token_hex(16)
-            if redis_client:
-                redis_client.setex(f"pow:{challenge}", 300, "pending")
-                logger.debug(f"PoW challenge set: {challenge[:10]}...")
+            # Decode encrypted_payload for redirect
+            try:
+                encrypted_payload = urllib.parse.unquote(encrypted_payload)
+                logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}...")
+            except Exception as e:
+                logger.error(f"Error decoding encrypted_payload: {str(e)}", exc_info=True)
+                abort(400, "Invalid payload format")
+
+            # Try decryption methods
+            payload = None
+            for method in ['heap_x3', 'slugstorm', 'pow', 'signed_token']:
+                try:
+                    logger.debug(f"Trying decryption method: {method}")
+                    if method == 'heap_x3':
+                        data = decrypt_heap_x3(encrypted_payload)
+                        payload = data['payload']
+                        if data['fingerprint'] != generate_fingerprint():
+                            logger.warning("Fingerprint mismatch")
+                            continue
+                    elif method == 'slugstorm':
+                        data = decrypt_slugstorm(encrypted_payload)
+                        payload = data['payload']
+                    elif method == 'pow':
+                        payload = decrypt_pow(encrypted_payload)
+                    else:
+                        payload = decrypt_signed_token(encrypted_payload)
+                    logger.debug(f"Decryption successful with {method}")
+                    break
+                except Exception as e:
+                    logger.debug(f"Decryption failed with {method}: {str(e)}")
+                    continue
+
+            if not payload:
+                logger.error("All decryption methods failed")
+                abort(400, "Invalid payload")
+
+            try:
+                data = json.loads(payload)
+                redirect_url = data.get("student_link")
+                if not redirect_url or not re.match(r"^https?://", redirect_url):
+                    logger.error(f"Invalid redirect URL: {redirect_url}")
+                    abort(400, "Invalid redirect URL")
+                logger.debug(f"Parsed payload: redirect_url={redirect_url}")
+            except Exception as e:
+                logger.error(f"Payload parsing error: {str(e)}", exc_info=True)
+                abort(400, "Invalid payload")
+
+            # Prepare final URL
+            final_url = f"{redirect_url.rstrip('/')}/{path_segment}"
+            logger.info(f"Preparing redirect to {final_url} with 2-second delay")
+
+            # Render delay page
             return render_template_string("""
                 <!DOCTYPE html>
                 <html lang="en">
                 <head>
                     <meta charset="UTF-8">
                     <meta name="robots" content="noindex, nofollow">
-                    <title>Verification Required</title>
+                    <title>Redirecting...</title>
                     <script src="https://cdn.tailwindcss.com"></script>
                     <script>
-                        async function computePoW(challenge) {
-                            let nonce = 0;
-                            try {
-                                while (true) {
-                                    let hashInput = challenge + nonce.toString();
-                                    let encoder = new TextEncoder();
-                                    let data = encoder.encode(hashInput);
-                                    let hashBuffer = await crypto.subtle.digest('SHA-256', data);
-                                    let hashArray = Array.from(new Uint8Array(hashBuffer));
-                                    let hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-                                    if (hashHex.startsWith('0000')) {
-                                        console.log('PoW computed: nonce=' + nonce + ', hash=' + hashHex);
-                                        return nonce;
-                                    }
-                                    nonce++;
-                                    if (nonce > 100000) {
-                                        console.error('PoW computation failed: max iterations reached');
-                                        break;
-                                    }
-                                }
-                            } catch (e) {
-                                console.error('PoW computation error: ' + e.message);
-                            }
-                            return null;
-                        }
-                        async function verify() {
-                            try {
-                                let nonce = await computePoW('{{ challenge }}');
-                                if (!nonce) {
-                                    alert('Verification failed. Please try again.');
-                                    return;
-                                }
-                                let response = await fetch('/verify', {
-                                    method: 'POST',
-                                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                                    body: 'pow_nonce=' + nonce + '&challenge={{ challenge }}'
-                                });
-                                if (response.ok) {
-                                    console.log('Verification successful, reloading...');
-                                    window.location.reload();
-                                } else {
-                                    console.error('Verification failed: ' + response.status);
-                                    alert('Verification failed. Please try again.');
-                                }
-                            } catch (e) {
-                                console.error('Verification error: ' + e.message);
-                                alert('Verification error. Please try again.');
-                            }
-                        }
+                        setTimeout(() => {
+                            console.log('Redirecting to {{ final_url }}');
+                            window.location.href = '{{ final_url }}';
+                        }, 2000);
                     </script>
+                    <style>
+                        body { background: #f3f4f6; }
+                        .container { animation: fadeIn 1s ease-in; }
+                        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+                    </style>
                 </head>
-                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                        <h3 class="text-lg font-bold mb-4 text-gray-900">Human Verification</h3>
-                        <p class="text-gray-600 mb-4">Please verify you're not a bot.</p>
-                        <button onclick="verify()" class="bg-indigo-600 text-white p-3 rounded-lg hover:bg-indigo-700 transition transform hover:scale-105">Verify Now</button>
+                <body class="min-h-screen flex items-center justify-center p-4">
+                    <div class="container bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-gray-900">Redirecting...</h3>
+                        <p class="text-gray-600">You will be redirected to your destination in 2 seconds.</p>
                     </div>
                 </body>
                 </html>
-            """, challenge=challenge)
+            """, final_url=final_url)
 
-        # Flexible path_segment parsing (no strict validation)
-        randomstring1_short = path_segment[:6] if len(path_segment) >= 6 else "xxxxxx"
-        randomstring2_short = path_segment[-8:] if len(path_segment) >= 8 else "xxxxxxxx"
-        base64_email = path_segment[6:-8] if len(path_segment) > 14 else "default"
-        logger.debug(f"Parsed path_segment: randomstring1={randomstring1_short}, base64email={base64_email}, randomstring2={randomstring2_short}")
-
-        # Decode encrypted_payload
+        # Direct redirect if anti-bot checks pass
         try:
             encrypted_payload = urllib.parse.unquote(encrypted_payload)
             logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}...")
@@ -614,7 +601,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             logger.error(f"Error decoding encrypted_payload: {str(e)}", exc_info=True)
             abort(400, "Invalid payload format")
 
-        # Try decryption methods
         payload = None
         for method in ['heap_x3', 'slugstorm', 'pow', 'signed_token']:
             try:
@@ -653,43 +639,12 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             logger.error(f"Payload parsing error: {str(e)}", exc_info=True)
             abort(400, "Invalid payload")
 
-        # Pass path_segment as-is, including slashes
         final_url = f"{redirect_url.rstrip('/')}/{path_segment}"
         logger.info(f"Redirecting to {final_url}")
         return redirect(final_url, code=302)
     except Exception as e:
         logger.error(f"Internal Server Error in redirect_handler: {str(e)}", exc_info=True)
         raise
-
-@app.route("/verify", methods=["POST"])
-def verify():
-    try:
-        challenge = request.form.get('challenge')
-        nonce = request.form.get('pow_nonce')
-        logger.debug(f"Verify accessed: challenge={challenge[:10]}..., nonce={nonce}")
-        if not challenge or not nonce:
-            logger.warning("Missing challenge or nonce")
-            return {"status": "denied"}, 403
-        # Skip Redis check if unavailable
-        if redis_client:
-            if not redis_client.exists(f"pow:{challenge}"):
-                logger.warning(f"PoW challenge not found: {challenge[:10]}...")
-                return {"status": "denied"}, 403
-        if proof_of_work(challenge, nonce):
-            fingerprint = generate_fingerprint()
-            session['js_verified'] = True
-            session.modified = True  # Ensure session is saved
-            if redis_client:
-                redis_client.setex(f"browser:{fingerprint}", 3600, 1)
-                redis_client.delete(f"pow:{challenge}")
-                logger.debug(f"PoW verified, fingerprint stored: {fingerprint[:10]}...")
-            logger.info("Verification successful")
-            return {"status": "ok"}, 200
-        logger.warning("Invalid PoW verification")
-        return {"status": "denied"}, 403
-    except Exception as e:
-        logger.error(f"Error in verify: {str(e)}", exc_info=True)
-        return {"status": "error"}, 500
 
 @app.route("/denied", methods=["GET"])
 def denied():

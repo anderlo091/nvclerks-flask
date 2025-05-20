@@ -342,7 +342,7 @@ def index():
                     button:hover { transform: scale(1.05); }
                 </style>
             </head>
-            <body class="min-h-screen flex items-center justify-center食品安全p-4">
+            <body class="min-h-screen flex items-center justify-center p-4">
                 <div class="container bg-white p-8 rounded-xl shadow-2xl max-w-md w-full">
                     <h1 class="text-3xl font-extrabold mb-6 text-center text-gray-900">Secure URL Generator</h1>
                     <form method="POST" action="{{ url_for('generate') }}" class="space-y-5">
@@ -427,8 +427,9 @@ def generate():
             randomstring2 = randomstring2[:20]
             logger.debug(f"Truncated Randomstring2 to 20 chars: {randomstring2}")
 
-        # Sanitize subdomain (allow case preservation)
-        sanitized_name = re.sub(r"[^a-zA-Z0-9]", "", randomstring1) or "default"
+        # Use Randomstring1 as subdomain (case-sensitive, up to 20 chars)
+        subdomain = randomstring1 if randomstring1 else "default"
+        logger.debug(f"Using subdomain: {subdomain}")
         endpoint = generate_random_string(8)
         randomstring1_short = randomstring1[:6] if len(randomstring1) >= 6 else randomstring1 + generate_random_string(6 - len(randomstring1))
         randomstring2_short = randomstring2[:8] if len(randomstring2) >= 8 else randomstring2 + generate_random_string(8 - len(randomstring2))
@@ -456,7 +457,7 @@ def generate():
         except Exception as e:
             logger.error(f"Encryption failed with {method}: {str(e)}", exc_info=True)
             abort(500, "Failed to encrypt payload")
-        generated_url = f"https://{sanitized_name}.{BASE_DOMAIN}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
+        generated_url = f"https://{urllib.parse.quote(subdomain)}.{BASE_DOMAIN}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
         logger.info(f"Generated URL with {method}: {generated_url}")
 
         theme_seed = hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()[:6]
@@ -469,7 +470,7 @@ def generate():
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <meta name="robots" content="noindex, nofollow">
-                < जबtitle>Generated URL</title>
+                <title>Generated URL</title>
                 <script src="https://cdn.tailwindcss.com"></script>
                 <style>
                     body { background: {{ primary_color }}; }
@@ -563,33 +564,22 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             final_url = f"{redirect_url.rstrip('/')}/{path_segment}"
             logger.info(f"Preparing redirect to {final_url} with 2-second delay")
 
-            # Render delay page
+            # Render blank delay page
             return render_template_string("""
                 <!DOCTYPE html>
                 <html lang="en">
                 <head>
                     <meta charset="UTF-8">
                     <meta name="robots" content="noindex, nofollow">
-                    <title>Redirecting...</title>
-                    <script src="https://cdn.tailwindcss.com"></script>
+                    <title></title>
                     <script>
                         setTimeout(() => {
                             console.log('Redirecting to {{ final_url }}');
                             window.location.href = '{{ final_url }}';
                         }, 2000);
                     </script>
-                    <style>
-                        body { background: #f3f4f6; }
-                        .container { animation: fadeIn 1s ease-in; }
-                        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-                    </style>
                 </head>
-                <body class="min-h-screen flex items-center justify-center p-4">
-                    <div class="container bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                        <h3 class="text-lg font-bold mb-4 text-gray-900">Redirecting...</h3>
-                        <p class="text-gray-600">You will be redirected to your destination in 2 seconds.</p>
-                    </div>
-                </body>
+                <body></body>
                 </html>
             """, final_url=final_url)
 

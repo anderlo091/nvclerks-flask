@@ -3,3 +3,5 @@ cryptography==42.0.8
 gunicorn==23.0.0
 redis==5.0.8
 requests==2.32.3
+user-agents==2.2.0
+python-dotenv==1.0.1

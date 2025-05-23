@@ -46,6 +46,18 @@ MAXMIND_KEY = os.getenv("MAXMIND_KEY", "")
 USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/anderlo091/nvclerks-flask/main/user.txt")
 DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", 90))
 
+# Dynamic domain handling
+def get_base_domain():
+    try:
+        host = request.host
+        parts = host.split('.')
+        if len(parts) >= 2:
+            return '.'.join(parts[-2:])
+        return host
+    except Exception as e:
+        logger.error(f"Error getting base domain: {str(e)}")
+        return "nvclerks.com"  # Fallback
+
 # Configuration
 try:
     app.config['SECRET_KEY'] = FLASK_SECRET_KEY
@@ -102,6 +114,10 @@ BOT_PATTERNS = ["googlebot", "bingbot", "yandex", "duckduckbot", "curl/", "wget/
 
 def is_bot(user_agent, headers, ip):
     try:
+        # Allow authenticated users
+        if 'username' in session:
+            logger.debug(f"IP {ip} is authenticated, skipping bot check")
+            return False, "Authenticated user"
         if not user_agent:
             logger.warning(f"Blocked IP {ip}: No User-Agent provided")
             return True, "Missing User-Agent"
@@ -110,13 +126,6 @@ def is_bot(user_agent, headers, ip):
             if pattern in user_agent_lower:
                 logger.warning(f"Blocked IP {ip}: Known bot pattern {pattern}")
                 return True, f"Known bot: {pattern}"
-        if not headers.get('Accept') or not headers.get('Referer'):
-            logger.warning(f"Blocked IP {ip}: Missing browser headers")
-            return True, "Missing browser headers"
-        ua = parse(user_agent)
-        if ua.is_mobile and 'X-Desktop' in headers:
-            logger.warning(f"Blocked IP {ip}: Mobile UA with desktop headers")
-            return True, "Mimicry: Mobile UA with desktop headers"
         if 'HeadlessChrome' in user_agent or 'PhantomJS' in user_agent:
             logger.warning(f"Blocked IP {ip}: Headless browser detected")
             return True, "Headless browser"
@@ -385,6 +394,7 @@ def login_required(f):
         if 'username' not in session:
             logger.debug(f"Redirecting to login from {request.url}, session: {session}")
             return redirect(url_for('login', next=request.url))
+        logger.debug(f"Authenticated user: {session['username']}, session: {session}")
         return f(*args, **kwargs)
     return decorated_function
 
@@ -680,6 +690,7 @@ def dashboard():
         theme_seed = hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()[:6]
         primary_color = f"#{theme_seed}"
 
+        logger.debug(f"Rendering dashboard template for user: {username}")
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">

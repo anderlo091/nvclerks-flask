@@ -446,15 +446,9 @@ def generate():
             logger.error(f"Invalid base64email: {base64email}")
             abort(400, "Base64email must be 2-100 characters (letters or numbers)")
 
-        # Use inputs as entered (case-sensitive, no truncation)
-        subdomain = subdomain
-        # Use first 6 characters for randomstring1_short, pad if needed
-        randomstring1_short = randomstring1[:6] if len(randomstring1) >= 6 else randomstring1 + generate_random_string(6 - len(randomstring1))
-        # Use first 8 characters for randomstring2_short, pad if needed
-        randomstring2_short = randomstring2[:8] if len(randomstring2) >= 8 else randomstring2 + generate_random_string(8 - len(randomstring2))
+        # Use full inputs for path_segment (case-sensitive, no truncation)
         base64_email = base64email  # Use as-is without encoding
-        # Use full randomstring1 and randomstring2 in path_segment if needed, but here we use short versions
-        path_segment = f"{randomstring1_short}{base64_email}{randomstring2_short}"
+        path_segment = f"{randomstring1}{base64_email}{randomstring2}"
 
         endpoint = generate_random_string(8)
         encryption_methods = ['heap_x3', 'slugstorm', 'pow', 'signed_token']
@@ -463,8 +457,8 @@ def generate():
         payload = json.dumps({
             "student_link": destination_link,
             "timestamp": int(time.time() * 1000),
-            "randomstring1": randomstring1,  # Store full string
-            "randomstring2": randomstring2   # Store full string
+            "randomstring1": randomstring1,
+            "randomstring2": randomstring2
         })
 
         logger.debug(f"Selected encryption method: {method}")

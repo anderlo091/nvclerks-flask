@@ -81,23 +81,19 @@ def is_bot(user_agent, headers):
             logger.warning("No User-Agent provided")
             return True, "Missing User-Agent"
         user_agent = user_agent.lower()
-        # Basic bot patterns
         for pattern in BOT_PATTERNS:
             if pattern in user_agent:
                 return True, f"Known bot: {pattern}"
-        # Header analysis
         if not headers.get('Accept') or not headers.get('Referer'):
             return True, "Missing browser headers"
-        # Mimicry detection
         ua = parse(user_agent)
         if ua.is_mobile and 'X-Desktop' in headers:
             return True, "Mimicry: Mobile UA with desktop headers"
-        # Rapid request detection
         if redis_client:
             ip = request.remote_addr
             key = f"bot_check:{ip}"
             count = redis_client.get(key)
-            if count and int(count) > 10:  # More than 10 requests in 60s
+            if count and int(count) > 10:
                 return True, "Rapid requests"
             redis_client.incr(key)
             redis_client.expire(key, 60)
@@ -114,7 +110,7 @@ def check_asn(ip):
         response = requests.get(f"https://api.maxmind.com/v2.0/asn/{ip}?apiKey={MAXMIND_KEY}")
         response.raise_for_status()
         asn = response.json().get('asn', 0)
-        blocked_asns = [16509, 14618, 8075, 14061, 16276]  # Example ASNs
+        blocked_asns = [16509, 14618, 8075, 14061, 16276]
         result = asn in blocked_asns
         logger.debug(f"ASN check for IP {ip}: ASN {asn}, Blocked: {result}")
         return result
@@ -341,6 +337,7 @@ def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'username' not in session:
+            logger.debug(f"Redirecting to login from {request.url}")
             return redirect(url_for('login', next=request.url))
         return f(*args, **kwargs)
     return decorated_function
@@ -349,6 +346,7 @@ def login_required(f):
 @rate_limit(limit=5, per=60)
 def login():
     try:
+        logger.debug(f"Accessing /login, method: {request.method}, next: {request.args.get('next', '')}")
         if request.method == "POST":
             username = request.form.get("username", "").strip()
             valid_usernames = get_valid_usernames()
@@ -357,6 +355,7 @@ def login():
                 session.modified = True
                 logger.debug(f"User {username} logged in")
                 next_url = request.form.get('next') or url_for('dashboard')
+                logger.debug(f"Redirecting to {next_url}")
                 return redirect(next_url)
             logger.warning(f"Invalid login attempt: {username}")
             return render_template_string("""
@@ -428,8 +427,11 @@ def login():
 @rate_limit(limit=5, per=60)
 def index():
     try:
+        logger.debug(f"Accessing root URL, session: {'username' in session}")
         if 'username' in session:
+            logger.debug(f"User {session['username']} redirecting to dashboard")
             return redirect(url_for('dashboard'))
+        logger.debug("No user session, redirecting to login")
         return redirect(url_for('login'))
     except Exception as e:
         logger.error(f"Error in index: {str(e)}", exc_info=True)
@@ -441,6 +443,7 @@ def index():
 def dashboard():
     try:
         username = session['username']
+        logger.debug(f"Accessing dashboard for user: {username}")
         error = None
         if request.method == "POST":
             subdomain = request.form.get("subdomain", "default")

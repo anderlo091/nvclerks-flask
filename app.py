@@ -97,6 +97,17 @@ except Exception as e:
     logger.error(f"Valkey connection failed: {str(e)}", exc_info=True)
     valkey_client = None
 
+# Custom Jinja2 filter for datetime
+def datetime_filter(timestamp):
+    try:
+        return datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+    except (TypeError, ValueError) as e:
+        logger.error(f"Error formatting timestamp: {str(e)}")
+        return "Unknown"
+
+# Register the filter
+app.jinja_env.filters['datetime'] = datetime_filter
+
 # Bot detection patterns
 BOT_PATTERNS = ["googlebot", "bingbot", "yandex", "duckduckbot", "curl/", "wget/"]
 
@@ -346,6 +357,7 @@ def get_valid_usernames():
         if valkey_client:
             cached = valkey_client.get("usernames")
             if cached:
+                logger.debug("Retrieved usernames from Valkey cache")
                 return json.loads(cached)
         response = requests.get(USER_TXT_URL)
         response.raise_for_status()
@@ -353,6 +365,7 @@ def get_valid_usernames():
         if valkey_client:
             try:
                 valkey_client.setex("usernames", 3600, json.dumps(usernames))
+                logger.debug("Cached usernames in Valkey")
             except Exception as e:
                 logger.error(f"Valkey error caching usernames: {str(e)}")
         logger.debug(f"Fetched {len(usernames)} usernames from GitHub")
@@ -584,7 +597,9 @@ def dashboard():
         valkey_error = None
         if valkey_client:
             try:
+                logger.debug(f"Fetching URL keys for user: {username}")
                 url_keys = valkey_client.keys(f"user:{username}:url:*")
+                logger.debug(f"Found {len(url_keys)} URL keys")
                 for key in url_keys:
                     try:
                         url_data = valkey_client.hgetall(key)
@@ -844,6 +859,7 @@ def export(index):
         username = session['username']
         if valkey_client:
             try:
+                logger.debug(f"Fetching URL keys for export, user: {username}")
                 url_keys = valkey_client.keys(f"user:{username}:url:*")
                 if index <= 0 or index > len(url_keys):
                     abort(404, "URL not found")
@@ -870,6 +886,7 @@ def export(index):
                         visit.get('location', {}).get('city', 'Unknown')
                     ])
                 output.seek(0)
+                logger.debug(f"Exported CSV for URL ID: {url_id}")
                 return Response(
                     output.getvalue(),
                     mimetype='text/csv',
@@ -895,6 +912,7 @@ def export(index):
                     </html>
                 """), 500
         else:
+            logger.warning("Valkey unavailable for export")
             return render_template_string("""
                 <!DOCTYPE html>
                 <html lang="en">
@@ -1009,6 +1027,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                     "location": location
                 }))
                 valkey_client.expire(f"user:{username}:url:{url_id}:visits", DATA_RETENTION_DAYS * 86400)
+                logger.debug(f"Logged visit for URL ID: {url_id}")
             except Exception as e:
                 logger.error(f"Valkey error logging visit: {str(e)}")
 

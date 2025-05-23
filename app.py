@@ -38,10 +38,10 @@ logger.debug("Initializing Flask app")
 FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", secrets.token_bytes(32))
 HMAC_KEY = os.getenv("HMAC_KEY", secrets.token_bytes(32))
-REDIS_HOST = os.getenv("REDIS_HOST", "redis-13362.c322.us-east-1-2.ec2.redns.redis-cloud.com")
-REDIS_PORT = int(os.getenv("REDIS_PORT", 13362))
+REDIS_HOST = os.getenv("REDIS_HOST", "valkey-137d99b9-reign.e.aivencloud.com")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 25708))
 REDIS_USERNAME = os.getenv("REDIS_USERNAME", "default")
-REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "iKYTtl8xj5TNkEBp02Wfg8JfKsJvzqSZ")
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "AVNS_Yzfa75IOznjCrZJIyzI")
 MAXMIND_KEY = os.getenv("MAXMIND_KEY", "")
 USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/anderlo091/nvclerks-flask/main/user.txt")
 DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", 90))
@@ -80,7 +80,7 @@ logger.debug(f"REDIS_PASSWORD: {'set' if REDIS_PASSWORD else 'not set'}")
 logger.debug(f"MAXMIND_KEY: {'set' if MAXMIND_KEY else 'not set'}")
 logger.debug(f"USER_TXT_URL: {USER_TXT_URL}")
 
-# Redis initialization
+# Valkey initialization (Redis-compatible)
 redis_client = None
 try:
     redis_client = Redis(
@@ -92,9 +92,9 @@ try:
         ssl=True
     )
     redis_client.ping()
-    logger.debug("Redis connection established successfully")
+    logger.debug("Valkey connection established successfully")
 except Exception as e:
-    logger.error(f"Redis connection failed: {str(e)}", exc_info=True)
+    logger.error(f"Valkey connection failed: {str(e)}", exc_info=True)
     redis_client = None
 
 # Bot detection patterns
@@ -164,7 +164,7 @@ def rate_limit(limit=10, per=60):
         def wrapped_function(*args, **kwargs):
             try:
                 if not redis_client:
-                    logger.warning("Redis unavailable, skipping rate limit")
+                    logger.warning("Valkey unavailable, skipping rate limit")
                     return f(*args, **kwargs)
                 ip = request.remote_addr
                 key = f"rate_limit:{ip}:{f.__name__}"
@@ -203,7 +203,7 @@ def generate_fingerprint():
 def verify_browser():
     try:
         if not redis_client:
-            logger.warning("Redis unavailable, skipping browser verification")
+            logger.warning("Valkey unavailable, skipping browser verification")
             return True
         fingerprint = generate_fingerprint()
         session_key = f"browser:{fingerprint}"
@@ -351,7 +351,10 @@ def get_valid_usernames():
         response.raise_for_status()
         usernames = [line.strip() for line in response.text.splitlines() if line.strip()]
         if redis_client:
-            redis_client.setex("usernames", 3600, json.dumps(usernames))
+            try:
+                redis_client.setex("usernames", 3600, json.dumps(usernames))
+            except Exception as e:
+                logger.error(f"Valkey error caching usernames: {str(e)}")
         logger.debug(f"Fetched {len(usernames)} usernames from GitHub")
         return usernames
     except Exception as e:
@@ -568,7 +571,7 @@ def dashboard():
                             redis_client.expire(f"user:{username}:url:{url_id}", DATA_RETENTION_DAYS * 86400)
                             logger.info(f"Generated URL for {username}: {generated_url}")
                         except Exception as e:
-                            logger.error(f"Redis error storing URL: {str(e)}", exc_info=True)
+                            logger.error(f"Valkey error storing URL: {str(e)}", exc_info=True)
                             error = "Failed to store URL in database"
                     else:
                         error = "Database unavailable"
@@ -613,7 +616,7 @@ def dashboard():
                     except Exception as e:
                         logger.error(f"Error processing URL key {key}: {str(e)}")
             except Exception as e:
-                logger.error(f"Redis error fetching URLs: {str(e)}")
+                logger.error(f"Valkey error fetching URLs: {str(e)}")
                 redis_error = "Unable to fetch URL history due to database error"
         else:
             redis_error = "Database unavailable"
@@ -840,54 +843,75 @@ def export(index):
     try:
         username = session['username']
         if redis_client:
-            url_keys = redis_client.keys(f"user:{username}:url:*")
-            if index <= 0 or index > len(url_keys):
-                abort(404, "URL not found")
-            key = url_keys[index-1]
-            url_id = key.split(':')[-1]
-            visits = redis_client.lrange(f"user:{username}:url:{url_id}:visits", 0, -1)
-            visit_data = []
-            for v in visits:
-                try:
-                    visit_data.append(json.loads(v))
-                except json.JSONDecodeError as e:
-                    logger.error(f"Error decoding visit data: {str(e)}")
-            output = StringIO()
-            writer = csv.writer(output)
-            writer.writerow(['Timestamp', 'IP', 'Device', 'App', 'Type', 'Country', 'City'])
-            for visit in visit_data:
-                writer.writerow([
-                    datetime.fromtimestamp(visit['timestamp']).strftime('%Y-%m-%d %H:%M:%S') if visit.get('timestamp') else 'Unknown',
-                    visit.get('ip', 'Unknown'),
-                    visit.get('device', 'Unknown'),
-                    visit.get('app', 'Unknown'),
-                    visit.get('type', 'Unknown'),
-                    visit.get('location', {}).get('country', 'Unknown'),
-                    visit.get('location', {}).get('city', 'Unknown')
-                ])
-            output.seek(0)
-            return Response(
-                output.getvalue(),
-                mimetype='text/csv',
-                headers={"Content-Disposition": f"attachment;filename=visits_{url_id}.csv"}
-            )
-        return render_template_string("""
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Error</title>
-                <script src="https://cdn.tailwindcss.com"></script>
-            </head>
-            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
-                    <p class="text-gray-600">Database unavailable. Unable to export data.</p>
-                </div>
-            </body>
-            </html>
-        """), 500
+            try:
+                url_keys = redis_client.keys(f"user:{username}:url:*")
+                if index <= 0 or index > len(url_keys):
+                    abort(404, "URL not found")
+                key = url_keys[index-1]
+                url_id = key.split(':')[-1]
+                visits = redis_client.lrange(f"user:{username}:url:{url_id}:visits", 0, -1)
+                visit_data = []
+                for v in visits:
+                    try:
+                        visit_data.append(json.loads(v))
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Error decoding visit data: {str(e)}")
+                output = StringIO()
+                writer = csv.writer(output)
+                writer.writerow(['Timestamp', 'IP', 'Device', 'App', 'Type', 'Country', 'City'])
+                for visit in visit_data:
+                    writer.writerow([
+                        datetime.fromtimestamp(visit['timestamp']).strftime('%Y-%m-%d %H:%M:%S') if visit.get('timestamp') else 'Unknown',
+                        visit.get('ip', 'Unknown'),
+                        visit.get('device', 'Unknown'),
+                        visit.get('app', 'Unknown'),
+                        visit.get('type', 'Unknown'),
+                        visit.get('location', {}).get('country', 'Unknown'),
+                        visit.get('location', {}).get('city', 'Unknown')
+                    ])
+                output.seek(0)
+                return Response(
+                    output.getvalue(),
+                    mimetype='text/csv',
+                    headers={"Content-Disposition": f"attachment;filename=visits_{url_id}.csv"}
+                )
+            except Exception as e:
+                logger.error(f"Valkey error in export: {str(e)}")
+                return render_template_string("""
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Error</title>
+                        <script src="https://cdn.tailwindcss.com"></script>
+                    </head>
+                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                            <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                            <p class="text-gray-600">Database unavailable. Unable to export data.</p>
+                        </div>
+                    </body>
+                    </html>
+                """), 500
+        else:
+            return render_template_string("""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Error</title>
+                    <script src="https://cdn.tailwindcss.com"></script>
+                </head>
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                        <p class="text-gray-600">Database unavailable. Unable to export data.</p>
+                    </div>
+                </body>
+                </html>
+            """), 500
     except Exception as e:
         logger.error(f"Error in export: {str(e)}", exc_info=True)
         return render_template_string("""
@@ -930,8 +954,11 @@ def fingerprint():
         if data and 'fingerprint' in data:
             fingerprint = generate_fingerprint()
             if redis_client:
-                redis_client.setex(f"fingerprint:{fingerprint}", 3600, data['fingerprint'])
-                logger.debug(f"Fingerprint stored: {fingerprint[:10]}...")
+                try:
+                    redis_client.setex(f"fingerprint:{fingerprint}", 3600, data['fingerprint'])
+                    logger.debug(f"Fingerprint stored: {fingerprint[:10]}...")
+                except Exception as e:
+                    logger.error(f"Valkey error storing fingerprint: {str(e)}")
         return {"status": "ok"}, 200
     except Exception as e:
         logger.error(f"Error in fingerprint: {str(e)}", exc_info=True)
@@ -983,80 +1010,27 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 }))
                 redis_client.expire(f"user:{username}:url:{url_id}:visits", DATA_RETENTION_DAYS * 86400)
             except Exception as e:
-                logger.error(f"Redis error logging visit: {str(e)}")
-
-        # Decrypt payload
-        try:
-            encrypted_payload = urllib.parse.unquote(encrypted_payload)
-            logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}...")
-        except Exception as e:
-            logger.error(f"Error decoding encrypted_payload: {str(e)}", exc_info=True)
-            abort(400, "Invalid payload format")
-
-        payload = None
-        for method in ['heap_x3', 'slugstorm', 'pow', 'signed_token']:
-            try:
-                logger.debug(f"Trying decryption method: {method}")
-                if method == 'heap_x3':
-                    data = decrypt_heap_x3(encrypted_payload)
-                    payload = data['payload']
-                    if data['fingerprint'] != generate_fingerprint():
-                        logger.warning("Fingerprint mismatch")
-                        continue
-                elif method == 'slugstorm':
-                    data = decrypt_slugstorm(encrypted_payload)
-                    payload = data['payload']
-                elif method == 'pow':
-                    payload = decrypt_pow(encrypted_payload)
-                else:
-                    payload = decrypt_signed_token(encrypted_payload)
-                logger.debug(f"Decryption successful with {method}")
-                break
+                logger.info(f"Redirecting to {final_url}")
+                return redirect(final_url, code=302)
             except Exception as e:
-                logger.debug(f"Decryption failed with {method}: {str(e)}")
-                continue
-
-        if not payload:
-            logger.error("All decryption methods failed")
-            abort(400, "Invalid payload")
-
-        try:
-            data = json.loads(payload)
-            redirect_url = data.get("student_link")
-            expiry = data.get("expiry", float('inf'))
-            if not redirect_url or not re.match(r"^https?://", redirect_url):
-                logger.error(f"Invalid redirect URL: {redirect_url}")
-                abort(400, "Invalid redirect URL")
-            if time.time() > expiry:
-                logger.warning("URL expired")
-                abort(410, "URL has expired")
-            logger.debug(f"Parsed payload: redirect_url={redirect_url}")
-        except Exception as e:
-            logger.error(f"Payload parsing error: {str(e)}", exc_info=True)
-            abort(400, "Invalid payload")
-
-        final_url = f"{redirect_url.rstrip('/')}/{path_segment}"
-        logger.info(f"Redirecting to {final_url}")
-        return redirect(final_url, code=302)
-    except Exception as e:
-        logger.error(f"Error in redirect_handler: {str(e)}", exc_info=True)
-        return render_template_string("""
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Internal Server Error</title>
-                <script src="https://cdn.tailwindcss.com"></script>
-            </head>
-            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
-                </div>
-            </body>
-            </html>
-        """), 500
+                logger.error(f"Error in redirect_handler: {str(e)}", exc_info=True)
+                return render_template_string("""
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Internal Server Error</title>
+                        <script src="https://cdn.tailwindcss.com"></script>
+                    </head>
+                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                            <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                            <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                        </div>
+                    </body>
+                    </html>
+                """), 500
 
 @app.route("/denied", methods=["GET"])
 def denied():

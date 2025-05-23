@@ -46,24 +46,13 @@ MAXMIND_KEY = os.getenv("MAXMIND_KEY", "")
 USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/anderlo091/nvclerks-flask/main/user.txt")
 DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", 90))
 
-# Dynamic domain handling
-def get_base_domain():
-    try:
-        host = request.host
-        parts = host.split('.')
-        if len(parts) >= 2:
-            return '.'.join(parts[-2:])
-        return host
-    except Exception as e:
-        logger.error(f"Error getting base domain: {str(e)}")
-        return "nvclerks.com"  # Fallback
-
 # Configuration
 try:
     app.config['SECRET_KEY'] = FLASK_SECRET_KEY
     app.config['SESSION_COOKIE_HTTPONLY'] = True
     app.config['SESSION_COOKIE_SECURE'] = True
     app.config['SESSION_COOKIE_SAMESITE'] = 'Strict'
+    app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=1)
     logger.debug("Flask configuration set successfully")
 except Exception as e:
     logger.error(f"Error setting Flask config: {str(e)}", exc_info=True)
@@ -156,7 +145,7 @@ def check_asn(ip):
         response = requests.get(f"https://api.maxmind.com/v2.0/asn/{ip}?apiKey={MAXMIND_KEY}")
         response.raise_for_status()
         asn = response.json().get('asn', 0)
-        blocked_asns = [16509, 14618, 8075, 14061, 16276]  # Example: AWS, Microsoft, etc.
+        blocked_asns = [16509, 14618, 8075, 14061, 16276]
         result = asn in blocked_asns
         logger.debug(f"ASN check for IP {ip}: ASN {asn}, Blocked: {result}")
         return result
@@ -394,7 +383,7 @@ def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'username' not in session:
-            logger.debug(f"Redirecting to login from {request.url}")
+            logger.debug(f"Redirecting to login from {request.url}, session: {session}")
             return redirect(url_for('login', next=request.url))
         return f(*args, **kwargs)
     return decorated_function
@@ -403,14 +392,16 @@ def login_required(f):
 @rate_limit(limit=5, per=60)
 def login():
     try:
-        logger.debug(f"Accessing /login, method: {request.method}, next: {request.args.get('next', '')}")
+        logger.debug(f"Accessing /login, method: {request.method}, next: {request.args.get('next', '')}, session: {session}")
         if request.method == "POST":
             username = request.form.get("username", "").strip()
+            logger.debug(f"Login attempt with username: {username}")
             valid_usernames = get_valid_usernames()
             if username in valid_usernames:
                 session['username'] = username
+                session.permanent = True
                 session.modified = True
-                logger.debug(f"User {username} logged in")
+                logger.debug(f"User {username} logged in, session: {session}")
                 next_url = request.form.get('next') or url_for('dashboard')
                 logger.debug(f"Redirecting to {next_url}")
                 return redirect(next_url)
@@ -425,7 +416,7 @@ def login():
                     <title>Login</title>
                     <script src="https://cdn.tailwindcss.com"></script>
                     <style>
-                        body { background: #f3f4f6; }
+                        body { background: linear-gradient(to right, #4f46e5, #7c3aed); }
                         .container { animation: fadeIn 1s ease-in; }
                         @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
                     </style>
@@ -456,7 +447,7 @@ def login():
                 <title>Login</title>
                 <script src="https://cdn.tailwindcss.com"></script>
                 <style>
-                    body { background: #f3f4f6; }
+                    body { background: linear-gradient(to right, #4f46e5, #7c3aed); }
                     .container { animation: fadeIn 1s ease-in; }
                     @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
                 </style>
@@ -533,9 +524,10 @@ def dashboard():
     try:
         username = session['username']
         base_domain = get_base_domain()
-        logger.debug(f"Accessing dashboard for user: {username}, base_domain: {base_domain}")
+        logger.debug(f"Accessing dashboard for user: {username}, base_domain: {base_domain}, session: {session}")
         error = None
         if request.method == "POST":
+            logger.debug(f"Form data: {request.form}")
             subdomain = request.form.get("subdomain", "default")
             randomstring1 = request.form.get("randomstring1", "default")
             base64email = request.form.get("base64email", "default")
@@ -658,7 +650,7 @@ def dashboard():
         bot_logs = []
         if valkey_client:
             try:
-                visitor_keys = valkey_client.keys(f"visitor:*")
+                visitor_keys = valkey_client.keys(f"user:{username}:visitor:*")
                 for key in visitor_keys:
                     try:
                         visitor_data = valkey_client.hgetall(key)
@@ -669,6 +661,7 @@ def dashboard():
                             "city": visitor_data.get('city', 'Unknown'),
                             "device": visitor_data.get('device', 'Unknown'),
                             "application": visitor_data.get('application', 'Unknown'),
+                            "user_agent": visitor_data.get('user_agent', 'Unknown'),
                             "bot_status": visitor_data.get('bot_status', 'Unknown'),
                             "block_reason": visitor_data.get('block_reason', 'N/A')
                         })
@@ -698,14 +691,21 @@ def dashboard():
                 <script src="https://cdn.tailwindcss.com"></script>
                 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
                 <style>
-                    body { background: #f3f4f6; color: #1f2937; }
+                    body { background: linear-gradient(to right, #4f46e5, #7c3aed); color: #1f2937; }
                     .container { animation: fadeIn 1s ease-in; }
                     @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-                    .card { transition: all 0.3s; }
-                    .card:hover { transform: scale(1.02); }
+                    .card { transition: all 0.3s; box-shadow: 0 10px 15px rgba(0,0,0,0.1); }
+                    .card:hover { transform: translateY(-5px); }
                     canvas { max-height: 200px; }
-                    .tab { cursor: pointer; }
+                    .tab { cursor: pointer; transition: all 0.3s; }
                     .tab.active { background-color: #4f46e5; color: white; }
+                    .table-container { max-height: 400px; overflow-y: auto; }
+                    table { width: 100%; border-collapse: collapse; }
+                    th, td { padding: 12px; text-align: left; }
+                    th { background: #e5e7eb; position: sticky; top: 0; }
+                    tr:nth-child(even) { background: #f9fafb; }
+                    .error { background: #fee2e2; color: #b91c1c; }
+                    .bot { background: #fee2e2; }
                 </style>
                 <script>
                     function toggleAnalytics(id) {
@@ -756,20 +756,20 @@ def dashboard():
             </head>
             <body class="min-h-screen p-4">
                 <div class="container max-w-7xl mx-auto">
-                    <h1 class="text-4xl font-extrabold mb-8 text-center text-gray-900">Welcome, {{ username }}</h1>
+                    <h1 class="text-4xl font-extrabold mb-8 text-center text-white">Welcome, {{ username }}</h1>
                     {% if error %}
-                        <p class="text-red-600 mb-4 text-center">{{ error }}</p>
+                        <p class="error p-4 mb-4 text-center rounded-lg">{{ error }}</p>
                     {% endif %}
                     {% if valkey_error %}
-                        <p class="text-yellow-600 mb-4 text-center">{{ valkey_error }}</p>
+                        <p class="error p-4 mb-4 text-center rounded-lg">{{ valkey_error }}</p>
                     {% endif %}
                     <div class="flex space-x-4 mb-4">
-                        <button class="tab px-4 py-2 bg-gray-200 rounded-lg active" onclick="showTab('urls-tab')">URLs</button>
-                        <button class="tab px-4 py-2 bg-gray-200 rounded-lg" onclick="showTab('visitors-tab')">Visitor Views</button>
-                        <button class="tab px-4 py-2 bg-gray-200 rounded-lg" onclick="showTab('bot-logs-tab')">Bot Logs</button>
+                        <button class="tab px-4 py-2 bg-white rounded-lg active" onclick="showTab('urls-tab')">URLs</button>
+                        <button class="tab px-4 py-2 bg-white rounded-lg" onclick="showTab('visitors-tab')">Visitor Views</button>
+                        <button class="tab px-4 py-2 bg-white rounded-lg" onclick="showTab('bot-logs-tab')">Bot Logs</button>
                     </div>
                     <div id="urls-tab" class="tab-content">
-                        <div class="bg-white p-8 rounded-xl shadow-2xl mb-8">
+                        <div class="bg-white p-8 rounded-xl card mb-8">
                             <h2 class="text-2xl font-bold mb-6 text-gray-900">Generate New URL</h2>
                             <form method="POST" class="space-y-5">
                                 <div>
@@ -804,7 +804,7 @@ def dashboard():
                                 <button type="submit" class="w-full bg-indigo-600 text-white p-3 rounded-lg hover:bg-indigo-700 transition">Generate URL</button>
                             </form>
                         </div>
-                        <div class="bg-white p-8 rounded-xl shadow-2xl">
+                        <div class="bg-white p-8 rounded-xl card">
                             <h2 class="text-2xl font-bold mb-6 text-gray-900">URL History</h2>
                             {% if urls %}
                                 {% for url in urls %}
@@ -859,30 +859,32 @@ def dashboard():
                                                 </select>
                                             </div>
                                             <a href="/export/{{ loop.index }}" class="mt-4 inline-block bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export as CSV</a>
-                                            <table id="visits-{{ loop.index }}" class="mt-4 w-full text-left border-collapse">
-                                                <thead>
-                                                    <tr class="bg-gray-200">
-                                                        <th class="p-2">Timestamp</th>
-                                                        <th class="p-2">IP</th>
-                                                        <th class="p-2">Device</th>
-                                                        <th class="p-2">App</th>
-                                                        <th class="p-2">Type</th>
-                                                        <th class="p-2">Location</th>
-                                                    </tr>
-                                                </thead>
-                                                <tbody>
-                                                    {% for visit in url.visits %}
-                                                        <tr class="{% if visit.type != 'Human' %}bg-red-100{% endif %}">
-                                                            <td class="p-2">{{ visit.timestamp|datetime }}</td>
-                                                            <td class="p-2">{{ visit.ip }}</td>
-                                                            <td class="p-2">{{ visit.device }}</td>
-                                                            <td class="p-2">{{ visit.app }}</td>
-                                                            <td class="p-2">{{ visit.type }}</td>
-                                                            <td class="p-2">{{ visit.location.country }}, {{ visit.location.city }}</td>
+                                            <div class="table-container mt-4">
+                                                <table>
+                                                    <thead>
+                                                        <tr class="bg-gray-200">
+                                                            <th>Timestamp</th>
+                                                            <th>IP</th>
+                                                            <th>Device</th>
+                                                            <th>App</th>
+                                                            <th>Type</th>
+                                                            <th>Location</th>
                                                         </tr>
-                                                    {% endfor %}
-                                                </tbody>
-                                            </table>
+                                                    </thead>
+                                                    <tbody>
+                                                        {% for visit in url.visits %}
+                                                            <tr class="{% if visit.type != 'Human' %}bot{% endif %}">
+                                                                <td>{{ visit.timestamp|datetime }}</td>
+                                                                <td>{{ visit.ip }}</td>
+                                                                <td>{{ visit.device }}</td>
+                                                                <td>{{ visit.app }}</td>
+                                                                <td>{{ visit.type }}</td>
+                                                                <td>{{ visit.location.country }}, {{ visit.location.city }}</td>
+                                                            </tr>
+                                                        {% endfor %}
+                                                    </tbody>
+                                                </table>
+                                            </div>
                                         </div>
                                     </div>
                                 {% endfor %}
@@ -892,64 +894,70 @@ def dashboard():
                         </div>
                     </div>
                     <div id="visitors-tab" class="tab-content hidden">
-                        <div class="bg-white p-8 rounded-xl shadow-2xl">
+                        <div class="bg-white p-8 rounded-xl card">
                             <h2 class="text-2xl font-bold mb-6 text-gray-900">Visitor Views</h2>
                             {% if visitors %}
-                                <table class="w-full text-left border-collapse">
-                                    <thead>
-                                        <tr class="bg-gray-200">
-                                            <th class="p-2">Timestamp</th>
-                                            <th class="p-2">IP</th>
-                                            <th class="p-2">Country</th>
-                                            <th class="p-2">City</th>
-                                            <th class="p-2">Device</th>
-                                            <th class="p-2">Application</th>
-                                            <th class="p-2">Bot Status</th>
-                                            <th class="p-2">Block Reason</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                                        {% for visitor in visitors %}
-                                            <tr class="{% if visitor.bot_status != 'Human' %}bg-red-100{% endif %}">
-                                                <td class="p-2">{{ visitor.timestamp }}</td>
-                                                <td class="p-2">{{ visitor.ip }}</td>
-                                                <td class="p-2">{{ visitor.country }}</td>
-                                                <td class="p-2">{{ visitor.city }}</td>
-                                                <td class="p-2">{{ visitor.device }}</td>
-                                                <td class="p-2">{{ visitor.application }}</td>
-                                                <td class="p-2">{{ visitor.bot_status }}</td>
-                                                <td class="p-2">{{ visitor.block_reason }}</td>
+                                <div class="table-container">
+                                    <table>
+                                        <thead>
+                                            <tr class="bg-gray-200">
+                                                <th>Timestamp</th>
+                                                <th>IP</th>
+                                                <th>Country</th>
+                                                <th>City</th>
+                                                <th>Device</th>
+                                                <th>Application</th>
+                                                <th>User Agent</th>
+                                                <th>Bot Status</th>
+                                                <th>Block Reason</th>
                                             </tr>
-                                        {% endfor %}
-                                    </tbody>
-                                </table>
+                                        </thead>
+                                        <tbody>
+                                            {% for visitor in visitors %}
+                                                <tr class="{% if visitor.bot_status != 'Human' %}bot{% endif %}">
+                                                    <td>{{ visitor.timestamp }}</td>
+                                                    <td>{{ visitor.ip }}</td>
+                                                    <td>{{ visitor.country }}</td>
+                                                    <td>{{ visitor.city }}</td>
+                                                    <td>{{ visitor.device }}</td>
+                                                    <td>{{ visitor.application }}</td>
+                                                    <td>{{ visitor.user_agent }}</td>
+                                                    <td>{{ visitor.bot_status }}</td>
+                                                    <td>{{ visitor.block_reason }}</td>
+                                                </tr>
+                                            {% endfor %}
+                                        </tbody>
+                                    </table>
+                                </div>
                             {% else %}
                                 <p class="text-gray-600">No visitor data available.</p>
                             {% endif %}
                         </div>
                     </div>
                     <div id="bot-logs-tab" class="tab-content hidden">
-                        <div class="bg-white p-8 rounded-xl shadow-2xl">
+                        <div class="bg-white p-8 rounded-xl card">
                             <h2 class="text-2xl font-bold mb-6 text-gray-900">Bot Detection Logs</h2>
                             {% if bot_logs %}
-                                <table class="w-full text-left border-collapse">
-                                    <thead>
-                                        <tr class="bg-gray-200">
-                                            <th class="p-2">Timestamp</th>
-                                            <th class="p-2">IP</th>
-                                            <th class="p-2">Block Reason</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                                        {% for log in bot_logs %}
-                                            <tr class="bg-red-100">
-                                                <td class="p-2">{{ log.timestamp|datetime }}</td>
-                                                <td class="p-2">{{ log.ip }}</td>
-                                                <td class="p-2">{{ log.block_reason }}</td>
+                                <div class="table-container">
+                                    <table>
+                                        <thead>
+                                            <tr class="bg-gray-200">
+                                                <th>Timestamp</th>
+                                                <th>IP</th>
+                                                <th>Block Reason</th>
                                             </tr>
-                                        {% endfor %}
-                                    </tbody>
-                                </table>
+                                        </thead>
+                                        <tbody>
+                                            {% for log in bot_logs %}
+                                                <tr class="bot">
+                                                    <td>{{ log.timestamp|datetime }}</td>
+                                                    <td>{{ log.ip }}</td>
+                                                    <td>{{ log.block_reason }}</td>
+                                                </tr>
+                                            {% endfor %}
+                                        </tbody>
+                                    </table>
+                                </div>
                             {% else %}
                                 <p class="text-gray-600">No bot detections logged.</p>
                             {% endif %}
@@ -984,6 +992,7 @@ def dashboard():
 def export(index):
     try:
         username = session['username']
+        logger.debug(f"Exporting data for user: {username}, session: {session}")
         if valkey_client:
             try:
                 logger.debug(f"Fetching URL keys for export, user: {username}")
@@ -1085,6 +1094,7 @@ def challenge():
             logger.warning("Invalid JS challenge")
             return {"status": "denied"}, 403
         session['js_verified'] = True
+        session.permanent = True
         session.modified = True
         logger.debug("JS challenge passed")
         return {"status": "ok"}, 200
@@ -1144,18 +1154,19 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         if valkey_client:
             try:
                 visitor_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
-                valkey_client.hset(f"visitor:{visitor_id}", mapping={
+                valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
                     "timestamp": int(time.time()),
                     "ip": ip,
                     "country": location['country'],
                     "city": location['city'],
                     "device": device,
                     "application": app,
+                    "user_agent": user_agent,
                     "bot_status": visit_type,
                     "block_reason": bot_reason if is_bot_flag else "N/A"
                 })
-                valkey_client.expire(f"visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
-                logger.debug(f"Logged visitor: {visitor_id}")
+                valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
+                logger.debug(f"Logged visitor: {visitor_id} for user: {username}")
             except Exception as e:
                 logger.error(f"Valkey error logging visitor: {str(e)}")
 

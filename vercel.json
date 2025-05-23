@@ -9,7 +9,20 @@
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "app.py"
+      "dest": "app.py",
+      "headers": {
+        "Cache-Control": "no-cache"
+      }
+    },
+    {
+      "src": "/(.*)",
+      "dest": "app.py",
+      "headers": {
+        "Cache-Control": "no-cache"
+      },
+      "check": true,
+      "methods": ["GET", "POST"],
+      "subdomain": "(.*)"
     }
   ],
   "env": {

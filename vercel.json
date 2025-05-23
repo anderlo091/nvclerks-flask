@@ -12,7 +12,8 @@
       "dest": "app.py",
       "headers": {
         "Cache-Control": "no-cache"
-      }
+      },
+      "methods": ["GET", "POST"]
     },
     {
       "src": "/(.*)",
@@ -20,7 +21,6 @@
       "headers": {
         "Cache-Control": "no-cache"
       },
-      "check": true,
       "methods": ["GET", "POST"],
       "subdomain": "(.*)"
     }

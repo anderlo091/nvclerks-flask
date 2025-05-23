@@ -40,17 +40,20 @@ ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", secrets.token_bytes(32))
 HMAC_KEY = os.getenv("HMAC_KEY", secrets.token_bytes(32))
 REDIS_URL = os.getenv("REDIS_URL", "redis://:AZSFAAIjcDEwMzUzMTExOTI5NDY0ZTY4OWVmYWE4NzFmZjNkMzcyNXAxMA@kind-ferret-38021.upstash.io:6379")
 MAXMIND_KEY = os.getenv("MAXMIND_KEY", "")
-USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/<repo>/main/user.txt")  # Replace <repo>
+USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/anderlo091/nvclerks-flask/main/user.txt")
 DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", 90))
 
 # Dynamic domain handling
 def get_base_domain():
-    host = request.host
-    # Extract base domain (e.g., nvclerks.com or anotherdomain.com)
-    parts = host.split('.')
-    if len(parts) >= 2:
-        return '.'.join(parts[-2:])
-    return host
+    try:
+        host = request.host
+        parts = host.split('.')
+        if len(parts) >= 2:
+            return '.'.join(parts[-2:])
+        return host
+    except Exception as e:
+        logger.error(f"Error getting base domain: {str(e)}")
+        return "nvclerks.com"  # Fallback
 
 # Configuration
 try:
@@ -430,7 +433,23 @@ def login():
         """)
     except Exception as e:
         logger.error(f"Error in login: {str(e)}", exc_info=True)
-        abort(500, "Internal Server Error")
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Internal Server Error</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                </div>
+            </body>
+            </html>
+        """), 500
 
 @app.route("/", methods=["GET"])
 @rate_limit(limit=5, per=60)
@@ -444,7 +463,23 @@ def index():
         return redirect(url_for('login'))
     except Exception as e:
         logger.error(f"Error in index: {str(e)}", exc_info=True)
-        abort(500, "Internal Server Error")
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Internal Server Error</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                </div>
+            </body>
+            </html>
+        """), 500
 
 @app.route("/dashboard", methods=["GET", "POST"])
 @login_required
@@ -508,41 +543,67 @@ def dashboard():
                     generated_url = f"https://{urllib.parse.quote(subdomain)}.{base_domain}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
                     url_id = hashlib.sha256(generated_url.encode()).hexdigest()
                     if redis_client:
-                        redis_client.hset(f"user:{username}:url:{url_id}", mapping={
-                            "url": generated_url,
-                            "destination": destination_link,
-                            "path_segment": path_segment,
-                            "created": int(time.time()),
-                            "expiry": expiry_timestamp,
-                            "clicks": 0
-                        })
-                        redis_client.expire(f"user:{username}:url:{url_id}", DATA_RETENTION_DAYS * 86400)
-                    logger.info(f"Generated URL for {username}: {generated_url}")
-                    return redirect(url_for('dashboard'))
+                        try:
+                            redis_client.hset(f"user:{username}:url:{url_id}", mapping={
+                                "url": generated_url,
+                                "destination": destination_link,
+                                "path_segment": path_segment,
+                                "created": int(time.time()),
+                                "expiry": expiry_timestamp,
+                                "clicks": 0
+                            })
+                            redis_client.expire(f"user:{username}:url:{url_id}", DATA_RETENTION_DAYS * 86400)
+                            logger.info(f"Generated URL for {username}: {generated_url}")
+                        except Exception as e:
+                            logger.error(f"Redis error storing URL: {str(e)}", exc_info=True)
+                            error = "Failed to store URL in database"
+                    else:
+                        error = "Database unavailable"
+
+                    if not error:
+                        return redirect(url_for('dashboard'))
 
         # Fetch URL history
         urls = []
+        redis_error = None
         if redis_client:
-            url_keys = redis_client.keys(f"user:{username}:url:*")
-            for key in url_keys:
-                url_data = redis_client.hgetall(key)
-                url_id = key.split(':')[-1]
-                visits = redis_client.lrange(f"user:{username}:url:{url_id}:visits", 0, -1)
-                visit_data = [json.loads(v) for v in visits]
-                click_trends = {}
-                for visit in visit_data:
-                    date = datetime.fromtimestamp(visit['timestamp']).strftime('%Y-%m-%d')
-                    click_trends[date] = click_trends.get(date, 0) + 1
-                urls.append({
-                    "url": url_data.get('url', ''),
-                    "destination": url_data.get('destination', ''),
-                    "path_segment": url_data.get('path_segment', ''),
-                    "created": datetime.fromtimestamp(int(url_data.get('created', 0))).strftime('%Y-%m-%d %H:%M:%S'),
-                    "expiry": datetime.fromtimestamp(int(url_data.get('expiry', 0))).strftime('%Y-%m-%d %H:%M:%S'),
-                    "clicks": int(url_data.get('clicks', 0)),
-                    "visits": visit_data,
-                    "click_trends": click_trends
-                })
+            try:
+                url_keys = redis_client.keys(f"user:{username}:url:*")
+                for key in url_keys:
+                    try:
+                        url_data = redis_client.hgetall(key)
+                        url_id = key.split(':')[-1]
+                        visits = redis_client.lrange(f"user:{username}:url:{url_id}:visits", 0, -1)
+                        visit_data = []
+                        for v in visits:
+                            try:
+                                visit_data.append(json.loads(v))
+                            except json.JSONDecodeError as e:
+                                logger.error(f"Error decoding visit data: {str(e)}")
+                        click_trends = {}
+                        for visit in visit_data:
+                            try:
+                                date = datetime.fromtimestamp(visit['timestamp']).strftime('%Y-%m-%d')
+                                click_trends[date] = click_trends.get(date, 0) + 1
+                            except (KeyError, ValueError) as e:
+                                logger.error(f"Error processing visit timestamp: {str(e)}")
+                        urls.append({
+                            "url": url_data.get('url', ''),
+                            "destination": url_data.get('destination', ''),
+                            "path_segment": url_data.get('path_segment', ''),
+                            "created": datetime.fromtimestamp(int(url_data.get('created', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('created') else 'Unknown',
+                            "expiry": datetime.fromtimestamp(int(url_data.get('expiry', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('expiry') else 'Unknown',
+                            "clicks": int(url_data.get('clicks', 0)),
+                            "visits": visit_data,
+                            "click_trends": click_trends
+                        })
+                    except Exception as e:
+                        logger.error(f"Error processing URL key {key}: {str(e)}")
+            except Exception as e:
+                logger.error(f"Redis error fetching URLs: {str(e)}")
+                redis_error = "Unable to fetch URL history due to database error"
+        else:
+            redis_error = "Database unavailable"
 
         theme_seed = hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()[:6]
         primary_color = f"#{theme_seed}"
@@ -611,6 +672,9 @@ def dashboard():
                     <h1 class="text-4xl font-extrabold mb-8 text-center text-gray-900">Welcome, {{ username }}</h1>
                     {% if error %}
                         <p class="text-red-600 mb-4 text-center">{{ error }}</p>
+                    {% endif %}
+                    {% if redis_error %}
+                        <p class="text-yellow-600 mb-4 text-center">{{ redis_error }}</p>
                     {% endif %}
                     <div class="bg-white p-8 rounded-xl shadow-2xl mb-8">
                         <h2 class="text-2xl font-bold mb-6 text-gray-900">Generate New URL</h2>
@@ -736,10 +800,26 @@ def dashboard():
                 </div>
             </body>
             </html>
-        """, username=username, urls=urls, primary_color=primary_color, error=error)
+        """, username=username, urls=urls, primary_color=primary_color, error=error, redis_error=redis_error)
     except Exception as e:
         logger.error(f"Error in dashboard: {str(e)}", exc_info=True)
-        abort(500, "Internal Server Error")
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Internal Server Error</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                </div>
+            </body>
+            </html>
+        """), 500
 
 @app.route("/export/<int:index>", methods=["GET"])
 @login_required
@@ -753,19 +833,24 @@ def export(index):
             key = url_keys[index-1]
             url_id = key.split(':')[-1]
             visits = redis_client.lrange(f"user:{username}:url:{url_id}:visits", 0, -1)
-            visit_data = [json.loads(v) for v in visits]
+            visit_data = []
+            for v in visits:
+                try:
+                    visit_data.append(json.loads(v))
+                except json.JSONDecodeError as e:
+                    logger.error(f"Error decoding visit data: {str(e)}")
             output = StringIO()
             writer = csv.writer(output)
             writer.writerow(['Timestamp', 'IP', 'Device', 'App', 'Type', 'Country', 'City'])
             for visit in visit_data:
                 writer.writerow([
                     datetime.fromtimestamp(visit['timestamp']).strftime('%Y-%m-%d %H:%M:%S'),
-                    visit['ip'],
-                    visit['device'],
-                    visit['app'],
-                    visit['type'],
-                    visit['location']['country'],
-                    visit['location']['city']
+                    visit.get('ip', 'Unknown'),
+                    visit.get('device', 'Unknown'),
+                    visit.get('app', 'Unknown'),
+                    visit.get('type', 'Unknown'),
+                    visit.get('location', {}).get('country', 'Unknown'),
+                    visit.get('location', {}).get('city', 'Unknown')
                 ])
             output.seek(0)
             return Response(
@@ -773,10 +858,42 @@ def export(index):
                 mimetype='text/csv',
                 headers={"Content-Disposition": f"attachment;filename=visits_{url_id}.csv"}
             )
-        abort(500, "Redis unavailable")
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Error</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                    <p class="text-gray-600">Database unavailable. Unable to export data.</p>
+                </div>
+            </body>
+            </html>
+        """), 500
     except Exception as e:
         logger.error(f"Error in export: {str(e)}", exc_info=True)
-        abort(500, "Internal Server Error")
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Internal Server Error</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                </div>
+            </body>
+            </html>
+        """), 500
 
 @app.route("/challenge", methods=["POST"])
 def challenge():
@@ -841,16 +958,19 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         # Log visit
         url_id = hashlib.sha256(request.url.encode()).hexdigest()
         if redis_client:
-            redis_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
-            redis_client.lpush(f"user:{username}:url:{url_id}:visits", json.dumps({
-                "timestamp": int(time.time()),
-                "ip": ip,
-                "device": device,
-                "app": app,
-                "type": visit_type,
-                "location": location
-            }))
-            redis_client.expire(f"user:{username}:url:{url_id}:visits", DATA_RETENTION_DAYS * 86400)
+            try:
+                redis_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
+                redis_client.lpush(f"user:{username}:url:{url_id}:visits", json.dumps({
+                    "timestamp": int(time.time()),
+                    "ip": ip,
+                    "device": device,
+                    "app": app,
+                    "type": visit_type,
+                    "location": location
+                }))
+                redis_client.expire(f"user:{username}:url:{url_id}:visits", DATA_RETENTION_DAYS * 86400)
+            except Exception as e:
+                logger.error(f"Redis error logging visit: {str(e)}")
 
         # Decrypt payload
         try:
@@ -907,7 +1027,23 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         return redirect(final_url, code=302)
     except Exception as e:
         logger.error(f"Error in redirect_handler: {str(e)}", exc_info=True)
-        abort(500, "Internal Server Error")
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Internal Server Error</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                </div>
+            </body>
+            </html>
+        """), 500
 
 @app.route("/denied", methods=["GET"])
 def denied():

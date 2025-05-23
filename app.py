@@ -109,33 +109,43 @@ def datetime_filter(timestamp):
 app.jinja_env.filters['datetime'] = datetime_filter
 
 # Bot detection patterns
-BOT_PATTERNS = ["googlebot", "bingbot", "yandex", "duckduckbot", "curl/", "wget/"]
+BOT_PATTERNS = ["googlebot", "bingbot", "yandex", "duckduckbot", "curl/", "wget/", "headless"]
 
-def is_bot(user_agent, headers):
+def is_bot(user_agent, headers, ip):
     try:
         if not user_agent:
-            logger.warning("No User-Agent provided")
+            logger.warning(f"Blocked IP {ip}: No User-Agent provided")
             return True, "Missing User-Agent"
-        user_agent = user_agent.lower()
+        user_agent_lower = user_agent.lower()
         for pattern in BOT_PATTERNS:
-            if pattern in user_agent:
+            if pattern in user_agent_lower:
+                logger.warning(f"Blocked IP {ip}: Known bot pattern {pattern}")
                 return True, f"Known bot: {pattern}"
         if not headers.get('Accept') or not headers.get('Referer'):
+            logger.warning(f"Blocked IP {ip}: Missing browser headers")
             return True, "Missing browser headers"
         ua = parse(user_agent)
         if ua.is_mobile and 'X-Desktop' in headers:
+            logger.warning(f"Blocked IP {ip}: Mobile UA with desktop headers")
             return True, "Mimicry: Mobile UA with desktop headers"
+        if 'HeadlessChrome' in user_agent or 'PhantomJS' in user_agent:
+            logger.warning(f"Blocked IP {ip}: Headless browser detected")
+            return True, "Headless browser"
         if valkey_client:
-            ip = request.remote_addr
             key = f"bot_check:{ip}"
             count = valkey_client.get(key)
             if count and int(count) > 10:
+                logger.warning(f"Blocked IP {ip}: Rapid requests")
                 return True, "Rapid requests"
             valkey_client.incr(key)
             valkey_client.expire(key, 60)
+        # Check IP reputation (simplified, requires MAXMIND_KEY for full implementation)
+        if ip.startswith(('162.249.', '5.62.', '84.39.')):  # Example data center ranges
+            logger.warning(f"Blocked IP {ip}: Data center IP range")
+            return True, "Data center IP"
         return False, "Human"
     except Exception as e:
-        logger.error(f"Error in is_bot: {str(e)}", exc_info=True)
+        logger.error(f"Error in is_bot for IP {ip}: {str(e)}", exc_info=True)
         return True, "Error in bot detection"
 
 def check_asn(ip):
@@ -146,12 +156,12 @@ def check_asn(ip):
         response = requests.get(f"https://api.maxmind.com/v2.0/asn/{ip}?apiKey={MAXMIND_KEY}")
         response.raise_for_status()
         asn = response.json().get('asn', 0)
-        blocked_asns = [16509, 14618, 8075, 14061, 16276]
+        blocked_asns = [16509, 14618, 8075, 14061, 16276]  # Example: AWS, Microsoft, etc.
         result = asn in blocked_asns
         logger.debug(f"ASN check for IP {ip}: ASN {asn}, Blocked: {result}")
         return result
     except Exception as e:
-        logger.error(f"MaxMind ASN check failed: {str(e)}", exc_info=True)
+        logger.error(f"MaxMind ASN check failed for IP {ip}: {str(e)}", exc_info=True)
         return False
 
 def get_geoip(ip):
@@ -166,7 +176,7 @@ def get_geoip(ip):
             "city": data.get('city', {}).get('names', {}).get('en', 'Unknown')
         }
     except Exception as e:
-        logger.error(f"MaxMind GeoIP failed: {str(e)}", exc_info=True)
+        logger.error(f"MaxMind GeoIP failed for IP {ip}: {str(e)}", exc_info=True)
         return {"country": "Unknown", "city": "Unknown"}
 
 def rate_limit(limit=10, per=60):
@@ -174,10 +184,16 @@ def rate_limit(limit=10, per=60):
         @wraps(f)
         def wrapped_function(*args, **kwargs):
             try:
+                ip = request.remote_addr
+                user_agent = request.headers.get("User-Agent", "")
+                headers = request.headers
+                is_bot_flag, bot_reason = is_bot(user_agent, headers, ip)
+                if is_bot_flag:
+                    logger.warning(f"Blocked request from IP {ip}: {bot_reason}")
+                    abort(403, f"Access denied: {bot_reason}")
                 if not valkey_client:
                     logger.warning("Valkey unavailable, skipping rate limit")
                     return f(*args, **kwargs)
-                ip = request.remote_addr
                 key = f"rate_limit:{ip}:{f.__name__}"
                 current = valkey_client.get(key)
                 if current is None:
@@ -191,7 +207,7 @@ def rate_limit(limit=10, per=60):
                     logger.debug(f"Rate limit incremented for {ip}: {int(current)+1}/{limit}")
                 return f(*args, **kwargs)
             except Exception as e:
-                logger.error(f"Error in rate_limit: {str(e)}", exc_info=True)
+                logger.error(f"Error in rate_limit for IP {ip}: {str(e)}", exc_info=True)
                 return f(*args, **kwargs)
         return wrapped_function
     return decorator
@@ -626,7 +642,8 @@ def dashboard():
                             "expiry": datetime.fromtimestamp(int(url_data.get('expiry', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('expiry') else 'Unknown',
                             "clicks": int(url_data.get('clicks', 0)) if url_data.get('clicks') else 0,
                             "visits": visit_data,
-                            "click_trends": click_trends
+                            "click_trends_keys": list(click_trends.keys()),
+                            "click_trends_values": list(click_trends.values())
                         })
                     except Exception as e:
                         logger.error(f"Error processing URL key {key}: {str(e)}")
@@ -635,6 +652,37 @@ def dashboard():
                 valkey_error = "Unable to fetch URL history due to database error"
         else:
             valkey_error = "Database unavailable"
+
+        # Fetch visitor data
+        visitors = []
+        bot_logs = []
+        if valkey_client:
+            try:
+                visitor_keys = valkey_client.keys(f"visitor:*")
+                for key in visitor_keys:
+                    try:
+                        visitor_data = valkey_client.hgetall(key)
+                        visitors.append({
+                            "timestamp": datetime.fromtimestamp(int(visitor_data.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor_data.get('timestamp') else 'Unknown',
+                            "ip": visitor_data.get('ip', 'Unknown'),
+                            "country": visitor_data.get('country', 'Unknown'),
+                            "city": visitor_data.get('city', 'Unknown'),
+                            "device": visitor_data.get('device', 'Unknown'),
+                            "application": visitor_data.get('application', 'Unknown'),
+                            "bot_status": visitor_data.get('bot_status', 'Unknown'),
+                            "block_reason": visitor_data.get('block_reason', 'N/A')
+                        })
+                        if visitor_data.get('bot_status') != 'Human':
+                            bot_logs.append({
+                                "timestamp": visitor_data.get('timestamp', 'Unknown'),
+                                "ip": visitor_data.get('ip', 'Unknown'),
+                                "block_reason": visitor_data.get('block_reason', 'Unknown')
+                            })
+                    except Exception as e:
+                        logger.error(f"Error processing visitor key {key}: {str(e)}")
+            except Exception as e:
+                logger.error(f"Valkey error fetching visitors: {str(e)}")
+                valkey_error = "Unable to fetch visitor data due to database error"
 
         theme_seed = hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()[:6]
         primary_color = f"#{theme_seed}"
@@ -656,6 +704,8 @@ def dashboard():
                     .card { transition: all 0.3s; }
                     .card:hover { transform: scale(1.02); }
                     canvas { max-height: 200px; }
+                    .tab { cursor: pointer; }
+                    .tab.active { background-color: #4f46e5; color: white; }
                 </style>
                 <script>
                     function toggleAnalytics(id) {
@@ -673,6 +723,12 @@ def dashboard():
                                 (type === '' || typeCell.includes(type))
                             ) ? '' : 'none';
                         });
+                    }
+                    function showTab(tabId) {
+                        document.querySelectorAll('.tab-content').forEach(tab => tab.classList.add('hidden'));
+                        document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+                        document.getElementById(tabId).classList.remove('hidden');
+                        document.querySelector(`[onclick="showTab('${tabId}')"]`).classList.add('active');
                     }
                     let challenge = 0;
                     for (let i = 0; i < 1000; i++) challenge += Math.random();
@@ -707,131 +763,202 @@ def dashboard():
                     {% if valkey_error %}
                         <p class="text-yellow-600 mb-4 text-center">{{ valkey_error }}</p>
                     {% endif %}
-                    <div class="bg-white p-8 rounded-xl shadow-2xl mb-8">
-                        <h2 class="text-2xl font-bold mb-6 text-gray-900">Generate New URL</h2>
-                        <form method="POST" class="space-y-5">
-                            <div>
-                                <label class="block text-sm font-medium text-gray-700">Subdomain</label>
-                                <input type="text" name="subdomain" required minlength="2" maxlength="100" pattern="[A-Za-z0-9\-]{2,100}" title="Subdomain must be 2-100 characters (letters, numbers, or hyphens)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
-                            </div>
-                            <div>
-                                <label class="block text-sm font-medium text-gray-700">Randomstring1</label>
-                                <input type="text" name="randomstring1" required minlength="2" maxlength="100" pattern="[A-Za-z0-9_@.]{2,100}" title="Randomstring1 must be 2-100 characters (letters, numbers, _, @, .)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
-                            </div>
-                            <div>
-                                <label class="block text-sm font-medium text-gray-700">Base64emailInput</label>
-                                <input type="text" name="base64email" required minlength="2" maxlength="100" pattern="[A-Za-z0-9_@.]{2,100}" title="Base64email must be 2-100 characters (letters, numbers, _, @, .)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
-                            </div>
-                            <div>
-                                <label class="block text-sm font-medium text-gray-700">Destination Link</label>
-                                <input type="url" name="destination_link" required class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
-                            </div>
-                            <div>
-                                <label class="block text-sm font-medium text-gray-700">Randomstring2</label>
-                                <input type="text" name="randomstring2" required minlength="2" maxlength="100" pattern="[A-Za-z0-9_@.]{2,100}" title="Randomstring2 must be 2-100 characters (letters, numbers, _, @, .)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
-                            </div>
-                            <div>
-                                <label class="block text-sm font-medium text-gray-700">Expiry</label>
-                                <select name="expiry" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
-                                    <option value="3600">1 Hour</option>
-                                    <option value="86400" selected>1 Day</option>
-                                    <option value="604800">1 Week</option>
-                                    <option value="2592000">1 Month</option>
-                                </select>
-                            </div>
-                            <button type="submit" class="w-full bg-indigo-600 text-white p-3 rounded-lg hover:bg-indigo-700 transition">Generate URL</button>
-                        </form>
+                    <div class="flex space-x-4 mb-4">
+                        <button class="tab px-4 py-2 bg-gray-200 rounded-lg active" onclick="showTab('urls-tab')">URLs</button>
+                        <button class="tab px-4 py-2 bg-gray-200 rounded-lg" onclick="showTab('visitors-tab')">Visitor Views</button>
+                        <button class="tab px-4 py-2 bg-gray-200 rounded-lg" onclick="showTab('bot-logs-tab')">Bot Logs</button>
                     </div>
-                    <div class="bg-white p-8 rounded-xl shadow-2xl">
-                        <h2 class="text-2xl font-bold mb-6 text-gray-900">URL History</h2>
-                        {% if urls %}
-                            {% for url in urls %}
-                                <div class="card bg-gray-50 p-6 rounded-lg mb-4">
-                                    <h3 class="text-xl font-semibold text-gray-900">{{ url.destination }}</h3>
-                                    <p class="text-gray-600 break-all"><strong>URL:</strong> <a href="{{ url.url }}" target="_blank" class="text-indigo-600">{{ url.url }}</a></p>
-                                    <p class="text-gray-600"><strong>Path Segment:</strong> {{ url.path_segment }}</p>
-                                    <p class="text-gray-600"><strong>Created:</strong> {{ url.created }}</p>
-                                    <p class="text-gray-600"><strong>Expires:</strong> {{ url.expiry }}</p>
-                                    <p class="text-gray-600"><strong>Clicks:</strong> {{ url.clicks }}</p>
-                                    <button onclick="toggleAnalytics('{{ loop.index }}')" class="mt-2 bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700">Toggle Analytics</button>
-                                    <div id="analytics-{{ loop.index }}" class="hidden mt-4">
-                                        <h4 class="text-lg font-semibold text-gray-900">Visitor Analytics</h4>
-                                        <canvas id="chart-{{ loop.index }}" class="mt-4"></canvas>
-                                        <script>
-                                            new Chart(document.getElementById('chart-{{ loop.index }}'), {
-                                                type: 'line',
-                                                data: {
-                                                    labels: {{ url.click_trends.keys()|tojson }},
-                                                    datasets: [{
-                                                        label: 'Clicks',
-                                                        data: {{ url.click_trends.values()|tojson }},
-                                                        borderColor: '{{ primary_color }}',
-                                                        fill: false
-                                                    }]
-                                                },
-                                                options: {
-                                                    scales: {
-                                                        x: { title: { display: true, text: 'Date' } },
-                                                        y: { title: { display: true, text: 'Clicks' }, beginAtZero: true }
-                                                    }
-                                                }
-                                            });
-                                        </script>
-                                        <div class="mt-4">
-                                            <label class="block text-sm font-medium text-gray-700">Filter by Device</label>
-                                            <select id="filter-device-{{ loop.index }}" onchange="applyFilters('{{ loop.index }}')" class="mt-1 w-full p-3 border rounded-lg">
-                                                <option value="">All</option>
-                                                <option value="Android">Android</option>
-                                                <option value="iPhone">iPhone</option>
-                                                <option value="Desktop">Desktop</option>
-                                            </select>
-                                        </div>
-                                        <div class="mt-4">
-                                            <label class="block text-sm font-medium text-gray-700">Filter by Type</label>
-                                            <select id="filter-type-{{ loop.index }}" onchange="applyFilters('{{ loop.index }}')" class="mt-1 w-full p-3 border rounded-lg">
-                                                <option value="">All</option>
-                                                <option value="Human">Human</option>
-                                                <option value="Bot">Bot</option>
-                                                <option value="Mimicry">Mimicry</option>
-                                                <option value="App">App</option>
-                                            </select>
-                                        </div>
-                                        <a href="/export/{{ loop.index }}" class="mt-4 inline-block bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export as CSV</a>
-                                        <table id="visits-{{ loop.index }}" class="mt-4 w-full text-left border-collapse">
-                                            <thead>
-                                                <tr class="bg-gray-200">
-                                                    <th class="p-2">Timestamp</th>
-                                                    <th class="p-2">IP</th>
-                                                    <th class="p-2">Device</th>
-                                                    <th class="p-2">App</th>
-                                                    <th class="p-2">Type</th>
-                                                    <th class="p-2">Location</th>
-                                                </tr>
-                                            </thead>
-                                            <tbody>
-                                                {% for visit in url.visits %}
-                                                    <tr class="{% if visit.type != 'Human' %}bg-red-100{% endif %}">
-                                                        <td class="p-2">{{ visit.timestamp|datetime }}</td>
-                                                        <td class="p-2">{{ visit.ip }}</td>
-                                                        <td class="p-2">{{ visit.device }}</td>
-                                                        <td class="p-2">{{ visit.app }}</td>
-                                                        <td class="p-2">{{ visit.type }}</td>
-                                                        <td class="p-2">{{ visit.location.country }}, {{ visit.location.city }}</td>
-                                                    </tr>
-                                                {% endfor %}
-                                            </tbody>
-                                        </table>
-                                    </div>
+                    <div id="urls-tab" class="tab-content">
+                        <div class="bg-white p-8 rounded-xl shadow-2xl mb-8">
+                            <h2 class="text-2xl font-bold mb-6 text-gray-900">Generate New URL</h2>
+                            <form method="POST" class="space-y-5">
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700">Subdomain</label>
+                                    <input type="text" name="subdomain" required minlength="2" maxlength="100" pattern="[A-Za-z0-9\-]{2,100}" title="Subdomain must be 2-100 characters (letters, numbers, or hyphens)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
                                 </div>
-                            {% endfor %}
-                        {% else %}
-                            <p class="text-gray-600">No URLs generated yet.</p>
-                        {% endif %}
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700">Randomstring1</label>
+                                    <input type="text" name="randomstring1" required minlength="2" maxlength="100" pattern="[A-Za-z0-9_@.]{2,100}" title="Randomstring1 must be 2-100 characters (letters, numbers, _, @, .)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700">Base64emailInput</label>
+                                    <input type="text" name="base64email" required minlength="2" maxlength="100" pattern="[A-Za-z0-9_@.]{2,100}" title="Base64email must be 2-100 characters (letters, numbers, _, @, .)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700">Destination Link</label>
+                                    <input type="url" name="destination_link" required class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700">Randomstring2</label>
+                                    <input type="text" name="randomstring2" required minlength="2" maxlength="100" pattern="[A-Za-z0-9_@.]{2,100}" title="Randomstring2 must be 2-100 characters (letters, numbers, _, @, .)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700">Expiry</label>
+                                    <select name="expiry" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                                        <option value="3600">1 Hour</option>
+                                        <option value="86400" selected>1 Day</option>
+                                        <option value="604800">1 Week</option>
+                                        <option value="2592000">1 Month</option>
+                                    </select>
+                                </div>
+                                <button type="submit" class="w-full bg-indigo-600 text-white p-3 rounded-lg hover:bg-indigo-700 transition">Generate URL</button>
+                            </form>
+                        </div>
+                        <div class="bg-white p-8 rounded-xl shadow-2xl">
+                            <h2 class="text-2xl font-bold mb-6 text-gray-900">URL History</h2>
+                            {% if urls %}
+                                {% for url in urls %}
+                                    <div class="card bg-gray-50 p-6 rounded-lg mb-4">
+                                        <h3 class="text-xl font-semibold text-gray-900">{{ url.destination }}</h3>
+                                        <p class="text-gray-600 break-all"><strong>URL:</strong> <a href="{{ url.url }}" target="_blank" class="text-indigo-600">{{ url.url }}</a></p>
+                                        <p class="text-gray-600"><strong>Path Segment:</strong> {{ url.path_segment }}</p>
+                                        <p class="text-gray-600"><strong>Created:</strong> {{ url.created }}</p>
+                                        <p class="text-gray-600"><strong>Expires:</strong> {{ url.expiry }}</p>
+                                        <p class="text-gray-600"><strong>Clicks:</strong> {{ url.clicks }}</p>
+                                        <button onclick="toggleAnalytics('{{ loop.index }}')" class="mt-2 bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700">Toggle Analytics</button>
+                                        <div id="analytics-{{ loop.index }}" class="hidden mt-4">
+                                            <h4 class="text-lg font-semibold text-gray-900">Visitor Analytics</h4>
+                                            <canvas id="chart-{{ loop.index }}" class="mt-4"></canvas>
+                                            <script>
+                                                new Chart(document.getElementById('chart-{{ loop.index }}'), {
+                                                    type: 'line',
+                                                    data: {
+                                                        labels: {{ url.click_trends_keys|tojson }},
+                                                        datasets: [{
+                                                            label: 'Clicks',
+                                                            data: {{ url.click_trends_values|tojson }},
+                                                            borderColor: '{{ primary_color }}',
+                                                            fill: false
+                                                        }]
+                                                    },
+                                                    options: {
+                                                        scales: {
+                                                            x: { title: { display: true, text: 'Date' } },
+                                                            y: { title: { display: true, text: 'Clicks' }, beginAtZero: true }
+                                                        }
+                                                    }
+                                                });
+                                            </script>
+                                            <div class="mt-4">
+                                                <label class="block text-sm font-medium text-gray-700">Filter by Device</label>
+                                                <select id="filter-device-{{ loop.index }}" onchange="applyFilters('{{ loop.index }}')" class="mt-1 w-full p-3 border rounded-lg">
+                                                    <option value="">All</option>
+                                                    <option value="Android">Android</option>
+                                                    <option value="iPhone">iPhone</option>
+                                                    <option value="Desktop">Desktop</option>
+                                                </select>
+                                            </div>
+                                            <div class="mt-4">
+                                                <label class="block text-sm font-medium text-gray-700">Filter by Type</label>
+                                                <select id="filter-type-{{ loop.index }}" onchange="applyFilters('{{ loop.index }}')" class="mt-1 w-full p-3 border rounded-lg">
+                                                    <option value="">All</option>
+                                                    <option value="Human">Human</option>
+                                                    <option value="Bot">Bot</option>
+                                                    <option value="Mimicry">Mimicry</option>
+                                                    <option value="App">App</option>
+                                                </select>
+                                            </div>
+                                            <a href="/export/{{ loop.index }}" class="mt-4 inline-block bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export as CSV</a>
+                                            <table id="visits-{{ loop.index }}" class="mt-4 w-full text-left border-collapse">
+                                                <thead>
+                                                    <tr class="bg-gray-200">
+                                                        <th class="p-2">Timestamp</th>
+                                                        <th class="p-2">IP</th>
+                                                        <th class="p-2">Device</th>
+                                                        <th class="p-2">App</th>
+                                                        <th class="p-2">Type</th>
+                                                        <th class="p-2">Location</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {% for visit in url.visits %}
+                                                        <tr class="{% if visit.type != 'Human' %}bg-red-100{% endif %}">
+                                                            <td class="p-2">{{ visit.timestamp|datetime }}</td>
+                                                            <td class="p-2">{{ visit.ip }}</td>
+                                                            <td class="p-2">{{ visit.device }}</td>
+                                                            <td class="p-2">{{ visit.app }}</td>
+                                                            <td class="p-2">{{ visit.type }}</td>
+                                                            <td class="p-2">{{ visit.location.country }}, {{ visit.location.city }}</td>
+                                                        </tr>
+                                                    {% endfor %}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+                                {% endfor %}
+                            {% else %}
+                                <p class="text-gray-600">No URLs generated yet.</p>
+                            {% endif %}
+                        </div>
+                    </div>
+                    <div id="visitors-tab" class="tab-content hidden">
+                        <div class="bg-white p-8 rounded-xl shadow-2xl">
+                            <h2 class="text-2xl font-bold mb-6 text-gray-900">Visitor Views</h2>
+                            {% if visitors %}
+                                <table class="w-full text-left border-collapse">
+                                    <thead>
+                                        <tr class="bg-gray-200">
+                                            <th class="p-2">Timestamp</th>
+                                            <th class="p-2">IP</th>
+                                            <th class="p-2">Country</th>
+                                            <th class="p-2">City</th>
+                                            <th class="p-2">Device</th>
+                                            <th class="p-2">Application</th>
+                                            <th class="p-2">Bot Status</th>
+                                            <th class="p-2">Block Reason</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {% for visitor in visitors %}
+                                            <tr class="{% if visitor.bot_status != 'Human' %}bg-red-100{% endif %}">
+                                                <td class="p-2">{{ visitor.timestamp }}</td>
+                                                <td class="p-2">{{ visitor.ip }}</td>
+                                                <td class="p-2">{{ visitor.country }}</td>
+                                                <td class="p-2">{{ visitor.city }}</td>
+                                                <td class="p-2">{{ visitor.device }}</td>
+                                                <td class="p-2">{{ visitor.application }}</td>
+                                                <td class="p-2">{{ visitor.bot_status }}</td>
+                                                <td class="p-2">{{ visitor.block_reason }}</td>
+                                            </tr>
+                                        {% endfor %}
+                                    </tbody>
+                                </table>
+                            {% else %}
+                                <p class="text-gray-600">No visitor data available.</p>
+                            {% endif %}
+                        </div>
+                    </div>
+                    <div id="bot-logs-tab" class="tab-content hidden">
+                        <div class="bg-white p-8 rounded-xl shadow-2xl">
+                            <h2 class="text-2xl font-bold mb-6 text-gray-900">Bot Detection Logs</h2>
+                            {% if bot_logs %}
+                                <table class="w-full text-left border-collapse">
+                                    <thead>
+                                        <tr class="bg-gray-200">
+                                            <th class="p-2">Timestamp</th>
+                                            <th class="p-2">IP</th>
+                                            <th class="p-2">Block Reason</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {% for log in bot_logs %}
+                                            <tr class="bg-red-100">
+                                                <td class="p-2">{{ log.timestamp|datetime }}</td>
+                                                <td class="p-2">{{ log.ip }}</td>
+                                                <td class="p-2">{{ log.block_reason }}</td>
+                                            </tr>
+                                        {% endfor %}
+                                    </tbody>
+                                </table>
+                            {% else %}
+                                <p class="text-gray-600">No bot detections logged.</p>
+                            {% endif %}
+                        </div>
                     </div>
                 </div>
             </body>
             </html>
-        """, username=username, urls=urls, primary_color=primary_color, error=error, valkey_error=valkey_error)
+        """, username=username, urls=urls, visitors=visitors, bot_logs=bot_logs, primary_color=primary_color, error=error, valkey_error=valkey_error)
     except Exception as e:
         logger.error(f"Error in dashboard: {str(e)}", exc_info=True)
         return render_template_string("""
@@ -993,7 +1120,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         logger.debug(f"Redirect handler for {username}.{base_domain}/{endpoint}, IP: {ip}, User-Agent: {user_agent}")
 
         # Bot detection
-        is_bot_flag, bot_reason = is_bot(user_agent, headers)
+        is_bot_flag, bot_reason = is_bot(user_agent, headers, ip)
         asn_blocked = check_asn(ip)
         ua = parse(user_agent)
         device = "Desktop"
@@ -1012,6 +1139,29 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
 
         # GeoIP
         location = get_geoip(ip)
+
+        # Log visitor
+        if valkey_client:
+            try:
+                visitor_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
+                valkey_client.hset(f"visitor:{visitor_id}", mapping={
+                    "timestamp": int(time.time()),
+                    "ip": ip,
+                    "country": location['country'],
+                    "city": location['city'],
+                    "device": device,
+                    "application": app,
+                    "bot_status": visit_type,
+                    "block_reason": bot_reason if is_bot_flag else "N/A"
+                })
+                valkey_client.expire(f"visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
+                logger.debug(f"Logged visitor: {visitor_id}")
+            except Exception as e:
+                logger.error(f"Valkey error logging visitor: {str(e)}")
+
+        if is_bot_flag or asn_blocked:
+            logger.warning(f"Blocked redirect for IP {ip}: {bot_reason}")
+            abort(403, f"Access denied: {bot_reason}")
 
         # Log visit
         url_id = hashlib.sha256(request.url.encode()).hexdigest()

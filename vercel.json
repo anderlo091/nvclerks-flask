@@ -14,15 +14,6 @@
         "Cache-Control": "no-cache"
       },
       "methods": ["GET", "POST"]
-    },
-    {
-      "src": "/(.*)",
-      "dest": "app.py",
-      "headers": {
-        "Cache-Control": "no-cache"
-      },
-      "methods": ["GET", "POST"],
-      "subdomain": "(.*)"
     }
   ],
   "env": {

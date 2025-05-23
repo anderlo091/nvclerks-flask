@@ -13,7 +13,7 @@ import time
 from datetime import datetime, timedelta
 import uuid
 import hashlib
-from redis import Redis
+from valkey import Valkey
 from functools import wraps
 import requests
 import traceback
@@ -38,10 +38,10 @@ logger.debug("Initializing Flask app")
 FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", secrets.token_bytes(32))
 HMAC_KEY = os.getenv("HMAC_KEY", secrets.token_bytes(32))
-REDIS_HOST = os.getenv("REDIS_HOST", "valkey-137d99b9-reign.e.aivencloud.com")
-REDIS_PORT = int(os.getenv("REDIS_PORT", 25708))
-REDIS_USERNAME = os.getenv("REDIS_USERNAME", "default")
-REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "AVNS_Yzfa75IOznjCrZJIyzI")
+VALKEY_HOST = os.getenv("VALKEY_HOST", "valkey-137d99b9-reign.e.aivencloud.com")
+VALKEY_PORT = int(os.getenv("VALKEY_PORT", 25708))
+VALKEY_USERNAME = os.getenv("VALKEY_USERNAME", "default")
+VALKEY_PASSWORD = os.getenv("VALKEY_PASSWORD", "AVNS_Yzfa75IOznjCrZJIyzI")
 MAXMIND_KEY = os.getenv("MAXMIND_KEY", "")
 USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/anderlo091/nvclerks-flask/main/user.txt")
 DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", 90))
@@ -73,29 +73,29 @@ except Exception as e:
 logger.debug(f"FLASK_SECRET_KEY: {'set' if os.getenv('FLASK_SECRET_KEY') else 'auto-generated'}")
 logger.debug(f"ENCRYPTION_KEY: {'set' if os.getenv('ENCRYPTION_KEY') else 'auto-generated'}")
 logger.debug(f"HMAC_KEY: {'set' if os.getenv('HMAC_KEY') else 'auto-generated'}")
-logger.debug(f"REDIS_HOST: {REDIS_HOST}")
-logger.debug(f"REDIS_PORT: {REDIS_PORT}")
-logger.debug(f"REDIS_USERNAME: {REDIS_USERNAME}")
-logger.debug(f"REDIS_PASSWORD: {'set' if REDIS_PASSWORD else 'not set'}")
+logger.debug(f"VALKEY_HOST: {VALKEY_HOST}")
+logger.debug(f"VALKEY_PORT: {VALKEY_PORT}")
+logger.debug(f"VALKEY_USERNAME: {VALKEY_USERNAME}")
+logger.debug(f"VALKEY_PASSWORD: {'set' if VALKEY_PASSWORD else 'not set'}")
 logger.debug(f"MAXMIND_KEY: {'set' if MAXMIND_KEY else 'not set'}")
 logger.debug(f"USER_TXT_URL: {USER_TXT_URL}")
 
-# Valkey initialization (Redis-compatible)
-redis_client = None
+# Valkey initialization
+valkey_client = None
 try:
-    redis_client = Redis(
-        host=REDIS_HOST,
-        port=REDIS_PORT,
-        username=REDIS_USERNAME,
-        password=REDIS_PASSWORD,
+    valkey_client = Valkey(
+        host=VALKEY_HOST,
+        port=VALKEY_PORT,
+        username=VALKEY_USERNAME,
+        password=VALKEY_PASSWORD,
         decode_responses=True,
         ssl=True
     )
-    redis_client.ping()
+    valkey_client.ping()
     logger.debug("Valkey connection established successfully")
 except Exception as e:
     logger.error(f"Valkey connection failed: {str(e)}", exc_info=True)
-    redis_client = None
+    valkey_client = None
 
 # Bot detection patterns
 BOT_PATTERNS = ["googlebot", "bingbot", "yandex", "duckduckbot", "curl/", "wget/"]
@@ -114,14 +114,14 @@ def is_bot(user_agent, headers):
         ua = parse(user_agent)
         if ua.is_mobile and 'X-Desktop' in headers:
             return True, "Mimicry: Mobile UA with desktop headers"
-        if redis_client:
+        if valkey_client:
             ip = request.remote_addr
             key = f"bot_check:{ip}"
-            count = redis_client.get(key)
+            count = valkey_client.get(key)
             if count and int(count) > 10:
                 return True, "Rapid requests"
-            redis_client.incr(key)
-            redis_client.expire(key, 60)
+            valkey_client.incr(key)
+            valkey_client.expire(key, 60)
         return False, "Human"
     except Exception as e:
         logger.error(f"Error in is_bot: {str(e)}", exc_info=True)
@@ -163,20 +163,20 @@ def rate_limit(limit=10, per=60):
         @wraps(f)
         def wrapped_function(*args, **kwargs):
             try:
-                if not redis_client:
+                if not valkey_client:
                     logger.warning("Valkey unavailable, skipping rate limit")
                     return f(*args, **kwargs)
                 ip = request.remote_addr
                 key = f"rate_limit:{ip}:{f.__name__}"
-                current = redis_client.get(key)
+                current = valkey_client.get(key)
                 if current is None:
-                    redis_client.setex(key, per, 1)
+                    valkey_client.setex(key, per, 1)
                     logger.debug(f"Rate limit set for {ip}: 1/{limit}")
                 elif int(current) >= limit:
                     logger.warning(f"Rate limit exceeded for IP: {ip}")
                     abort(429, "Too Many Requests")
                 else:
-                    redis_client.incr(key)
+                    valkey_client.incr(key)
                     logger.debug(f"Rate limit incremented for {ip}: {int(current)+1}/{limit}")
                 return f(*args, **kwargs)
             except Exception as e:
@@ -202,14 +202,14 @@ def generate_fingerprint():
 
 def verify_browser():
     try:
-        if not redis_client:
+        if not valkey_client:
             logger.warning("Valkey unavailable, skipping browser verification")
             return True
         fingerprint = generate_fingerprint()
         session_key = f"browser:{fingerprint}"
-        exists = redis_client.exists(session_key)
+        exists = valkey_client.exists(session_key)
         if not exists:
-            redis_client.setex(session_key, 3600, 1)
+            valkey_client.setex(session_key, 3600, 1)
             logger.debug(f"New browser fingerprint: {fingerprint[:10]}...")
             return False
         logger.debug(f"Browser verified: {fingerprint[:10]}...")
@@ -343,16 +343,16 @@ def decrypt_signed_token(encrypted):
 
 def get_valid_usernames():
     try:
-        if redis_client:
-            cached = redis_client.get("usernames")
+        if valkey_client:
+            cached = valkey_client.get("usernames")
             if cached:
                 return json.loads(cached)
         response = requests.get(USER_TXT_URL)
         response.raise_for_status()
         usernames = [line.strip() for line in response.text.splitlines() if line.strip()]
-        if redis_client:
+        if valkey_client:
             try:
-                redis_client.setex("usernames", 3600, json.dumps(usernames))
+                valkey_client.setex("usernames", 3600, json.dumps(usernames))
             except Exception as e:
                 logger.error(f"Valkey error caching usernames: {str(e)}")
         logger.debug(f"Fetched {len(usernames)} usernames from GitHub")
@@ -558,9 +558,9 @@ def dashboard():
                 if not error:
                     generated_url = f"https://{urllib.parse.quote(subdomain)}.{base_domain}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
                     url_id = hashlib.sha256(generated_url.encode()).hexdigest()
-                    if redis_client:
+                    if valkey_client:
                         try:
-                            redis_client.hset(f"user:{username}:url:{url_id}", mapping={
+                            valkey_client.hset(f"user:{username}:url:{url_id}", mapping={
                                 "url": generated_url,
                                 "destination": destination_link,
                                 "path_segment": path_segment,
@@ -568,7 +568,7 @@ def dashboard():
                                 "expiry": expiry_timestamp,
                                 "clicks": 0
                             })
-                            redis_client.expire(f"user:{username}:url:{url_id}", DATA_RETENTION_DAYS * 86400)
+                            valkey_client.expire(f"user:{username}:url:{url_id}", DATA_RETENTION_DAYS * 86400)
                             logger.info(f"Generated URL for {username}: {generated_url}")
                         except Exception as e:
                             logger.error(f"Valkey error storing URL: {str(e)}", exc_info=True)
@@ -581,15 +581,15 @@ def dashboard():
 
         # Fetch URL history
         urls = []
-        redis_error = None
-        if redis_client:
+        valkey_error = None
+        if valkey_client:
             try:
-                url_keys = redis_client.keys(f"user:{username}:url:*")
+                url_keys = valkey_client.keys(f"user:{username}:url:*")
                 for key in url_keys:
                     try:
-                        url_data = redis_client.hgetall(key)
+                        url_data = valkey_client.hgetall(key)
                         url_id = key.split(':')[-1]
-                        visits = redis_client.lrange(f"user:{username}:url:{url_id}:visits", 0, -1)
+                        visits = valkey_client.lrange(f"user:{username}:url:{url_id}:visits", 0, -1)
                         visit_data = []
                         for v in visits:
                             try:
@@ -617,9 +617,9 @@ def dashboard():
                         logger.error(f"Error processing URL key {key}: {str(e)}")
             except Exception as e:
                 logger.error(f"Valkey error fetching URLs: {str(e)}")
-                redis_error = "Unable to fetch URL history due to database error"
+                valkey_error = "Unable to fetch URL history due to database error"
         else:
-            redis_error = "Database unavailable"
+            valkey_error = "Database unavailable"
 
         theme_seed = hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()[:6]
         primary_color = f"#{theme_seed}"
@@ -689,8 +689,8 @@ def dashboard():
                     {% if error %}
                         <p class="text-red-600 mb-4 text-center">{{ error }}</p>
                     {% endif %}
-                    {% if redis_error %}
-                        <p class="text-yellow-600 mb-4 text-center">{{ redis_error }}</p>
+                    {% if valkey_error %}
+                        <p class="text-yellow-600 mb-4 text-center">{{ valkey_error }}</p>
                     {% endif %}
                     <div class="bg-white p-8 rounded-xl shadow-2xl mb-8">
                         <h2 class="text-2xl font-bold mb-6 text-gray-900">Generate New URL</h2>
@@ -816,7 +816,7 @@ def dashboard():
                 </div>
             </body>
             </html>
-        """, username=username, urls=urls, primary_color=primary_color, error=error, redis_error=redis_error)
+        """, username=username, urls=urls, primary_color=primary_color, error=error, valkey_error=valkey_error)
     except Exception as e:
         logger.error(f"Error in dashboard: {str(e)}", exc_info=True)
         return render_template_string("""
@@ -842,14 +842,14 @@ def dashboard():
 def export(index):
     try:
         username = session['username']
-        if redis_client:
+        if valkey_client:
             try:
-                url_keys = redis_client.keys(f"user:{username}:url:*")
+                url_keys = valkey_client.keys(f"user:{username}:url:*")
                 if index <= 0 or index > len(url_keys):
                     abort(404, "URL not found")
                 key = url_keys[index-1]
                 url_id = key.split(':')[-1]
-                visits = redis_client.lrange(f"user:{username}:url:{url_id}:visits", 0, -1)
+                visits = valkey_client.lrange(f"user:{username}:url:{url_id}:visits", 0, -1)
                 visit_data = []
                 for v in visits:
                     try:
@@ -953,9 +953,9 @@ def fingerprint():
         data = request.get_json()
         if data and 'fingerprint' in data:
             fingerprint = generate_fingerprint()
-            if redis_client:
+            if valkey_client:
                 try:
-                    redis_client.setex(f"fingerprint:{fingerprint}", 3600, data['fingerprint'])
+                    valkey_client.setex(f"fingerprint:{fingerprint}", 3600, data['fingerprint'])
                     logger.debug(f"Fingerprint stored: {fingerprint[:10]}...")
                 except Exception as e:
                     logger.error(f"Valkey error storing fingerprint: {str(e)}")
@@ -997,10 +997,10 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
 
         # Log visit
         url_id = hashlib.sha256(request.url.encode()).hexdigest()
-        if redis_client:
+        if valkey_client:
             try:
-                redis_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
-                redis_client.lpush(f"user:{username}:url:{url_id}:visits", json.dumps({
+                valkey_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
+                valkey_client.lpush(f"user:{username}:url:{url_id}:visits", json.dumps({
                     "timestamp": int(time.time()),
                     "ip": ip,
                     "device": device,
@@ -1008,29 +1008,82 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                     "type": visit_type,
                     "location": location
                 }))
-                redis_client.expire(f"user:{username}:url:{url_id}:visits", DATA_RETENTION_DAYS * 86400)
+                valkey_client.expire(f"user:{username}:url:{url_id}:visits", DATA_RETENTION_DAYS * 86400)
             except Exception as e:
-                logger.info(f"Redirecting to {final_url}")
-                return redirect(final_url, code=302)
+                logger.error(f"Valkey error logging visit: {str(e)}")
+
+        # Decrypt payload
+        try:
+            encrypted_payload = urllib.parse.unquote(encrypted_payload)
+            logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}...")
+        except Exception as e:
+            logger.error(f"Error decoding encrypted_payload: {str(e)}", exc_info=True)
+            abort(400, "Invalid payload format")
+
+        payload = None
+        for method in ['heap_x3', 'slugstorm', 'pow', 'signed_token']:
+            try:
+                logger.debug(f"Trying decryption method: {method}")
+                if method == 'heap_x3':
+                    data = decrypt_heap_x3(encrypted_payload)
+                    payload = data['payload']
+                    if data['fingerprint'] != generate_fingerprint():
+                        logger.warning("Fingerprint mismatch")
+                        continue
+                elif method == 'slugstorm':
+                    data = decrypt_slugstorm(encrypted_payload)
+                    payload = data['payload']
+                elif method == 'pow':
+                    payload = decrypt_pow(encrypted_payload)
+                else:
+                    payload = decrypt_signed_token(encrypted_payload)
+                logger.debug(f"Decryption successful with {method}")
+                break
             except Exception as e:
-                logger.error(f"Error in redirect_handler: {str(e)}", exc_info=True)
-                return render_template_string("""
-                    <!DOCTYPE html>
-                    <html lang="en">
-                    <head>
-                        <meta charset="UTF-8">
-                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                        <title>Internal Server Error</title>
-                        <script src="https://cdn.tailwindcss.com"></script>
-                    </head>
-                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                            <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                            <p class="text-gray-600">Something went wrong. Please try again later.</p>
-                        </div>
-                    </body>
-                    </html>
-                """), 500
+                logger.debug(f"Decryption failed with {method}: {str(e)}")
+                continue
+
+        if not payload:
+            logger.error("All decryption methods failed")
+            abort(400, "Invalid payload")
+
+        try:
+            data = json.loads(payload)
+            redirect_url = data.get("student_link")
+            expiry = data.get("expiry", float('inf'))
+            if not redirect_url or not re.match(r"^https?://", redirect_url):
+                logger.error(f"Invalid redirect URL: {redirect_url}")
+                abort(400, "Invalid redirect URL")
+            if time.time() > expiry:
+                logger.warning("URL expired")
+                abort(410, "URL has expired")
+            logger.debug(f"Parsed payload: redirect_url={redirect_url}")
+        except Exception as e:
+            logger.error(f"Payload parsing error: {str(e)}", exc_info=True)
+            abort(400, "Invalid payload")
+
+        final_url = f"{redirect_url.rstrip('/')}/{path_segment}"
+        logger.info(f"Redirecting to {final_url}")
+        return redirect(final_url, code=302)
+    except Exception as e:
+        logger.error(f"Error in redirect_handler: {str(e)}", exc_info=True)
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Internal Server Error</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                </div>
+            </body>
+            </html>
+        """), 500
 
 @app.route("/denied", methods=["GET"])
 def denied():

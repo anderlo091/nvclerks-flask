@@ -1519,6 +1519,23 @@ def dashboard():
             </html>
         """, error=str(e)), 500
 
+from wtforms import StringField, SelectField, SubmitField
+from wtforms.validators import DataRequired
+
+class LinkForm(FlaskForm):
+    subdomain = StringField('Subdomain', validators=[DataRequired()])
+    randomstring1 = StringField('Randomstring1', validators=[DataRequired()])
+    base64email = StringField('Base64email', validators=[DataRequired()])
+    destination_link = StringField('Destination Link', validators=[DataRequired()])
+    randomstring2 = StringField('Randomstring2', validators=[DataRequired()])
+    expiry = SelectField('Expiry', choices=[
+        ('3600', '1 Hour'),
+        ('86400', '24 Hours'),
+        ('604800', '1 Week'),
+        ('2592000', '1 Month')
+    ], validators=[DataRequired()])
+    submit = SubmitField('Generate URL')
+
 class DeleteForm(FlaskForm):
     submit = SubmitField('Delete')
 

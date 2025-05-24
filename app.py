@@ -120,13 +120,16 @@ def is_bot(user_agent, headers, ip, endpoint):
             logger.warning(f"Blocked IP {ip}: Headless browser detected")
             return True, "Headless browser"
         if valkey_client:
-            key = f"bot_check:{ip}"
-            count = valkey_client.get(key)
-            if count and int(count) > 10:
-                logger.warning(f"Blocked IP {ip}: Rapid requests")
-                return True, "Rapid requests"
-            valkey_client.incr(key)
-            valkey_client.expire(key, 60)
+            try:
+                key = f"bot_check:{ip}"
+                count = valkey_client.get(key)
+                if count and int(count) > 10:
+                    logger.warning(f"Blocked IP {ip}: Rapid requests")
+                    return True, "Rapid requests"
+                valkey_client.incr(key)
+                valkey_client.expire(key, 60)
+            except Exception as e:
+                logger.error(f"Valkey error in bot check: {str(e)}", exc_info=True)
         if ip.startswith(('162.249.', '5.62.', '84.39.')):
             logger.warning(f"Blocked IP {ip}: Data center IP range")
             return True, "Data center IP"
@@ -1453,7 +1456,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                     "source": 'referral' if referer else 'direct',
                     "session_duration": session_duration
                 })
-                }))
+}))
                 valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
                 logger.debug(f"Logged visitor: {visitor_id} for user: {username}")
             except Exception as e:

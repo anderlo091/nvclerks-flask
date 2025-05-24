@@ -81,20 +81,26 @@ logger.debug("Flask configuration set")
 
 # Valkey initialization
 valkey_client = None
-try:
-    valkey_client = Valkey(
-        host=VALKEY_HOST,
-        port=VALKEY_PORT,
-        username=VALKEY_USERNAME,
-        password=VALKEY_PASSWORD,
-        decode_responses=True,
-        ssl=True
-    )
-    valkey_client.ping()
-    logger.debug("Valkey connection established")
-except Exception as e:
-    logger.error(f"Valkey connection failed: {str(e)}", exc_info=True)
-    raise
+max_retries = 2
+for attempt in range(max_retries):
+    try:
+        valkey_client = Valkey(
+            host=VALKEY_HOST,
+            port=VALKEY_PORT,
+            username=VALKEY_USERNAME,
+            password=VALKEY_PASSWORD,
+            decode_responses=True,
+            ssl=True
+        )
+        valkey_client.ping()
+        logger.debug("Valkey connection established")
+        break
+    except Exception as e:
+        logger.error(f"Valkey connection failed on attempt {attempt+1}: {str(e)}")
+        if attempt < max_retries - 1:
+            time.sleep(0.5)
+            continue
+        raise ValueError("Failed to connect to Valkey")
 
 # Custom Jinja2 filter for datetime
 def datetime_filter(timestamp):
@@ -1169,7 +1175,7 @@ def dashboard():
                     window.onload = function() {
                         try {
                             updateCountdowns();
-                            showTab('urls-tab'); // Initialize with URLs tab
+                            showTab('urls-tab');
                         } catch (e) {
                             console.error('Onload error:', e);
                         }
@@ -1429,7 +1435,7 @@ def dashboard():
                                             {% endfor %}
                                         </tbody>
                                     </table>
-                                </div>
+                               </div>
                                 <a href="/export_visitors" class="mt-4 inline-block bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export Visitors as CSV</a>
                             {% else %}
                                 <p class="text-gray-600">No visitor data available.</p>

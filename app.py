@@ -1398,7 +1398,7 @@ def dashboard():
                             {% endif %}
                         </div>
                     </div>
-                    <div id="access-logs-tab" class="tab-content hidden">
+                   <div id="access-logs-tab" class="tab-content hidden">
                         <div class="bg-white p-8 rounded-xl card">
                             <h2 class="text-2xl font-bold mb-6 text-gray-900">Link Access Logs</h2>
                             {% if access_logs %}
@@ -1812,7 +1812,7 @@ def clear_views(url_id):
                 valkey_client.hset(f"user:{username}:url:{url_id}", "clicks", 0)
                 logger.info(f"Cleared views for URL {url_id} for user: {username}")
                 return redirect(url_for('dashboard'))
-            except Exception as eligne    try:
+            except Exception as e:
                 logger.error(f"Valkey error clearing views for URL {url_id} on attempt {attempt+1}: {str(e)}")
                 if attempt < max_retries - 1:
                     time.sleep(0.5)
@@ -1978,6 +1978,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         session_duration = int(time.time()) - session_start
         access_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
 
+        url_id = hashlib.sha256(request.url.encode()).hexdigest()
         max_retries = 2
         for attempt in range(max_retries):
             try:
@@ -2016,7 +2017,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 logger.error(f"Valkey error updating access or bot log: {str(e)}")
             abort(403, f"Access denied: {bot_reason}")
 
-        url_id = hashlib.sha256(request.url.encode()).hexdigest()
         url_data = None
         for attempt in range(max_retries):
             try:

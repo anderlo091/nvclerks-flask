@@ -1648,11 +1648,12 @@ def export_visitors():
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
+                    <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
             </body>
             </html>
-        """), 500
+        """, error=str(e)), 500
 
 @app.route("/export/<int:index>", methods=["GET"])
 @login_required
@@ -1748,11 +1749,12 @@ def export(index):
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
+                    <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
             </body>
             </html>
-        """), 500
+        """, error=str(e)), 500
 
 @app.route("/delete_url/<url_id>", methods=["POST"])
 @login_required
@@ -1823,11 +1825,12 @@ def delete_url(url_id):
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
+                    <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
             </body>
             </html>
-        """), 500
+        """, error=str(e)), 500
 
 @app.route("/clear_views/<url_id>", methods=["POST"])
 @login_required
@@ -1897,11 +1900,12 @@ def clear_views(url_id):
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
+                    <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
             </body>
             </html>
-        """), 500
+        """, error=str(e)), 500
 
 @app.route("/toggle_url/<url_id>", methods=["POST"])
 @login_required
@@ -1972,11 +1976,12 @@ def toggle_url(url_id):
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
+                    <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
             </body>
             </html>
-        """), 500
+        """, error=str(e)), 500
 
 @app.route("/challenge", methods=["POST"])
 def challenge():
@@ -2013,7 +2018,7 @@ def fingerprint():
 
 @app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>", methods=["GET"], subdomain="<username>")
 @rate_limit(limit=5, per=60)
-def redirect_handler(username,強調表示endpoint, encrypted_payload, path_segment):
+def redirect_handler(username, endpoint, encrypted_payload, path_segment):
     try:
         base_domain = get_base_domain()
         user_agent = request.headers.get("User-Agent", "")
@@ -2022,7 +2027,7 @@ def redirect_handler(username,強調表示endpoint, encrypted_payload, path_segm
         referer = headers.get("Referer", "")
         session_start = session.get('session_start', int(time.time()))
         session['session_start'] = session_start
-        logger.debug(f"Redirect handler called: username={username}, base_domain={base_domain}, endpoint={endpoint}, "
+        logger.debug(f"Redirect handler: username={username}, base_domain={base_domain}, endpoint={endpoint}, "
                      f"encrypted_payload={encrypted_payload[:20]}..., path_segment={path_segment}, "
                      f"IP={ip}, User-Agent={user_agent}, URL={request.url}")
 
@@ -2054,8 +2059,9 @@ def redirect_handler(username,強調表示endpoint, encrypted_payload, path_segm
                     "reason": "Pending"
                 })
                 valkey_client.expire(f"user:{username}:url:{url_id}:access:{access_id}", DATA_RETENTION_DAYS * 86400)
-            except Exception as e:
-                logger.error(f"Valkey error logging access attempt: {str(e)}")
+                logger.debug(f"Logged access attempt: {access_id}")
+            except Exception as e2:
+                logger.error(f"Valkey error logging access attempt: {str(e2)}")
 
         if is_bot_flag or asn_blocked:
             logger.warning(f"Blocked redirect for IP {ip}: {bot_reason}")
@@ -2065,13 +2071,14 @@ def redirect_handler(username,強調表示endpoint, encrypted_payload, path_segm
                         "success": "0",
                         "reason": bot_reason
                     })
-                except Exception as e:
-                    logger.error(f"Valkey error updating access log: {str(e)}")
+                except Exception as e2:
+                    logger.error(f"Valkey error updating access log: {str(e2)}")
             abort(403, f"Access denied: {bot_reason}")
 
         if valkey_client:
             try:
                 url_data = valkey_client.hgetall(f"user:{username}:url:{url_id}")
+                logger.debug(f"Retrieved URL data for {url_id}: {url_data}")
                 if not url_data:
                     logger.warning(f"URL {url_id} not found")
                     abort(404, "URL not found")
@@ -2101,6 +2108,11 @@ def redirect_handler(username,強調表示endpoint, encrypted_payload, path_segm
                         abort(403, "IP not whitelisted")
             except Exception as e:
                 logger.error(f"Valkey error checking URL {url_id}: {str(e)}")
+                valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
+                    "success": "0",
+                    "reason": f"Valkey error: {str(e)}"
+                })
+                abort(500, "Database error")
 
         if valkey_client:
             try:
@@ -2157,12 +2169,16 @@ def redirect_handler(username,強調表示endpoint, encrypted_payload, path_segm
             logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}...")
         except Exception as e:
             logger.error(f"Error decoding encrypted_payload: {str(e)}", exc_info=True)
+            valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
+                "success": "0",
+                "reason": f"Invalid payload format: {str(e)}"
+            })
             abort(400, "Invalid payload format")
 
         payload = None
         for method in ['heap_x3', 'slugstorm', 'pow', 'signed_token']:
             try:
-                logger.debug(f"Trying decryption method: {method}")
+                logger.debug(f"Attempting decryption with method: {method}")
                 if method == 'heap_x3':
                     data = decrypt_heap_x3(encrypted_payload)
                     payload = data['payload']
@@ -2194,6 +2210,7 @@ def redirect_handler(username,強調表示endpoint, encrypted_payload, path_segm
             data = json.loads(payload)
             redirect_url = data.get("student_link")
             expiry = data.get("expiry", float('inf'))
+            logger.debug(f"Parsed payload: redirect_url={redirect_url}, expiry={expiry}")
             if not redirect_url or not re.match(r"^https?://", redirect_url):
                 logger.error(f"Invalid redirect URL: {redirect_url}")
                 valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
@@ -2216,12 +2233,11 @@ def redirect_handler(username,強調表示endpoint, encrypted_payload, path_segm
                     "reason": "URL expired"
                 })
                 abort(410, "URL has expired")
-            logger.debug(f"Parsed payload: redirect_url={redirect_url}")
         except Exception as e:
             logger.error(f"Payload parsing error: {str(e)}", exc_info=True)
             valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
                 "success": "0",
-                "reason": "Invalid payload"
+                "reason": f"Invalid payload: {str(e)}"
             })
             abort(400, "Invalid payload")
 
@@ -2229,7 +2245,8 @@ def redirect_handler(username,強調表示endpoint, encrypted_payload, path_segm
         logger.info(f"Redirecting to {final_url}")
         return redirect(final_url, code=302)
     except Exception as e:
-        logger.error(f"Error in redirect_handler: {str(e)}", exc_info=True)
+        error_message = f"Redirect handler error: {str(e)}"
+        logger.error(error_message, exc_info=True)
         if valkey_client:
             try:
                 access_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
@@ -2237,10 +2254,10 @@ def redirect_handler(username,強調表示endpoint, encrypted_payload, path_segm
                     "timestamp": int(time.time()),
                     "ip": encrypt_signed_token(ip),
                     "success": "0",
-                    "reason": str(e)
+                    "reason": error_message
                 })
-            except Exception as e:
-                logger.error(f"Valkey error logging failed access: {str(e)}")
+            except Exception as e2:
+                logger.error(f"Valkey error logging failed access: {str(e2)}")
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -2258,7 +2275,7 @@ def redirect_handler(username,強調表示endpoint, encrypted_payload, path_segm
                 </div>
             </body>
             </html>
-        """, error=str(e)), 500
+        """, error=error_message), 500
 
 # Fallback route for non-subdomain URLs
 @app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>", methods=["GET"])

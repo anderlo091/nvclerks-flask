@@ -1,11 +1,3 @@
-from flask import Flask, request, redirect, render_template_string, abort, url_for, session, Response
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import hashes, hmac
-from cryptography.hazmat.backends import default_backend
-from flask_wtf import FlaskForm
-from wtforms import StringField, SubmitField, TextAreaField, SelectField
-from wtforms.validators import DataRequired
-from ipaddress import ip_network, ip_address
 import os
 import base64
 import json
@@ -17,6 +9,15 @@ import time
 from datetime import datetime, timedelta
 import uuid
 import hashlib
+import random
+from flask import Flask, request, redirect, render_template_string, abort, url_for, session, Response
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import hashes, hmac
+from cryptography.hazmat.backends import default_backend
+from flask_wtf import FlaskForm
+from wtforms import StringField, SubmitField, TextAreaField, SelectField
+from wtforms.validators import DataRequired
+from ipaddress import ip_network, ip_address
 from valkey import Valkey
 from functools import wraps
 import requests
@@ -37,10 +38,38 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.debug("Initializing Flask app")
 
+# Environment variable validation
+def validate_env_vars():
+    required_vars = {
+        "FLASK_SECRET_KEY": lambda x: len(x) >= 32,
+        "ENCRYPTION_KEY": lambda x: len(base64.b64decode(x)) == 32 if x else False,
+        "HMAC_KEY": lambda x: len(base64.b64decode(x)) == 32 if x else False,
+        "VALKEY_HOST": lambda x: bool(x),
+        "VALKEY_PORT": lambda x: x.isdigit(),
+        "VALKEY_USERNAME": lambda x: bool(x),
+        "VALKEY_PASSWORD": lambda x: bool(x),
+        "USER_TXT_URL": lambda x: bool(x),
+        "DATA_RETENTION_DAYS": lambda x: x.isdigit()
+    }
+    for var, validator in required_vars.items():
+        value = os.getenv(var)
+        if not value or not validator(value):
+            logger.warning(f"Invalid or missing environment variable: {var}")
+
+try:
+    validate_env_vars()
+except Exception as e:
+    logger.error(f"Environment variable validation failed: {str(e)}")
+
 # Environment variables
 FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
-ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", secrets.token_bytes(32))
-HMAC_KEY = os.getenv("HMAC_KEY", secrets.token_bytes(32))
+try:
+    ENCRYPTION_KEY = base64.b64decode(os.getenv("ENCRYPTION_KEY", base64.b64encode(secrets.token_bytes(32)).decode()))
+    HMAC_KEY = base64.b64decode(os.getenv("HMAC_KEY", base64.b64encode(secrets.token_bytes(32)).decode()))
+except Exception as e:
+    logger.error(f"Failed to decode ENCRYPTION_KEY or HMAC_KEY: {str(e)}")
+    ENCRYPTION_KEY = secrets.token_bytes(32)
+    HMAC_KEY = secrets.token_bytes(32)
 VALKEY_HOST = os.getenv("VALKEY_HOST", "valkey-137d99b9-reign.e.aivencloud.com")
 VALKEY_PORT = int(os.getenv("VALKEY_PORT", 25708))
 VALKEY_USERNAME = os.getenv("VALKEY_USERNAME", "default")
@@ -133,7 +162,7 @@ def is_bot(user_agent, headers, ip, endpoint):
 
 def check_asn(ip):
     try:
-        logger.debug("Skipping ASN check (using ipapi.co)")
+        logger.debug("Skipping ASN check (using ipapi.co/freegeoip.app)")
         return False
     except Exception as e:
         logger.error(f"ASN check failed for IP {ip}: {str(e)}", exc_info=True)
@@ -148,34 +177,81 @@ def get_geoip(ip):
             if cached:
                 logger.debug(f"Retrieved geoip from cache for IP {ip}")
                 return json.loads(cached)
-        # Use ipapi.co
-        response = requests.get(f"https://ipapi.co/{ip}/json/")
-        response.raise_for_status()
-        data = response.json()
-        logger.debug(f"ipapi.co response for IP {ip}: {json.dumps(data, indent=2)}")
-        with open('geoip_log.txt', 'a') as f:
-            f.write(f"IP: {ip}, Source: ipapi.co, Response: {json.dumps(data, indent=2)}\n")
-        result = {
-            "country": str(data.get('country_name', 'Unknown')),
-            "city": str(data.get('city', 'Unknown')),
-            "region": str(data.get('region', 'Unknown')),
-            "lat": float(data.get('latitude', 0.0)),
-            "lon": float(data.get('longitude', 0.0)),
-            "isp": str(data.get('org', 'Unknown')),
-            "timezone": str(data.get('timezone', 'Unknown'))
-        }
-        # Cache result
-        if valkey_client:
+        # Try ipapi.co with exponential backoff
+        max_retries = 2
+        for attempt in range(max_retries):
             try:
-                valkey_client.setex(cache_key, 3600, json.dumps(result))
-                logger.debug(f"Cached geoip for IP {ip}")
-            except Exception as e:
-                logger.error(f"Valkey error caching geoip for IP {ip}: {str(e)}")
-        return result
+                response = requests.get(f"https://ipapi.co/{ip}/json/")
+                response.raise_for_status()
+                data = response.json()
+                logger.debug(f"ipapi.co response for IP {ip}: {json.dumps(data, indent=2)}")
+                try:
+                    with open('/tmp/geoip_log.txt', 'a') as f:
+                        f.write(f"IP: {ip}, Source: ipapi.co, Response: {json.dumps(data, indent=2)}\n")
+                except Exception as log_e:
+                    logger.warning(f"Failed to write to /tmp/geoip_log.txt: {str(log_e)}")
+                    logger.debug(f"IP: {ip}, Source: ipapi.co, Response: {json.dumps(data, indent=2)}")
+                result = {
+                    "country": str(data.get('country_name', 'Unknown')),
+                    "city": str(data.get('city', 'Unknown')),
+                    "region": str(data.get('region', 'Unknown')),
+                    "lat": float(data.get('latitude', 0.0)),
+                    "lon": float(data.get('longitude', 0.0)),
+                    "isp": str(data.get('org', 'Unknown')),
+                    "timezone": str(data.get('timezone', 'Unknown'))
+                }
+                # Cache result
+                if valkey_client:
+                    try:
+                        valkey_client.setex(cache_key, 86400, json.dumps(result))
+                        logger.debug(f"Cached geoip for IP {ip}")
+                    except Exception as e:
+                        logger.error(f"Valkey error caching geoip for IP {ip}: {str(e)}")
+                return result
+            except requests.exceptions.HTTPError as e:
+                if response.status_code == 429 and attempt < max_retries - 1:
+                    sleep_time = (2 ** attempt) + (random.randint(0, 1000) / 1000)
+                    logger.warning(f"ipapi.co 429 error for IP {ip}, retrying in {sleep_time}s")
+                    time.sleep(sleep_time)
+                    continue
+                logger.error(f"ipapi.co failed for IP {ip}: {str(e)}")
+                break
+        # Fallback to freegeoip.app
+        try:
+            response = requests.get(f"https://freegeoip.app/json/{ip}")
+            response.raise_for_status()
+            data = response.json()
+            logger.debug(f"freegeoip.app response for IP {ip}: {json.dumps(data, indent=2)}")
+            try:
+                with open('/tmp/geoip_log.txt', 'a') as f:
+                    f.write(f"IP: {ip}, Source: freegeoip.app, Response: {json.dumps(data, indent=2)}\n")
+            except Exception as log_e:
+                logger.warning(f"Failed to write to /tmp/geoip_log.txt: {str(log_e)}")
+                logger.debug(f"IP: {ip}, Source: freegeoip.app, Response: {json.dumps(data, indent=2)}")
+            result = {
+                "country": str(data.get('country_name', 'Unknown')),
+                "city": str(data.get('city', 'Unknown')),
+                "region": str(data.get('region_name', 'Unknown')),
+                "lat": float(data.get('latitude', 0.0)),
+                "lon": float(data.get('longitude', 0.0)),
+                "isp": str(data.get('isp', 'Unknown')),
+                "timezone": str(data.get('time_zone', 'Unknown'))
+            }
+            # Cache result
+            if valkey_client:
+                try:
+                    valkey_client.setex(cache_key, 86400, json.dumps(result))
+                    logger.debug(f"Cached geoip for IP {ip}")
+                except Exception as e:
+                    logger.error(f"Valkey error caching geoip for IP {ip}: {str(e)}")
+            return result
+        except Exception as e:
+            logger.error(f"freegeoip.app failed for IP {ip}: {str(e)}")
+            logger.debug(f"IP: {ip}, Error: {str(e)}")
+            return {"country": "Unknown", "city": "Unknown", "region": "Unknown", "lat": 0.0, "lon": 0.0, "isp": "Unknown", "timezone": "Unknown"}
     except Exception as e:
-        logger.error(f"ipapi.co failed for IP {ip}: {str(e)}")
-        with open('geoip_log.txt', 'a') as f:
-            f.write(f"IP: {ip}, Error: {str(e)}\n")
+        logger.error(f"get_geoip failed for IP {ip}: {str(e)}", exc_info=True)
+        logger.debug(f"IP: {ip}, Error: {str(e)}")
         return {"country": "Unknown", "city": "Unknown", "region": "Unknown", "lat": 0.0, "lon": 0.0, "isp": "Unknown", "timezone": "Unknown"}
 
 def rate_limit(limit=5, per=60):
@@ -762,7 +838,7 @@ def dashboard():
                     error = "Failed to encrypt payload"
 
                 if not error:
-                    generated_url = f"https://{urllib.parse.quote(subdomain)}.{base_domain}/{endpoint}/{urllib.parse.quote(encoded_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
+                    generated_url = f"https://{urllib.parse.quote(subdomain)}.{base_domain}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
                     url_id = hashlib.sha256(generated_url.encode()).hexdigest()
                     if valkey_client:
                         try:
@@ -1336,7 +1412,8 @@ def dashboard():
                                 <p class="text-gray-600">No bot detections logged.</p>
                             {% endif %}
                         </div>
-                    </div> <div id="access-logs-tab" class="tab-content hidden">
+                   </div>
+                    <div id="access-logs-tab" class="tab-content hidden">
                         <div class="bg-white p-8 rounded-xl card">
                             <h2 class="text-2xl font-bold mb-6 text-gray-900">Link Access Logs</h2>
                             {% if access_logs %}
@@ -1368,7 +1445,7 @@ def dashboard():
                                 <p class="text-gray-600">No access logs available.</p>
                             {% endif %}
                         </div>
-                   </div>
+                    </div>
                     <div id="analytics-tab" class="tab-content hidden">
                         <div class="bg-white p-8 rounded-xl card">
                             <h2 class="text-2xl font-bold mb-6 text-gray-900">Traffic Analytics</h2>

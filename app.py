@@ -1374,7 +1374,7 @@ def dashboard():
                                 <p class="text-gray-600">No access logs available.</p>
                             {% endif %}
                         </div>
-                   </div>
+                  </div>
                     <div id="analytics-tab" class="tab-content hidden">
                         <div class="bg-white p-8 rounded-xl card">
                             <h2 class="text-2xl font-bold mb-6 text-gray-900">Traffic Analytics</h2>
@@ -2016,6 +2016,11 @@ def fingerprint():
         logger.error(f"Error in fingerprint: {str(e)}", exc_info=True)
         return {"status": "error"}, 500
 
+@app.route("/favicon.ico", methods=["GET"])
+def favicon():
+    logger.debug("Favicon requested, returning 204")
+    return "", 204
+
 @app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>", methods=["GET"], subdomain="<username>")
 @rate_limit(limit=5, per=60)
 def redirect_handler(username, endpoint, encrypted_payload, path_segment):
@@ -2048,10 +2053,10 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         location = get_geoip(ip)
         session_duration = int(time.time()) - session_start
         url_id = hashlib.sha256(request.url.encode()).hexdigest()
+        access_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
 
         if valkey_client:
             try:
-                access_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
                 valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
                     "timestamp": int(time.time()),
                     "ip": encrypt_signed_token(ip),
@@ -2060,8 +2065,8 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 })
                 valkey_client.expire(f"user:{username}:url:{url_id}:access:{access_id}", DATA_RETENTION_DAYS * 86400)
                 logger.debug(f"Logged access attempt: {access_id}")
-            except Exception as e2:
-                logger.error(f"Valkey error logging access attempt: {str(e2)}")
+            except Exception as e:
+                logger.error(f"Valkey error logging access attempt: {str(e)}")
 
         if is_bot_flag or asn_blocked:
             logger.warning(f"Blocked redirect for IP {ip}: {bot_reason}")
@@ -2071,16 +2076,21 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                         "success": "0",
                         "reason": bot_reason
                     })
-                except Exception as e2:
-                    logger.error(f"Valkey error updating access log: {str(e2)}")
+                except Exception as e:
+                    logger.error(f"Valkey error updating access log: {str(e)}")
             abort(403, f"Access denied: {bot_reason}")
 
         if valkey_client:
             try:
+                logger.debug(f"Checking URL key: user:{username}:url:{url_id}")
                 url_data = valkey_client.hgetall(f"user:{username}:url:{url_id}")
                 logger.debug(f"Retrieved URL data for {url_id}: {url_data}")
                 if not url_data:
-                    logger.warning(f"URL {url_id} not found")
+                    logger.warning(f"URL {url_id} not found in Valkey")
+                    valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
+                        "success": "0",
+                        "reason": "URL not found"
+                    })
                     abort(404, "URL not found")
                 if url_data.get('disabled', '0') == '1':
                     logger.warning(f"URL {url_id} is disabled")
@@ -2112,7 +2122,46 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                     "success": "0",
                     "reason": f"Valkey error: {str(e)}"
                 })
-                abort(500, "Database error")
+                return render_template_string("""
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Database Error</title>
+                        <script src="https://cdn.tailwindcss.com"></script>
+                    </head>
+                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                            <h3 class="text-lg font-bold mb-4 text-red-600">Database Error</h3>
+                            <p class="text-gray-600">Unable to access URL data. Please try again later.</p>
+                        </div>
+                    </body>
+                    </html>
+                """), 500
+        else:
+            logger.warning("Valkey unavailable for URL check")
+            valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
+                "success": "0",
+                "reason": "Database unavailable"
+            })
+            return render_template_string("""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Database Error</title>
+                    <script src="https://cdn.tailwindcss.com"></script>
+                </head>
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Database Error</h3>
+                        <p class="text-gray-600">Database unavailable. Please try again later.</p>
+                    </div>
+                </body>
+                </html>
+            """), 500
 
         if valkey_client:
             try:

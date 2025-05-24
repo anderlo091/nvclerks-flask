@@ -1,4 +1,6 @@
 from flask import Flask, request, redirect, render_template_string, abort, url_for, session, Response
+from flask_wtf import FlaskForm
+from wtforms import SubmitField
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.backends import default_backend
@@ -62,6 +64,7 @@ app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SECURE'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Strict'
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=1)
+app.config['WTF_CSRF_ENABLED'] = True
 logger.debug("Flask configuration set")
 
 # Valkey initialization
@@ -660,6 +663,29 @@ def index():
             </html>
         """), 500
 
+class LinkForm(FlaskForm):
+    subdomain = StringField('Subdomain', validators=[DataRequired()])
+    randomstring1 = StringField('Randomstring1', validators=[DataRequired()])
+    base64email = StringField('Base64email', validators=[DataRequired()])
+    destination_link = StringField('Destination Link', validators=[DataRequired()])
+    randomstring2 = StringField('Randomstring2', validators=[DataRequired()])
+    expiry = SelectField('Expiry', choices=[
+        ('3600', '1 Hour'),
+        ('86400', '24 Hours'),
+        ('604800', '1 Week'),
+        ('2592000', '1 Month')
+    ], validators=[DataRequired()])
+    submit = SubmitField('Generate URL')
+
+class DeleteForm(FlaskForm):
+    submit = SubmitField('Delete')
+
+class ClearViewsForm(FlaskForm):
+    submit = SubmitField('Clear Views')
+
+class ToggleForm(FlaskForm):
+    submit = SubmitField('Toggle')
+
 @app.route("/dashboard", methods=["GET", "POST"])
 @login_required
 @rate_limit(limit=5, per=60)
@@ -667,23 +693,19 @@ def dashboard():
     try:
         username = session['username']
         logger.debug(f"Dashboard accessed for user: {username}")
+        form = LinkForm()
         base_domain = get_base_domain()
         error = None
         success = None
 
-        if request.method == "POST":
-            logger.debug(f"Processing form: {request.form}")
-            subdomain = request.form.get("subdomain", "default").strip().lower()
-            randomstring1 = request.form.get("randomstring1", "default").strip()
-            base64email = request.form.get("base64email", "default").strip()
-            destination_link = request.form.get("destination_link", "https://example.com").strip()
-            randomstring2 = request.form.get("randomstring2", generate_random_string(8)).strip()
-            expiry = request.form.get("expiry", "86400")
-            try:
-                expiry = int(expiry)
-            except ValueError:
-                logger.error("Invalid expiry value, defaulting to 86400")
-                expiry = 86400
+        if request.method == "POST" and form.validate_on_submit():
+            logger.debug(f"Processing form: {form.data}")
+            subdomain = form.subdomain.data.strip().lower()
+            randomstring1 = form.randomstring1.data.strip()
+            base64email = form.base64email.data.strip()
+            destination_link = form.destination_link.data.strip()
+            randomstring2 = form.randomstring2.data.strip()
+            expiry = int(form.expiry.data)
 
             if not re.match(r"^https?://", destination_link):
                 error = "Invalid URL"
@@ -853,7 +875,7 @@ def dashboard():
                     decrypted_ip = decrypt_signed_token(visitor_data.get('ip', encrypt_signed_token('Unknown')))
                     decrypted_ua = decrypt_signed_token(visitor_data.get('user_agent', encrypt_signed_token('Unknown')))
                     visitors.append({
-                        "timestamp": datetime.fromtimestamp(int(visitor_data.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S JST') if visitor_data.get('timestamp') else 'Unknown',
+                        "timestamp": int(visitor_data.get('timestamp', 0)),
                         "ip": decrypted_ip,
                         "country": visitor_data.get('country', 'Unknown'),
                         "region": visitor_data.get('region', 'Unknown'),
@@ -1116,36 +1138,32 @@ def dashboard():
                         <div class="bg-white p-8 rounded-xl card mb-8">
                             <h2 class="text-2xl font-bold mb-6 text-gray-900">Generate New URL</h2>
                             <form method="POST" class="space-y-5">
+                                {{ form.hidden_tag() }}
                                 <div>
-                                    <label class="block text-sm font-medium text-gray-700">Subdomain</label>
-                                    <input type="text" name="subdomain" required minlength="2" maxlength="100" pattern="[a-z0-9-]{2,100}" title="Subdomain must be 2-100 characters (letters, numbers, or hyphens)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                                    <label class="block text-sm font-medium text-gray-700">{{ form.subdomain.label }}</label>
+                                    {{ form.subdomain(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition", **{'title': "Subdomain must be 2-100 characters (letters, numbers, or hyphens)"}) }}
                                 </div>
                                 <div>
-                                    <label class="block text-sm font-medium text-gray-700">Randomstring1</label>
-                                    <input type="text" name="randomstring1" required minlength="2" maxlength="100" pattern="[A-Za-z0-9_@.]{2,100}" title="Randomstring1 must be 2-100 characters (letters, numbers, _, @, .)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                                    <label class="block text-sm font-medium text-gray-700">{{ form.randomstring1.label }}</label>
+                                    {{ form.randomstring1(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition", **{'title': "Randomstring1 must be 2-100 characters (letters, numbers, _, @, .)"}) }}
                                 </div>
                                 <div>
-                                    <label class="block text-sm font-medium text-gray-700">Base64email</label>
-                                    <input type="text" name="base64email" required minlength="2" maxlength="100" pattern="[A-Za-z0-9_@.]{2,100}" title="Base64email must be 2-100 characters (letters, numbers, _, @, .)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                                    <label class="block text-sm font-medium text-gray-700">{{ form.base64email.label }}</label>
+                                    {{ form.base64email(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition", **{'title': "Base64email must be 2-100 characters (letters, numbers, _, @, .)"}) }}
                                 </div>
                                 <div>
-                                    <label class="block text-sm font-medium text-gray-700">Destination Link</label>
-                                    <input type="url" name="destination_link" required class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                                    <label class="block text-sm font-medium text-gray-700">{{ form.destination_link.label }}</label>
+                                    {{ form.destination_link(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
                                 </div>
                                 <div>
-                                    <label class="block text-sm font-medium text-gray-700">Randomstring2</label>
-                                    <input type="text" name="randomstring2" required minlength="2" maxlength="100" pattern="[A-Za-z0-9_@.]{2,100}" title="Randomstring2 must be 2-100 characters (letters, numbers, _, @, .)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                                    <label class="block text-sm font-medium text-gray-700">{{ form.randomstring2.label }}</label>
+                                    {{ form.randomstring2(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition", **{'title': "Randomstring2 must be 2-100 characters (letters, numbers, _, @, .)"}) }}
                                 </div>
                                 <div>
-                                    <label class="block text-sm font-medium text-gray-700">Expiry</label>
-                                    <select name="expiry" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
-                                        <option value="3600">1 Hour</option>
-                                        <option value="86400" selected>1 Day</option>
-                                        <option value="604800">1 Week</option>
-                                        <option value="2592000">1 Month</option>
-                                    </select>
+                                    <label class="block text-sm font-medium text-gray-700">{{ form.expiry.label }}</label>
+                                    {{ form.expiry(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
                                 </div>
-                                <button type="submit" class="w-full bg-indigo-600 text-white p-3 rounded-lg hover:bg-indigo-700 transition">Generate URL</button>
+                                {{ form.submit(class="w-full bg-indigo-600 text-white p-3 rounded-lg hover:bg-indigo-700 transition") }}
                             </form>
                         </div>
                         <div class="bg-white p-8 rounded-xl card">
@@ -1157,12 +1175,21 @@ def dashboard():
                                         <p class="text-gray-600 break-all"><strong>URL:</strong> <a href="{{ url.url }}" target="_blank" class="text-indigo-600">{{ url.url }}</a></p>
                                         <p class="text-gray-600"><strong>Path Segment:</strong> {{ url.path_segment }}</p>
                                         <p class="text-gray-600"><strong>Created:</strong> {{ url.created }}</p>
-                                        <p class="text-gray-600"><strong>Expires:</strong> <span class="countdown" data-expiry="{{ url.expiry }}">{{ 'Expired' if url.expiry < (now() | int) else url.expiry | datetime }}</span></p>
+                                        <p class="text-gray-600"><strong>Expires:</strong> <span class="countdown" data-expiry="{{ url.expiry }}">{{ 'Expired' if url.expiry < now else url.expiry | datetime }}</span></p>
                                         <p class="text-gray-600"><strong>Clicks:</strong> {{ url.clicks }}</p>
                                         <p class="text-gray-600"><strong>Status:</strong> {{ 'Disabled' if url.disabled else 'Active' }}</p>
                                         <p class="text-gray-600"><strong>Preview:</strong> <a href="{{ url.destination }}" target="_blank" class="text-indigo-600">{{ url.destination }}</a></p>
                                         <div class="mt-2 flex space-x-2">
+                                            <form action="{{ url_for('delete_url', url_id=url.id) }}" method="POST">
+                                                {{ form.hidden_tag() }}
+                                                <button type="submit" class="bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700">Delete</button>
+                                            </form>
+                                            <form action="{{ url_for('clear_views', url_id=url.id) }}" method="POST">
+                                                {{ form.hidden_tag() }}
+                                                <button type="submit" class="bg-yellow-600 text-white px-4 py-2 rounded-lg hover:bg-yellow-700">Clear Views</button>
+                                            </form>
                                             <form action="{{ url_for('toggle_url', url_id=url.id) }}" method="POST">
+                                                {{ form.hidden_tag() }}
                                                 <button type="submit" class="bg-gray-600 text-white px-4 py-2 rounded-lg hover:bg-gray-700">{{ 'Enable' if url.disabled else 'Disable' }}</button>
                                             </form>
                                             <button onclick="toggleAnalytics('{{ loop.index }}')" class="bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700">Toggle Analytics</button>
@@ -1315,7 +1342,7 @@ def dashboard():
                                         <tbody>
                                             {% for visitor in visitors %}
                                                 <tr class="{% if visitor.bot_status != 'Human' %}bot{% endif %}">
-                                                    <td data-timestamp="{{ visitor.timestamp }}">{{ visitor.timestamp }}</td>
+                                                    <td data-timestamp="{{ visitor.timestamp }}">{{ visitor.timestamp | datetime }}</td>
                                                     <td>{{ visitor.ip }}</td>
                                                     <td>{{ visitor.country }}</td>
                                                     <td>{{ visitor.region }}</td>
@@ -1469,7 +1496,8 @@ def dashboard():
         """, username=username, urls=urls, visitors=visitors, bot_logs=bot_logs, access_logs=access_logs,
            traffic_sources_keys=traffic_sources_keys, traffic_sources_values=traffic_sources_values,
            bot_ratio_keys=bot_ratio_keys, bot_ratio_values=bot_ratio_values,
-           primary_color=primary_color, error=error, success=success, valkey_error=valkey_error)
+           primary_color=primary_color, error=error, success=success, valkey_error=valkey_error,
+           form=form, now=int(time.time()))
     except Exception as e:
         logger.error(f"Dashboard error for user {username}: {str(e)}", exc_info=True)
         return render_template_string("""
@@ -1490,6 +1518,15 @@ def dashboard():
             </body>
             </html>
         """, error=str(e)), 500
+
+class DeleteForm(FlaskForm):
+    submit = SubmitField('Delete')
+
+class ClearViewsForm(FlaskForm):
+    submit = SubmitField('Clear Views')
+
+class ToggleForm(FlaskForm):
+    submit = SubmitField('Toggle')
 
 @app.route("/export_visitors", methods=["GET"])
 @login_required
@@ -1698,9 +1735,132 @@ def export(index):
             </html>
         """), 500
 
+@app.route("/delete_url/<url_id>", methods=["POST"])
+@login_required
+def delete_url(url_id):
+    form = DeleteForm()
+    if not form.validate_on_submit():
+        logger.warning(f"CSRF validation failed for delete_url: {url_id}")
+        abort(403, "Invalid CSRF token")
+    try:
+        username = session['username']
+        logger.debug(f"Deleting URL {url_id} for user: {username}")
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                valkey_client.delete(f"user:{username}:url:{url_id}")
+                valkey_client.delete(f"user:{username}:url:{url_id}:visits")
+                valkey_client.delete(f"user:{username}:url:{url_id}:access:*")
+                logger.info(f"Deleted URL {url_id} for user: {username}")
+                return redirect(url_for('dashboard'))
+            except Exception as e:
+                logger.error(f"Valkey error deleting URL {url_id} on attempt {attempt+1}: {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(0.5)
+                    continue
+                return render_template_string("""
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Error</title>
+                        <script src="https://cdn.tailwindcss.com"></script>
+                    </head>
+                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                            <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                            <p class="text-gray-600">Failed to delete URL. Please try again.</p>
+                        </div>
+                    </body>
+                    </html>
+                """), 500
+    except Exception as e:
+        logger.error(f"Error in delete_url: {str(e)}", exc_info=True)
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Internal Server Error</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                </div>
+            </body>
+            </html>
+        """), 500
+
+@app.route("/clear_views/<url_id>", methods=["POST"])
+@login_required
+def clear_views(url_id):
+    form = ClearViewsForm()
+    if not form.validate_on_submit():
+        logger.warning(f"CSRF validation failed for clear_views: {url_id}")
+        abort(403, "Invalid CSRF token")
+    try:
+        username = session['username']
+        logger.debug(f"Clearing views for URL {url_id} for user: {username}")
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                valkey_client.delete(f"user:{username}:url:{url_id}:visits")
+                valkey_client.hset(f"user:{username}:url:{url_id}", "clicks", 0)
+                logger.info(f"Cleared views for URL {url_id} for user: {username}")
+                return redirect(url_for('dashboard'))
+            except Exception as eligne    try:
+                logger.error(f"Valkey error clearing views for URL {url_id} on attempt {attempt+1}: {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(0.5)
+                    continue
+                return render_template_string("""
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Error</title>
+                        <script src="https://cdn.tailwindcss.com"></script>
+                    </head>
+                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                            <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                            <p class="text-gray-600">Failed to clear views. Please try again.</p>
+                        </div>
+                    </body>
+                    </html>
+                """), 500
+    except Exception as e:
+        logger.error(f"Error in clear_views: {str(e)}", exc_info=True)
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Internal Server Error</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                </div>
+            </body>
+            </html>
+        """), 500
+
 @app.route("/toggle_url/<url_id>", methods=["POST"])
 @login_required
 def toggle_url(url_id):
+    form = ToggleForm()
+    if not form.validate_on_submit():
+        logger.warning(f"CSRF validation failed for toggle_url: {url_id}")
+        abort(403, "Invalid CSRF token")
     try:
         username = session['username']
         logger.debug(f"Toggling URL {url_id} for user: {username}")
@@ -1821,13 +1981,13 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         max_retries = 2
         for attempt in range(max_retries):
             try:
-                valkey_client.hset(f"user:{username}:url:{access_id}:access:{access_id}", mapping={
+                valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
                     "timestamp": int(time.time()),
                     "ip": encrypt_signed_token(ip),
                     "success": "0",
                     "reason": "Pending"
                 })
-                valkey_client.expire(f"user:{username}:url:{access_id}:access:{access_id}", DATA_RETENTION_DAYS * 86400)
+                valkey_client.expire(f"user:{username}:url:{url_id}:access:{access_id}", DATA_RETENTION_DAYS * 86400)
                 logger.debug(f"Logged access attempt: {access_id} for user: {username}")
                 break
             except Exception as e:
@@ -1839,7 +1999,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         if is_bot_flag:
             logger.warning(f"Blocked redirect for IP {ip}: {bot_reason}")
             try:
-                valkey_client.hset(f"user:{username}:url:{access_id}:access:{access_id}", mapping={
+                valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
                     "success": "0",
                     "reason": bot_reason
                 })

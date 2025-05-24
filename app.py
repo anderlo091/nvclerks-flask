@@ -2013,7 +2013,7 @@ def fingerprint():
 
 @app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>", methods=["GET"], subdomain="<username>")
 @rate_limit(limit=5, per=60)
-def redirect_handler(username, endpoint, encrypted_payload, path_segment):
+def redirect_handler(username,強調表示endpoint, encrypted_payload, path_segment):
     try:
         base_domain = get_base_domain()
         user_agent = request.headers.get("User-Agent", "")

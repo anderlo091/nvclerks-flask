@@ -38,12 +38,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.debug("Initializing Flask app")
 
-# Environment variable validation
+# Validate environment variables
 def validate_env_vars():
     required_vars = {
         "FLASK_SECRET_KEY": lambda x: len(x) >= 32,
-        "ENCRYPTION_KEY": lambda x: len(base64.b64decode(x)) == 32 if x else False,
-        "HMAC_KEY": lambda x: len(base64.b64decode(x)) == 32 if x else False,
+        "ENCRYPTION_KEY": lambda x: len(base64.b64decode(x)) == 32,
+        "HMAC_KEY": lambda x: len(base64.b64decode(x)) == 32,
         "VALKEY_HOST": lambda x: bool(x),
         "VALKEY_PORT": lambda x: x.isdigit(),
         "VALKEY_USERNAME": lambda x: bool(x),
@@ -54,28 +54,21 @@ def validate_env_vars():
     for var, validator in required_vars.items():
         value = os.getenv(var)
         if not value or not validator(value):
-            logger.warning(f"Invalid or missing environment variable: {var}")
+            logger.error(f"Missing or invalid environment variable: {var}")
+            raise ValueError(f"Environment variable {var} is missing or invalid")
 
-try:
-    validate_env_vars()
-except Exception as e:
-    logger.error(f"Environment variable validation failed: {str(e)}")
+validate_env_vars()
 
 # Environment variables
-FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
-try:
-    ENCRYPTION_KEY = base64.b64decode(os.getenv("ENCRYPTION_KEY", base64.b64encode(secrets.token_bytes(32)).decode()))
-    HMAC_KEY = base64.b64decode(os.getenv("HMAC_KEY", base64.b64encode(secrets.token_bytes(32)).decode()))
-except Exception as e:
-    logger.error(f"Failed to decode ENCRYPTION_KEY or HMAC_KEY: {str(e)}")
-    ENCRYPTION_KEY = secrets.token_bytes(32)
-    HMAC_KEY = secrets.token_bytes(32)
-VALKEY_HOST = os.getenv("VALKEY_HOST", "valkey-137d99b9-reign.e.aivencloud.com")
-VALKEY_PORT = int(os.getenv("VALKEY_PORT", 25708))
-VALKEY_USERNAME = os.getenv("VALKEY_USERNAME", "default")
-VALKEY_PASSWORD = os.getenv("VALKEY_PASSWORD", "AVNS_Yzfa75IOznjCrZJIyzI")
-USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/anderlo091/nvclerks-flask/main/user.txt")
-DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", 90))
+FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY")
+ENCRYPTION_KEY = base64.b64decode(os.getenv("ENCRYPTION_KEY"))
+HMAC_KEY = base64.b64decode(os.getenv("HMAC_KEY"))
+VALKEY_HOST = os.getenv("VALKEY_HOST")
+VALKEY_PORT = int(os.getenv("VALKEY_PORT"))
+VALKEY_USERNAME = os.getenv("VALKEY_USERNAME")
+VALKEY_PASSWORD = os.getenv("VALKEY_PASSWORD")
+USER_TXT_URL = os.getenv("USER_TXT_URL")
+DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS"))
 
 # Flask configuration
 app.config['SECRET_KEY'] = FLASK_SECRET_KEY
@@ -101,7 +94,7 @@ try:
     logger.debug("Valkey connection established")
 except Exception as e:
     logger.error(f"Valkey connection failed: {str(e)}", exc_info=True)
-    valkey_client = None
+    raise
 
 # Custom Jinja2 filter for datetime
 def datetime_filter(timestamp):
@@ -127,12 +120,11 @@ def is_bot(user_agent, headers, ip, endpoint):
             if ua.browser.family in TRUSTED_USER_AGENTS:
                 logger.debug(f"Trusted user-agent {ua.browser.family} for IP {ip}, bypassing JS verification")
                 return False, "Trusted browser"
-            if valkey_client:
-                session_key = f"user:session:{ip}"
-                js_verified = valkey_client.get(session_key)
-                if js_verified == "1":
-                    logger.debug(f"JS verification found in Valkey for IP {ip}")
-                    return False, "JS verified"
+            session_key = f"user:session:{ip}"
+            js_verified = valkey_client.get(session_key)
+            if js_verified == "1":
+                logger.debug(f"JS verification found in Valkey for IP {ip}")
+                return False, "JS verified"
             logger.warning(f"Blocked IP {ip}: Missing JS verification")
             return True, "Missing JS verification"
         if not user_agent:
@@ -146,14 +138,13 @@ def is_bot(user_agent, headers, ip, endpoint):
         if 'HeadlessChrome' in user_agent or 'PhantomJS' in user_agent:
             logger.warning(f"Blocked IP {ip}: Headless browser")
             return True, "Headless browser"
-        if valkey_client:
-            key = f"bot_check:{ip}"
-            count = valkey_client.get(key)
-            if count and int(count) > 2:
-                logger.warning(f"Blocked IP {ip}: Rapid requests")
-                return True, "Rapid requests"
-            valkey_client.incr(key)
-            valkey_client.expire(key, 60)
+        key = f"bot_check:{ip}"
+        count = valkey_client.get(key)
+        if count and int(count) > 2:
+            logger.warning(f"Blocked IP {ip}: Rapid requests")
+            return True, "Rapid requests"
+        valkey_client.incr(key)
+        valkey_client.expire(key, 60)
         if ip.startswith(('162.249.', '5.62.', '84.39.', '37.19.200.')):
             logger.warning(f"Blocked IP {ip}: Data center IP")
             return True, "Data center IP"
@@ -166,27 +157,13 @@ def is_bot(user_agent, headers, ip, endpoint):
         logger.error(f"Error in is_bot for IP {ip}: {str(e)}", exc_info=True)
         return True, "Error in bot detection"
 
-def check_asn(ip):
-    try:
-        response = requests.get(f"https://ipapi.co/{ip}/json/")
-        response.raise_for_status()
-        data = response.json()
-        if data.get('asn') == 'AS212238':
-            logger.warning(f"Blocked IP {ip}: Bot ASN AS212238")
-            return True
-        return False
-    except Exception as e:
-        logger.error(f"ASN check failed for IP {ip}: {str(e)}")
-        return False
-
 def get_geoip(ip):
     try:
-        if valkey_client:
-            cache_key = f"geoip:{ip}"
-            cached = valkey_client.get(cache_key)
-            if cached:
-                logger.debug(f"GeoIP cache hit for IP {ip}")
-                return json.loads(cached)
+        cache_key = f"geoip:{ip}"
+        cached = valkey_client.get(cache_key)
+        if cached:
+            logger.debug(f"GeoIP cache hit for IP {ip}")
+            return json.loads(cached)
         max_retries = 2
         for attempt in range(max_retries):
             try:
@@ -209,9 +186,8 @@ def get_geoip(ip):
                     "isp": str(data.get('org', 'Unknown')),
                     "timezone": str(data.get('timezone', 'Unknown'))
                 }
-                if valkey_client:
-                    valkey_client.setex(cache_key, 86400, json.dumps(result))
-                    logger.debug(f"GeoIP cached for IP {ip}")
+                valkey_client.setex(cache_key, 86400, json.dumps(result))
+                logger.debug(f"GeoIP cached for IP {ip}")
                 return result
             except requests.exceptions.HTTPError as e:
                 if response.status_code == 429 and attempt < max_retries - 1:
@@ -241,9 +217,8 @@ def get_geoip(ip):
                 "isp": str(data.get('isp', 'Unknown')),
                 "timezone": str(data.get('time_zone', 'Unknown'))
             }
-            if valkey_client:
-                valkey_client.setex(cache_key, 86400, json.dumps(result))
-                logger.debug(f"GeoIP cached for IP {ip}")
+            valkey_client.setex(cache_key, 86400, json.dumps(result))
+            logger.debug(f"GeoIP cached for IP {ip}")
             return result
         except Exception as e:
             logger.error(f"freegeoip.app failed for IP {ip}: {str(e)}")
@@ -265,9 +240,6 @@ def rate_limit(limit=5, per=60, bot_limit=2):
                 if is_bot_flag:
                     logger.warning(f"Blocked request from IP {ip}: {bot_reason}")
                     abort(403, f"Access denied: {bot_reason}")
-                if not valkey_client:
-                    logger.warning("Valkey unavailable, skipping rate limit")
-                    return f(*args, **kwargs)
                 effective_limit = bot_limit if is_bot_flag else limit
                 key = f"rate_limit:{ip}:{f.__name__}"
                 current = valkey_client.get(key)
@@ -409,18 +381,15 @@ def decrypt_signed_token(encrypted):
 
 def get_valid_usernames():
     try:
-        if valkey_client:
-            cached = valkey_client.get("usernames")
-            if cached:
-                logger.debug("Retrieved usernames from Valkey cache")
-                return json.loads(cached)
+        cached = valkey_client.get("usernames")
+        if cached:
+            logger.debug("Retrieved usernames from Valkey cache")
+            return json.loads(cached)
         response = requests.get(USER_TXT_URL)
         response.raise_for_status()
         usernames = [line.strip() for line in response.text.splitlines() if line.strip()]
-        if valkey_client:
-            valkey_client.setex("usernames", 3600, json.dumps(usernames))
-            logger.debug("Cached usernames in Valkey")
-        logger.debug(f"Fetched {len(usernames)} usernames")
+        valkey_client.setex("usernames", 3600, json.dumps(usernames))
+        logger.debug(f"Cached {len(usernames)} usernames in Valkey")
         return usernames
     except Exception as e:
         logger.error(f"Error fetching usernames: {str(e)}")
@@ -474,41 +443,57 @@ def log_visitor():
             visit_type = "App"
         location = get_geoip(ip)
         session_duration = int(time.time()) - session_start
-        if valkey_client:
-            visitor_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
-            encrypted_ip = encrypt_signed_token(ip)
-            encrypted_ua = encrypt_signed_token(user_agent[:100])
-            valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
-                "timestamp": int(time.time()),
-                "ip": encrypted_ip,
-                "country": location['country'],
-                "region": location['region'],
-                "city": location['city'],
-                "lat": str(location['lat']),
-                "lon": str(location['lon']),
-                "isp": location['isp'],
-                "timezone": location['timezone'],
-                "device": device,
-                "application": app,
-                "user_agent": encrypted_ua,
-                "bot_status": visit_type,
-                "block_reason": bot_reason if is_bot_flag else "N/A",
-                "referer": referer,
-                "source": 'referral' if referer else 'direct',
-                "session_duration": session_duration
-            })
-            valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
-            logger.debug(f"Logged visitor: {visitor_id} for user: {username}")
-            if is_bot_flag:
-                bot_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
-                valkey_client.hset(f"user:{username}:bot:{bot_id}", mapping={
+        visitor_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
+        encrypted_ip = encrypt_signed_token(ip)
+        encrypted_ua = encrypt_signed_token(user_agent[:100])
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
                     "timestamp": int(time.time()),
                     "ip": encrypted_ip,
+                    "country": location['country'],
+                    "region": location['region'],
+                    "city": location['city'],
+                    "lat": str(location['lat']),
+                    "lon": str(location['lon']),
+                    "isp": location['isp'],
+                    "timezone": location['timezone'],
+                    "device": device,
+                    "application": app,
                     "user_agent": encrypted_ua,
-                    "block_reason": bot_reason
+                    "bot_status": visit_type,
+                    "block_reason": bot_reason if is_bot_flag else "N/A",
+                    "referer": referer,
+                    "source": 'referral' if referer else 'direct',
+                    "session_duration": session_duration
                 })
-                valkey_client.expire(f"user:{username}:bot:{bot_id}", DATA_RETENTION_DAYS * 86400)
-                logger.debug(f"Logged bot attempt: {bot_id} for user: {username}")
+                valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
+                logger.debug(f"Logged visitor: {visitor_id} for user: {username}")
+                break
+            except Exception as e:
+                logger.error(f"Valkey error logging visitor on attempt {attempt+1}: {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(0.5)
+                    continue
+        if is_bot_flag:
+            bot_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
+            for attempt in range(max_retries):
+                try:
+                    valkey_client.hset(f"user:{username}:bot:{bot_id}", mapping={
+                        "timestamp": int(time.time()),
+                        "ip": encrypted_ip,
+                        "user_agent": encrypted_ua,
+                        "block_reason": bot_reason
+                    })
+                    valkey_client.expire(f"user:{username}:bot:{bot_id}", DATA_RETENTION_DAYS * 86400)
+                    logger.debug(f"Logged bot attempt: {bot_id} for user: {username}")
+                    break
+                except Exception as e:
+                    logger.error(f"Valkey error logging bot attempt on attempt {attempt+1}: {str(e)}")
+                    if attempt < max_retries - 1:
+                        time.sleep(0.5)
+                        continue
     except Exception as e:
         logger.error(f"Error in log_visitor: {str(e)}")
 
@@ -828,7 +813,8 @@ def dashboard():
 
                 if not error:
                     generated_url = f"https://{urllib.parse.quote(subdomain.lower())}.{base_domain}/{endpoint}/{url_id}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
-                    if valkey_client:
+                    max_retries = 2
+                    for attempt in range(max_retries):
                         try:
                             valkey_client.hset(f"user:{username}:url:{url_id}", mapping={
                                 "url": generated_url,
@@ -841,145 +827,163 @@ def dashboard():
                                 "disabled": "0"
                             })
                             valkey_client.expire(f"user:{username}:url:{url_id}", DATA_RETENTION_DAYS * 86400)
-                            logger.info(f"Generated URL for {username}: {generated_url}, url_id: {url_id}")
+                            logger.info(f"Generated URL for {username}: {generated_url}, url_id: {url_id}, key: user:{username}:url:{url_id}")
                             success = f"URL generated: <a href='{generated_url}' target='_blank'>{generated_url}</a>"
+                            break
                         except Exception as e:
-                            logger.error(f"Valkey error storing URL: {str(e)}")
+                            logger.error(f"Valkey error storing URL on attempt {attempt+1}: {str(e)}")
+                            if attempt < max_retries - 1:
+                                time.sleep(0.5)
+                                continue
                             error = "Failed to store URL in database"
-                    else:
-                        logger.warning("Valkey unavailable")
-                        error = "Database unavailable"
+                            break
 
         urls = []
         valkey_error = None
-        if valkey_client:
-            try:
-                url_keys = valkey_client.keys(f"user:{username}:url:*")
-                logger.debug(f"Found {len(url_keys)} URL keys for user: {username}")
-                for key in url_keys:
-                    try:
-                        url_data = valkey_client.hgetall(key)
-                        if not url_data:
-                            logger.warning(f"Empty data for key {key}")
-                            continue
-                        url_id = key.split(':')[-1]
-                        visits = valkey_client.lrange(f"user:{username}:url:{url_id}:visits", 0, -1)
-                        visit_data = []
-                        for v in visits:
-                            try:
-                                visit_data.append(json.loads(v))
-                            except json.JSONDecodeError:
-                                logger.error(f"Error decoding visit data for {key}")
-                        click_trends = {}
-                        country_counts = {}
-                        device_counts = {}
-                        for visit in visit_data:
-                            try:
-                                date = datetime.fromtimestamp(visit.get('timestamp', 0)).strftime('%Y-%m-%d')
-                                click_trends[date] = click_trends.get(date, 0) + 1
-                                country = visit.get('location', {}).get('country', 'Unknown')
-                                device = visit.get('device', 'Unknown')
-                                country_counts[country] = country_counts.get(country, 0) + 1
-                                device_counts[device] = device_counts.get(device, 0) + 1
-                            except (KeyError, ValueError):
-                                logger.error(f"Error processing visit data")
-                        urls.append({
-                            "url": url_data.get('url', ''),
-                            "destination": url_data.get('destination', ''),
-                            "path_segment": url_data.get('path_segment', ''),
-                            "created": datetime.fromtimestamp(int(url_data.get('created', 0))).strftime('%Y-%m-%d %H:%M:%S JST') if url_data.get('created') else 'Unknown',
-                            "expiry": int(url_data.get('expiry', 0)),
-                            "clicks": int(url_data.get('clicks', 0)) if url_data.get('clicks') else 0,
-                            "visits": visit_data,
-                            "click_trends_keys": list(click_trends.keys()),
-                            "click_trends_values": list(click_trends.values()),
-                            "country_counts_keys": list(country_counts.keys()),
-                            "country_counts_values": list(country_counts.values()),
-                            "device_counts_keys": list(device_counts.keys()),
-                            "device_counts_values": list(device_counts.values()),
-                            "ip_whitelist": json.loads(url_data.get('ip_whitelist', '[]')),
-                            "disabled": url_data.get('disabled', '0') == '1',
-                            "id": url_id
-                        })
-                    except Exception as e:
-                        logger.error(f"Error processing URL key {key}: {str(e)}")
-            except Exception as e:
-                logger.error(f"Valkey error fetching URLs: {str(e)}")
-                valkey_error = "Unable to fetch URL history"
-        else:
-            logger.warning("Valkey unavailable")
-            valkey_error = "Database unavailable"
+        try:
+            max_retries = 2
+            url_keys = []
+            for attempt in range(max_retries):
+                try:
+                    url_keys = valkey_client.keys(f"user:{username}:url:*")
+                    logger.debug(f"Found {len(url_keys)} URL keys for user: {username}")
+                    break
+                except Exception as e:
+                    logger.error(f"Valkey error fetching URL keys on attempt {attempt+1}: {str(e)}")
+                    if attempt < max_retries - 1:
+                        time.sleep(0.5)
+                        continue
+                    valkey_error = "Unable to fetch URL history"
+                    break
+            for key in url_keys:
+                try:
+                    url_data = valkey_client.hgetall(key)
+                    if not url_data:
+                        logger.warning(f"Empty data for key {key}")
+                        continue
+                    url_id = key.split(':')[-1]
+                    visits = valkey_client.lrange(f"user:{username}:url:{url_id}:visits", 0, -1)
+                    visit_data = []
+                    for v in visits:
+                        try:
+                            visit_data.append(json.loads(v))
+                        except json.JSONDecodeError:
+                            logger.error(f"Error decoding visit data for {key}")
+                    click_trends = {}
+                    country_counts = {}
+                    device_counts = {}
+                    for visit in visit_data:
+                        try:
+                            date = datetime.fromtimestamp(visit.get('timestamp', 0)).strftime('%Y-%m-%d')
+                            click_trends[date] = click_trends.get(date, 0) + 1
+                            country = visit.get('location', {}).get('country', 'Unknown')
+                            device = visit.get('device', 'Unknown')
+                            country_counts[country] = country_counts.get(country, 0) + 1
+                            device_counts[device] = device_counts.get(device, 0) + 1
+                        except (KeyError, ValueError):
+                            logger.error(f"Error processing visit data")
+                    urls.append({
+                        "url": url_data.get('url', ''),
+                        "destination": url_data.get('destination', ''),
+                        "path_segment": url_data.get('path_segment', ''),
+                        "created": datetime.fromtimestamp(int(url_data.get('created', 0))).strftime('%Y-%m-%d %H:%M:%S JST') if url_data.get('created') else 'Unknown',
+                        "expiry": int(url_data.get('expiry', 0)),
+                        "clicks": int(url_data.get('clicks', 0)) if url_data.get('clicks') else 0,
+                        "visits": visit_data,
+                        "click_trends_keys": list(click_trends.keys()),
+                        "click_trends_values": list(click_trends.values()),
+                        "country_counts_keys": list(country_counts.keys()),
+                        "country_counts_values": list(country_counts.values()),
+                        "device_counts_keys": list(device_counts.keys()),
+                        "device_counts_values": list(device_counts.values()),
+                        "ip_whitelist": json.loads(url_data.get('ip_whitelist', '[]')),
+                        "disabled": url_data.get('disabled', '0') == '1',
+                        "id": url_id
+                    })
+                except Exception as e:
+                    logger.error(f"Error processing URL key {key}: {str(e)}")
+        except Exception as e:
+            logger.error(f"Valkey error fetching URLs: {str(e)}")
+            valkey_error = "Unable to fetch URL history"
 
         visitors = []
         bot_logs = []
         access_logs = []
         traffic_sources = {"direct": 0, "referral": 0}
         bot_ratio = {"human": 0, "bot": 0}
-        if valkey_client:
-            try:
-                visitor_keys = valkey_client.keys(f"user:{username}:visitor:*")
-                logger.debug(f"Found {len(visitor_keys)} visitor keys for user: {username}")
-                for key in visitor_keys:
-                    try:
-                        visitor_data = valkey_client.hgetall(key)
-                        if not visitor_data:
-                            logger.warning(f"Empty visitor data for key {key}")
-                            continue
-                        source = 'referral' if visitor_data.get('referer') else 'direct'
-                        decrypted_ip = decrypt_signed_token(visitor_data.get('ip', encrypt_signed_token('Unknown')))
-                        decrypted_ua = decrypt_signed_token(visitor_data.get('user_agent', encrypt_signed_token('Unknown')))
-                        visitors.append({
-                            "timestamp": datetime.fromtimestamp(int(visitor_data.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S JST') if visitor_data.get('timestamp') else 'Unknown',
+        try:
+            max_retries = 2
+            visitor_keys = []
+            for attempt in range(max_retries):
+                try:
+                    visitor_keys = valkey_client.keys(f"user:{username}:visitor:*")
+                    logger.debug(f"Found {len(visitor_keys)} visitor keys for user: {username}")
+                    break
+                except Exception as e:
+                    logger.error(f"Valkey error fetching visitor keys on attempt {attempt+1}: {str(e)}")
+                    if attempt < max_retries - 1:
+                        time.sleep(0.5)
+                        continue
+                    valkey_error = "Unable to fetch visitor data"
+                    break
+            for key in visitor_keys:
+                try:
+                    visitor_data = valkey_client.hgetall(key)
+                    if not visitor_data:
+                        logger.warning(f"Empty visitor data for key {key}")
+                        continue
+                    source = 'referral' if visitor_data.get('referer') else 'direct'
+                    decrypted_ip = decrypt_signed_token(visitor_data.get('ip', encrypt_signed_token('Unknown')))
+                    decrypted_ua = decrypt_signed_token(visitor_data.get('user_agent', encrypt_signed_token('Unknown')))
+                    visitors.append({
+                        "timestamp": datetime.fromtimestamp(int(visitor_data.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S JST') if visitor_data.get('timestamp') else 'Unknown',
+                        "ip": decrypted_ip,
+                        "country": visitor_data.get('country', 'Unknown'),
+                        "region": visitor_data.get('region', 'Unknown'),
+                        "city": visitor_data.get('city', 'Unknown'),
+                        "lat": float(visitor_data.get('lat', 0.0)),
+                        "lon": float(visitor_data.get('lon', 0.0)),
+                        "isp": visitor_data.get('isp', 'Unknown'),
+                        "timezone": visitor_data.get('timezone', 'Unknown'),
+                        "device": visitor_data.get('device', 'Unknown'),
+                        "application": visitor_data.get('application', 'Unknown'),
+                        "user_agent": decrypted_ua,
+                        "bot_status": visitor_data.get('bot_status', 'Unknown'),
+                        "block_reason": visitor_data.get('block_reason', 'N/A'),
+                        "source": source,
+                        "session_duration": int(visitor_data.get('session_duration', 0))
+                    })
+                    if visitor_data.get('bot_status') != 'Human':
+                        bot_logs.append({
+                            "timestamp": visitor_data.get('timestamp', 'Unknown'),
                             "ip": decrypted_ip,
-                            "country": visitor_data.get('country', 'Unknown'),
-                            "region": visitor_data.get('region', 'Unknown'),
-                            "city": visitor_data.get('city', 'Unknown'),
-                            "lat": float(visitor_data.get('lat', 0.0)),
-                            "lon": float(visitor_data.get('lon', 0.0)),
-                            "isp": visitor_data.get('isp', 'Unknown'),
-                            "timezone": visitor_data.get('timezone', 'Unknown'),
-                            "device": visitor_data.get('device', 'Unknown'),
-                            "application": visitor_data.get('application', 'Unknown'),
-                            "user_agent": decrypted_ua,
-                            "bot_status": visitor_data.get('bot_status', 'Unknown'),
-                            "block_reason": visitor_data.get('block_reason', 'N/A'),
-                            "source": source,
-                            "session_duration": int(visitor_data.get('session_duration', 0))
+                            "block_reason": visitor_data.get('block_reason', 'Unknown')
                         })
-                        if visitor_data.get('bot_status') != 'Human':
-                            bot_logs.append({
-                                "timestamp": visitor_data.get('timestamp', 'Unknown'),
-                                "ip": decrypted_ip,
-                                "block_reason": visitor_data.get('block_reason', 'Unknown')
-                            })
-                            bot_ratio['bot'] += 1
-                        else:
-                            bot_ratio['human'] += 1
-                        traffic_sources[source] = traffic_sources.get(source, 0) + 1
+                        bot_ratio['bot'] += 1
+                    else:
+                        bot_ratio['human'] += 1
+                    traffic_sources[source] = traffic_sources.get(source, 0) + 1
+                except Exception as e:
+                    logger.error(f"Error processing visitor key {key}: {str(e)}")
+            for url in urls:
+                access_keys = valkey_client.keys(f"user:{username}:url:{url['id']}:access:*")
+                for key in access_keys:
+                    try:
+                        access_data = valkey_client.hgetall(key)
+                        if not access_data:
+                            continue
+                        access_logs.append({
+                            "url_id": url['id'],
+                            "timestamp": datetime.fromtimestamp(int(access_data.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S JST') if access_data.get('timestamp') else 'Unknown',
+                            "ip": decrypt_signed_token(access_data.get('ip', encrypt_signed_token('Unknown'))),
+                            "success": access_data.get('success', '0') == '1',
+                            "reason": access_data.get('reason', 'N/A')
+                        })
                     except Exception as e:
-                        logger.error(f"Error processing visitor key {key}: {str(e)}")
-                for url in urls:
-                    access_keys = valkey_client.keys(f"user:{username}:url:{url['id']}:access:*")
-                    for key in access_keys:
-                        try:
-                            access_data = valkey_client.hgetall(key)
-                            if not access_data:
-                                continue
-                            access_logs.append({
-                                "url_id": url['id'],
-                                "timestamp": datetime.fromtimestamp(int(access_data.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S JST') if access_data.get('timestamp') else 'Unknown',
-                                "ip": decrypt_signed_token(access_data.get('ip', encrypt_signed_token('Unknown'))),
-                                "success": access_data.get('success', '0') == '1',
-                                "reason": access_data.get('reason', 'N/A')
-                            })
-                        except Exception as e:
-                            logger.error(f"Error processing access key {key}: {str(e)}")
-            except Exception as e:
-                logger.error(f"Valkey error fetching visitors: {str(e)}")
-                valkey_error = "Unable to fetch visitor data"
-        else:
-            logger.warning("Valkey unavailable")
-            valkey_error = "Database unavailable"
+                        logger.error(f"Error processing access key {key}: {str(e)}")
+        except Exception as e:
+            logger.error(f"Valkey error fetching visitors: {str(e)}")
+            valkey_error = "Unable to fetch visitor data"
 
         try:
             traffic_sources_keys = list(traffic_sources.keys())
@@ -1034,19 +1038,24 @@ def dashboard():
                 <script>
                     function toggleAnalytics(id) {
                         try {
-                            document.getElementById('analytics-' + id).classList.toggle('hidden');
+                            const analytics = document.getElementById('analytics-' + id);
+                            if (analytics) {
+                                analytics.classList.toggle('hidden');
+                            } else {
+                                console.error('Analytics element not found: analytics-' + id);
+                            }
                         } catch (e) {
                             console.error('Toggle analytics error:', e);
                         }
                     }
                     function applyFilters(id) {
                         try {
-                            let device = document.getElementById('filter-device-' + id).value;
-                            let type = document.getElementById('filter-type-' + id).value;
-                            let rows = document.querySelectorAll('#visits-' + id + ' tr');
+                            const device = document.getElementById('filter-device-' + id)?.value || '';
+                            const type = document.getElementById('filter-type-' + id)?.value || '';
+                            const rows = document.querySelectorAll('#visits-' + id + ' tr');
                             rows.forEach(row => {
-                                let deviceCell = row.cells[2].textContent;
-                                let typeCell = row.cells[4].textContent;
+                                const deviceCell = row.cells[2]?.textContent || '';
+                                const typeCell = row.cells[4]?.textContent || '';
                                 row.style.display = (
                                     (device === '' || deviceCell.includes(device)) &&
                                     (type === '' || typeCell.includes(type))
@@ -1058,10 +1067,22 @@ def dashboard():
                     }
                     function showTab(tabId) {
                         try {
-                            document.querySelectorAll('.tab-content').forEach(tab => tab.classList.add('hidden'));
-                            document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
-                            document.getElementById(tabId).classList.remove('hidden');
-                            document.querySelector(`[onclick="showTab('${tabId}')"]`).classList.add('active');
+                            const tabs = document.querySelectorAll('.tab-content');
+                            const tabButtons = document.querySelectorAll('.tab');
+                            const targetTab = document.getElementById(tabId);
+                            if (!targetTab) {
+                                console.error('Tab not found: ' + tabId);
+                                return;
+                            }
+                            tabs.forEach(tab => tab.classList.add('hidden'));
+                            tabButtons.forEach(tab => tab.classList.remove('active'));
+                            targetTab.classList.remove('hidden');
+                            const activeButton = document.querySelector(`[onclick="showTab('${tabId}')"]`);
+                            if (activeButton) {
+                                activeButton.classList.add('active');
+                            } else {
+                                console.error('Tab button not found for: ' + tabId);
+                            }
                         } catch (e) {
                             console.error('Show tab error:', e);
                         }
@@ -1096,20 +1117,20 @@ def dashboard():
                     }
                     function applyVisitorFilters() {
                         try {
-                            let country = document.getElementById('visitor-filter-country').value;
-                            let device = document.getElementById('visitor-filter-device').value;
-                            let timeRange = document.getElementById('visitor-filter-time').value;
-                            let rows = document.querySelectorAll('#visitor-table tr');
-                            let now = Math.floor(Date.now() / 1000);
+                            const country = document.getElementById('visitor-filter-country')?.value || '';
+                            const device = document.getElementById('visitor-filter-device')?.value || '';
+                            const timeRange = document.getElementById('visitor-filter-time')?.value || '';
+                            const rows = document.querySelectorAll('#visitor-table tr');
+                            const now = Math.floor(Date.now() / 1000);
                             rows.forEach(row => {
-                                let countryCell = row.cells[2].textContent;
-                                let deviceCell = row.cells[9].textContent;
-                                let timestamp = parseInt(row.cells[0].dataset.timestamp || 0);
+                                const countryCell = row.cells[2]?.textContent || '';
+                                const deviceCell = row.cells[9]?.textContent || '';
+                                const timestamp = parseInt(row.cells[0]?.dataset.timestamp || 0);
                                 let show = true;
                                 if (country && countryCell !== country) show = false;
                                 if (device && deviceCell !== device) show = false;
                                 if (timeRange) {
-                                    let hours = parseInt(timeRange);
+                                    const hours = parseInt(timeRange);
                                     if (timestamp < now - hours * 3600) show = false;
                                 }
                                 row.style.display = show ? '' : 'none';
@@ -1148,6 +1169,7 @@ def dashboard():
                     window.onload = function() {
                         try {
                             updateCountdowns();
+                            showTab('urls-tab'); // Initialize with URLs tab
                         } catch (e) {
                             console.error('Onload error:', e);
                         }
@@ -1670,27 +1692,8 @@ def export_visitors():
     try:
         username = session['username']
         logger.debug(f"Exporting visitors for user: {username}")
-        if not valkey_client:
-            logger.warning("Valkey unavailable for export_visitors")
-            return render_template_string("""
-                <!DOCTYPE html>
-                <html lang="en">
-                <head>
-                    <meta charset="UTF-8">
-                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <title>Error</title>
-                    <script src="https://cdn.tailwindcss.com"></script>
-                </head>
-                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                        <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
-                        <p class="text-gray-600">Database unavailable. Unable to export data.</p>
-                    </div>
-                </body>
-                </html>
-            """), 500
-        visitor_keys = []
         max_retries = 2
+        visitor_keys = []
         for attempt in range(max_retries):
             try:
                 visitor_keys = valkey_client.keys(f"user:{username}:visitor:*")
@@ -1782,27 +1785,8 @@ def export(index):
     try:
         username = session['username']
         logger.debug(f"Exporting data for user: {username}, index: {index}")
-        if not valkey_client:
-            logger.warning("Valkey unavailable for export")
-            return render_template_string("""
-                <!DOCTYPE html>
-                <html lang="en">
-                <head>
-                    <meta charset="UTF-8">
-                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <title>Error</title>
-                    <script src="https://cdn.tailwindcss.com"></script>
-                </head>
-                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                        <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
-                        <p class="text-gray-600">Database unavailable. Unable to export data.</p>
-                    </div>
-                </body>
-                </html>
-            """), 500
-        url_keys = []
         max_retries = 2
+        url_keys = []
         for attempt in range(max_retries):
             try:
                 url_keys = valkey_client.keys(f"user:{username}:url:*")
@@ -1919,25 +1903,6 @@ def delete_url(url_id):
     try:
         username = session['username']
         logger.debug(f"Deleting URL {url_id} for user: {username}")
-        if not valkey_client:
-            logger.warning("Valkey unavailable for delete_url")
-            return render_template_string("""
-                <!DOCTYPE html>
-                <html lang="en">
-                <head>
-                    <meta charset="UTF-8">
-                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <title>Error</title>
-                    <script src="https://cdn.tailwindcss.com"></script>
-                </head>
-                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                        <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
-                        <p class="text-gray-600">Database unavailable. Unable to delete URL.</p>
-                    </div>
-                </body>
-                </html>
-            """), 500
         max_retries = 2
         for attempt in range(max_retries):
             try:
@@ -1998,25 +1963,6 @@ def clear_views(url_id):
     try:
         username = session['username']
         logger.debug(f"Clearing views for URL {url_id} for user: {username}")
-        if not valkey_client:
-            logger.warning("Valkey unavailable for clear_views")
-            return render_template_string("""
-                <!DOCTYPE html>
-                <html lang="en">
-                <head>
-                    <meta charset="UTF-8">
-                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <title>Error</title>
-                    <script src="https://cdn.tailwindcss.com"></script>
-                </head>
-                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                        <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
-                        <p class="text-gray-600">Database unavailable. Unable to clear views.</p>
-                    </div>
-                </body>
-                </html>
-            """), 500
         max_retries = 2
         for attempt in range(max_retries):
             try:
@@ -2076,25 +2022,6 @@ def toggle_url(url_id):
     try:
         username = session['username']
         logger.debug(f"Toggling URL {url_id} for user: {username}")
-        if not valkey_client:
-            logger.warning("Valkey unavailable for toggle_url")
-            return render_template_string("""
-                <!DOCTYPE html>
-                <html lang="en">
-                <head>
-                    <meta charset="UTF-8">
-                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <title>Error</title>
-                    <script src="https://cdn.tailwindcss.com"></script>
-                </head>
-                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                        <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
-                        <p class="text-gray-600">Database unavailable. Unable to toggle URL.</p>
-                    </div>
-                </body>
-                </html>
-            """), 500
         max_retries = 2
         for attempt in range(max_retries):
             try:
@@ -2153,10 +2080,9 @@ def challenge():
         if not data or 'challenge' not in data or not isinstance(data['challenge'], (int, float)):
             logger.warning(f"Invalid JS challenge from IP: {request.remote_addr}")
             return {"status": "denied"}, 403
-        if valkey_client:
-            session_key = f"user:session:{request.remote_addr}"
-            valkey_client.setex(session_key, 3600, "1")
-            logger.debug(f"JS verification set for IP: {request.remote_addr}")
+        session_key = f"user:session:{request.remote_addr}"
+        valkey_client.setex(session_key, 3600, "1")
+        logger.debug(f"JS verification set for IP: {request.remote_addr}")
         return {"status": "ok"}, 200
     except Exception as e:
         logger.error(f"Error in challenge: {str(e)}", exc_info=True)
@@ -2167,7 +2093,7 @@ def fingerprint():
     try:
         logger.debug(f"Fingerprint request received from IP: {request.remote_addr}")
         data = request.get_json()
-        if data and 'fingerprint' in data and valkey_client:
+        if data and 'fingerprint' in data:
             fingerprint = generate_fingerprint()
             valkey_client.setex(f"fingerprint:{fingerprint}", 3600, data['fingerprint'])
             logger.debug(f"Fingerprint stored: {fingerprint[:10]}... for IP: {request.remote_addr}")
@@ -2210,72 +2136,44 @@ def redirect_handler(username, endpoint, url_id, encrypted_payload, path_segment
         session_duration = int(time.time()) - session_start
         access_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
 
-        if valkey_client:
-            max_retries = 2
-            for attempt in range(max_retries):
-                try:
-                    valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
-                        "timestamp": int(time.time()),
-                        "ip": encrypt_signed_token(ip),
-                        "success": "0",
-                        "reason": "Pending"
-                    })
-                    valkey_client.expire(f"user:{username}:url:{url_id}:access:{access_id}", DATA_RETENTION_DAYS * 86400)
-                    logger.debug(f"Logged access attempt: {access_id} for user: {username}")
-                    break
-                except Exception as e:
-                    logger.error(f"Valkey error logging access attempt on attempt {attempt+1}: {str(e)}")
-                    if attempt < max_retries - 1:
-                        time.sleep(0.5)
-                        continue
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
+                    "timestamp": int(time.time()),
+                    "ip": encrypt_signed_token(ip),
+                    "success": "0",
+                    "reason": "Pending"
+                })
+                valkey_client.expire(f"user:{username}:url:{url_id}:access:{access_id}", DATA_RETENTION_DAYS * 86400)
+                logger.debug(f"Logged access attempt: {access_id} for user: {username}")
+                break
+            except Exception as e:
+                logger.error(f"Valkey error logging access attempt on attempt {attempt+1}: {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(0.5)
+                    continue
 
         if is_bot_flag:
             logger.warning(f"Blocked redirect for IP {ip}: {bot_reason}")
-            if valkey_client:
-                try:
-                    valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
-                        "success": "0",
-                        "reason": bot_reason
-                    })
-                    bot_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
-                    valkey_client.hset(f"user:{username}:bot:{bot_id}", mapping={
-                        "timestamp": int(time.time()),
-                        "ip": encrypt_signed_token(ip),
-                        "user_agent": encrypt_signed_token(user_agent[:100]),
-                        "block_reason": bot_reason
-                    })
-                    valkey_client.expire(f"user:{username}:bot:{bot_id}", DATA_RETENTION_DAYS * 86400)
-                    logger.debug(f"Logged bot attempt: {bot_id} for user: {username}")
-                except Exception as e:
-                    logger.error(f"Valkey error updating access or bot log: {str(e)}")
-            abort(403, f"Access denied: {bot_reason}")
-
-        if not valkey_client:
-            logger.warning("Valkey unavailable for URL check")
-            if valkey_client:
+            try:
                 valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
                     "success": "0",
-                    "reason": "Database unavailable"
+                    "reason": bot_reason
                 })
-            return render_template_string("""
-                <!DOCTYPE html>
-                <html lang="en">
-                <head>
-                    <meta charset="UTF-8">
-                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <title>Database Error</title>
-                    <script src="https://cdn.tailwindcss.com"></script>
-                </head>
-                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                        <h3 class="text-lg font-bold mb-4 text-red-600">Database Error</h3>
-                        <p class="text-gray-600">Database unavailable. Please try again later.</p>
-                    </div>
-                </body>
-                </html>
-            """), 500
+                bot_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
+                valkey_client.hset(f"user:{username}:bot:{bot_id}", mapping={
+                    "timestamp": int(time.time()),
+                    "ip": encrypt_signed_token(ip),
+                    "user_agent": encrypt_signed_token(user_agent[:100]),
+                    "block_reason": bot_reason
+                })
+                valkey_client.expire(f"user:{username}:bot:{bot_id}", DATA_RETENTION_DAYS * 86400)
+                logger.debug(f"Logged bot attempt: {bot_id} for user: {username}")
+            except Exception as e:
+                logger.error(f"Valkey error updating access or bot log: {str(e)}")
+            abort(403, f"Access denied: {bot_reason}")
 
-        max_retries = 2
         url_data = None
         for attempt in range(max_retries):
             try:
@@ -2342,66 +2240,62 @@ def redirect_handler(username, endpoint, url_id, encrypted_payload, path_segment
                 })
                 abort(403, "IP not whitelisted")
 
-        if valkey_client:
-            max_retries = 2
-            for attempt in range(max_retries):
-                try:
-                    visitor_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
-                    encrypted_ip = encrypt_signed_token(ip)
-                    encrypted_ua = encrypt_signed_token(user_agent[:100])
-                    valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
-                        "timestamp": int(time.time()),
-                        "ip": encrypted_ip,
-                        "country": location['country'],
-                        "region": location['region'],
-                        "city": location['city'],
-                        "lat": str(location['lat']),
-                        "lon": str(location['lon']),
-                        "isp": location['isp'],
-                        "timezone": location['timezone'],
-                        "device": device,
-                        "application": app,
-                        "user_agent": encrypted_ua,
-                        "bot_status": visit_type,
-                        "block_reason": bot_reason if is_bot_flag else "N/A",
-                        "referer": referer,
-                        "source": 'referral' if referer else 'direct',
-                        "session_duration": session_duration
-                    })
-                    valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
-                    logger.debug(f"Logged visitor: {visitor_id} for user: {username}")
-                    break
-                except Exception as e:
-                    logger.error(f"Valkey error logging visitor on attempt {attempt+1}: {str(e)}")
-                    if attempt < max_retries - 1:
-                        time.sleep(0.5)
-                        continue
+        for attempt in range(max_retries):
+            try:
+                visitor_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
+                encrypted_ip = encrypt_signed_token(ip)
+                encrypted_ua = encrypt_signed_token(user_agent[:100])
+                valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
+                    "timestamp": int(time.time()),
+                    "ip": encrypted_ip,
+                    "country": location['country'],
+                    "region": location['region'],
+                    "city": location['city'],
+                    "lat": str(location['lat']),
+                    "lon": str(location['lon']),
+                    "isp": location['isp'],
+                    "timezone": location['timezone'],
+                    "device": device,
+                    "application": app,
+                    "user_agent": encrypted_ua,
+                    "bot_status": visit_type,
+                    "block_reason": bot_reason if is_bot_flag else "N/A",
+                    "referer": referer,
+                    "source": 'referral' if referer else 'direct',
+                    "session_duration": session_duration
+                })
+                valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
+                logger.debug(f"Logged visitor: {visitor_id} for user: {username}")
+                break
+            except Exception as e:
+                logger.error(f"Valkey error logging visitor on attempt {attempt+1}: {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(0.5)
+                    continue
 
-        if valkey_client:
-            max_retries = 2
-            for attempt in range(max_retries):
-                try:
-                    valkey_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
-                    valkey_client.lpush(f"user:{username}:url:{url_id}:visits", json.dumps({
-                        "timestamp": int(time.time()),
-                        "ip": encrypt_signed_token(ip),
-                        "device": device,
-                        "app": app,
-                        "type": visit_type,
-                        "location": location
-                    }))
-                    valkey_client.expire(f"user:{username}:url:{url_id}:visits", DATA_RETENTION_DAYS * 86400)
-                    valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
-                        "success": "1",
-                        "reason": "Access granted"
-                    })
-                    logger.debug(f"Logged visit for URL ID: {url_id}")
-                    break
-                except Exception as e:
-                    logger.error(f"Valkey error logging visit on attempt {attempt+1}: {str(e)}")
-                    if attempt < max_retries - 1:
-                        time.sleep(0.5)
-                        continue
+        for attempt in range(max_retries):
+            try:
+                valkey_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
+                valkey_client.lpush(f"user:{username}:url:{url_id}:visits", json.dumps({
+                    "timestamp": int(time.time()),
+                    "ip": encrypt_signed_token(ip),
+                    "device": device,
+                    "app": app,
+                    "type": visit_type,
+                    "location": location
+                }))
+                valkey_client.expire(f"user:{username}:url:{url_id}:visits", DATA_RETENTION_DAYS * 86400)
+                valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
+                    "success": "1",
+                    "reason": "Access granted"
+                })
+                logger.debug(f"Logged visit for URL ID: {url_id}")
+                break
+            except Exception as e:
+                logger.error(f"Valkey error logging visit on attempt {attempt+1}: {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(0.5)
+                    continue
 
         try:
             encrypted_payload = urllib.parse.unquote(encrypted_payload)
@@ -2459,14 +2353,13 @@ def redirect_handler(username, endpoint, url_id, encrypted_payload, path_segment
                 abort(400, "Invalid redirect URL")
             if time.time() > expiry:
                 logger.warning(f"URL expired: {request.url}")
-                if valkey_client:
-                    try:
-                        valkey_client.delete(f"user:{username}:url:{url_id}")
-                        valkey_client.delete(f"user:{username}:url:{url_id}:visits")
-                        valkey_client.delete(f"user:{username}:url:{url_id}:access:*")
-                        logger.info(f"Deleted expired URL: {url_id}")
-                    except Exception as e:
-                        logger.error(f"Valkey error deleting expired URL: {str(e)}")
+                try:
+                    valkey_client.delete(f"user:{username}:url:{url_id}")
+                    valkey_client.delete(f"user:{username}:url:{url_id}:visits")
+                    valkey_client.delete(f"user:{username}:url:{url_id}:access:*")
+                    logger.info(f"Deleted expired URL: {url_id}")
+                except Exception as e:
+                    logger.error(f"Valkey error deleting expired URL: {str(e)}")
                 valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
                     "success": "0",
                     "reason": "URL expired"
@@ -2486,17 +2379,16 @@ def redirect_handler(username, endpoint, url_id, encrypted_payload, path_segment
     except Exception as e:
         error_message = f"Redirect handler error: {str(e)}"
         logger.error(error_message, exc_info=True)
-        if valkey_client:
-            try:
-                access_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
-                valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
-                    "timestamp": int(time.time()),
-                    "ip": encrypt_signed_token(ip),
-                    "success": "0",
-                    "reason": error_message
-                })
-            except Exception as e2:
-                logger.error(f"Valkey error logging failed access: {str(e2)}")
+        try:
+            access_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
+            valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
+                "timestamp": int(time.time()),
+                "ip": encrypt_signed_token(ip),
+                "success": "0",
+                "reason": error_message
+            })
+        except Exception as e2:
+            logger.error(f"Valkey error logging failed access: {str(e2)}")
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">

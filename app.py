@@ -382,18 +382,25 @@ def get_valid_usernames():
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if 'username' not in session:
-            logger.debug(f"Redirecting to login from {request.url}, session: {session}")
-            return redirect(url_for('login', next=request.url))
-        logger.debug(f"Authenticated user: {session['username']}, session: {session}")
-        return f(*args, **kwargs)
+        try:
+            if 'username' not in session:
+                logger.debug(f"Redirecting to login from {request.url}, session: {session}")
+                return redirect(url_for('login', next=request.url))
+            logger.debug(f"Authenticated user: {session['username']}, session: {session}")
+            return f(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"Error in login_required: {str(e)}", exc_info=True)
+            return redirect(url_for('login'))
     return decorated_function
 
 @app.before_request
 def block_ohio_subdomain():
-    if request.host == 'ohioautocollection.nvclerks.com':
-        logger.debug(f"Blocked request to {request.host}: Returning 404")
-        abort(404)
+    try:
+        if request.host == 'ohioautocollection.nvclerks.com':
+            logger.debug(f"Blocked request to {request.host}: Returning 404")
+            abort(404)
+    except Exception as e:
+        logger.error(f"Error in block_ohio_subdomain: {str(e)}", exc_info=True)
 
 @app.route("/login", methods=["GET", "POST"])
 @rate_limit(limit=5, per=60)
@@ -564,12 +571,41 @@ def login():
             </html>
         """), 500
 
+@app.route("/", methods=["GET"])
+@rate_limit(limit=5, per=60)
+def index():
+    try:
+        logger.debug(f"Accessing root URL, session: {'username' in session}, host: {request.host}")
+        if 'username' in session:
+            logger.debug(f"User {session['username']} redirecting to dashboard")
+            return redirect(url_for('dashboard'))
+        logger.debug("No user session, redirecting to login")
+        return redirect(url_for('login'))
+    except Exception as e:
+        logger.error(f"Error in index: {str(e)}", exc_info=True)
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Internal Server Error</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                </div>
+            </body>
+            </html>
+        """), 500
+
 @app.route("/dashboard", methods=["GET", "POST"])
 @login_required
 @rate_limit(limit=5, per=60)
 def dashboard():
     try:
-        # Validate session
         if 'username' not in session:
             logger.error("Session missing username, redirecting to login")
             return redirect(url_for('login'))
@@ -579,7 +615,6 @@ def dashboard():
         base_domain = get_base_domain()
         error = None
 
-        # Handle POST request for URL generation
         if request.method == "POST":
             logger.debug(f"Processing POST form data: {request.form}")
             subdomain = request.form.get("subdomain", "default")
@@ -593,7 +628,6 @@ def dashboard():
                 logger.error("Invalid expiry value, defaulting to 86400")
                 expiry = 86400
 
-            # Input validation
             if not re.match(r"^https?://", destination_link):
                 error = "Invalid URL"
                 logger.warning(f"Invalid destination_link: {destination_link}")
@@ -665,7 +699,6 @@ def dashboard():
                         logger.debug("URL generation successful, redirecting to dashboard")
                         return redirect(url_for('dashboard'))
 
-        # Fetch URL history
         urls = []
         valkey_error = None
         if valkey_client:
@@ -714,7 +747,6 @@ def dashboard():
             logger.warning("Valkey unavailable, cannot fetch URLs")
             valkey_error = "Database unavailable"
 
-        # Fetch visitor data
         visitors = []
         bot_logs = []
         traffic_sources = {"direct": 0, "referral": 0, "organic": 0}
@@ -762,7 +794,6 @@ def dashboard():
             logger.warning("Valkey unavailable, cannot fetch visitors")
             valkey_error = "Database unavailable"
 
-        # Validate chart data
         try:
             traffic_sources_keys = list(traffic_sources.keys())
             traffic_sources_values = list(traffic_sources.values())
@@ -1243,6 +1274,7 @@ def export(index):
                 logger.debug(f"Fetching URL keys for export, user: {username}")
                 url_keys = valkey_client.keys(f"user:{username}:url:*")
                 if index <= 0 or index > len(url_keys):
+                    logger.warning(f"Invalid export index {index} for user {username}")
                     abort(404, "URL not found")
                 key = url_keys[index-1]
                 url_id = key.split(':')[-1]
@@ -1258,7 +1290,7 @@ def export(index):
                 writer.writerow(['Timestamp', 'IP', 'Device', 'App', 'Type', 'Country', 'City'])
                 for visit in visit_data:
                     writer.writerow([
-                        datetime.fromtimestamp(visit['timestamp']).strftime('%Y-%m-%d %H:%M:%S') if visit.get('timestamp') else 'Unknown',
+                        datetime.fromtimestamp(visit.get('timestamp', 0)).strftime('%Y-%m-%d %H:%M:%S') if visit.get('timestamp') else 'Unknown',
                         visit.get('ip', 'Unknown'),
                         visit.get('device', 'Unknown'),
                         visit.get('app', 'Unknown'),
@@ -1399,33 +1431,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
 
         if valkey_client:
             try:
-                visitor_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
-                valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
-                    "timestamp": int(time.time()),
-                    "ip": ip,
-                    "country": location['country'],
-                    "city": location['city'],
-                    "device": device,
-                    "application": app,
-                    "user_agent": user_agent,
-                    "bot_status": visit_type,
-                    "block_reason": bot_reason if is_bot_flag or asn_blocked else "N/A",
-                    "referer": referer,
-                    "source": 'referral' if referer else 'direct',
-                    "session_duration": session_duration
-                })
-                valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
-                logger.debug(f"Logged visitor: {visitor_id} for user: {username}")
-            except Exception as e:
-                logger.error(f"Valkey error logging visitor: {str(e)}")
-
-        if is_bot_flag or asn_blocked:
-            logger.warning(f"Blocked redirect for IP {ip}: {bot_reason}")
-            abort(403, f"Access denied: {bot_reason}")
-
-        url_id = hashlib.sha256(request.url.encode()).hexdigest()
-        if valkey_client:
-            try:
                 valkey_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
                 valkey_client.lpush(f"user:{username}:url:{url_id}:visits", json.dumps({
                     "timestamp": int(time.time()),
@@ -1440,6 +1445,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             except Exception as e:
                 logger.error(f"Valkey error logging visit: {str(e)}")
 
+        # Decrypt payload
         try:
             encrypted_payload = urllib.parse.unquote(encrypted_payload)
             logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}...")
@@ -1506,11 +1512,12 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
+                    <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
             </body>
             </html>
-        """), 500
+        """, error=str(e)), 500
 
 @app.route("/denied", methods=["GET"])
 def denied():
@@ -1536,6 +1543,28 @@ def denied():
     except Exception as e:
         logger.error(f"Error in denied: {str(e)}", exc_info=True)
         return "Access Denied", 403
+
+@app.route("/<path:path>", methods=["GET"])
+def catch_all(path):
+    logger.warning(f"404 Not Found for path: {path}, host: {request.host}, url: {request.url}")
+    return render_template_string("""
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Not Found</title>
+            <script src="https://cdn.tailwindcss.com"></script>
+        </head>
+        <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+            <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                <h3 class="text-lg font-bold mb-4 text-red-600">Not Found</h3>
+                <p class="text-gray-600">The requested URL was not found on the server.</p>
+                <p class="text-gray-600">Please check your spelling and try again.</p>
+            </div>
+        </body>
+        </html>
+    """), 404
 
 def generate_random_string(length):
     try:

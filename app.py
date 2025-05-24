@@ -138,9 +138,13 @@ def is_bot(user_agent, headers, ip):
             valkey_client.incr(key)
             valkey_client.expire(key, 60)
         # Check IP reputation (simplified, requires MAXMIND_KEY for full implementation)
-        if ip.startswith(('162.249.', '5.62.', '84.39.')):  # Example data center ranges
+        if ip.startswith(('162.249.', '5.62.', '84.39.')):
             logger.warning(f"Blocked IP {ip}: Data center IP range")
             return True, "Data center IP"
+        # Behavioral check: Require JS challenge or fingerprint
+        if 'js_verified' not in session:
+            logger.warning(f"Blocked IP {ip}: Missing JS verification")
+            return True, "Missing JS verification"
         return False, "Human"
     except Exception as e:
         logger.error(f"Error in is_bot for IP {ip}: {str(e)}", exc_info=True)
@@ -177,7 +181,7 @@ def get_geoip(ip):
         logger.error(f"MaxMind GeoIP failed for IP {ip}: {str(e)}", exc_info=True)
         return {"country": "Unknown", "city": "Unknown"}
 
-def rate_limit(limit=10, per=60):
+def rate_limit(limit=5, per=60):
     def decorator(f):
         @wraps(f)
         def wrapped_function(*args, **kwargs):
@@ -658,6 +662,8 @@ def dashboard():
         # Fetch visitor data
         visitors = []
         bot_logs = []
+        traffic_sources = {"direct": 0, "referral": 0, "organic": 0}
+        bot_ratio = {"human": 0, "bot": 0}
         if valkey_client:
             try:
                 visitor_keys = valkey_client.keys(f"user:{username}:visitor:*")
@@ -673,7 +679,8 @@ def dashboard():
                             "application": visitor_data.get('application', 'Unknown'),
                             "user_agent": visitor_data.get('user_agent', 'Unknown'),
                             "bot_status": visitor_data.get('bot_status', 'Unknown'),
-                            "block_reason": visitor_data.get('block_reason', 'N/A')
+                            "block_reason": visitor_data.get('block_reason', 'N/A'),
+                            "source": visitor_data.get('source', 'direct')
                         })
                         if visitor_data.get('bot_status') != 'Human':
                             bot_logs.append({
@@ -681,6 +688,11 @@ def dashboard():
                                 "ip": visitor_data.get('ip', 'Unknown'),
                                 "block_reason": visitor_data.get('block_reason', 'Unknown')
                             })
+                            bot_ratio['bot'] += 1
+                        else:
+                            bot_ratio['human'] += 1
+                        source = visitor_data.get('source', 'direct')
+                        traffic_sources[source] = traffic_sources.get(source, 0) + 1
                     except Exception as e:
                         logger.error(f"Error processing visitor key {key}: {str(e)}")
             except Exception as e:
@@ -717,6 +729,8 @@ def dashboard():
                     tr:nth-child(even) { background: #f9fafb; }
                     .error { background: #fee2e2; color: #b91c1c; }
                     .bot { background: #fee2e2; }
+                    .refresh-btn { animation: pulse 2s infinite; }
+                    @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.05); } 100% { transform: scale(1); } }
                 </style>
                 <script>
                     function toggleAnalytics(id) {
@@ -740,6 +754,9 @@ def dashboard():
                         document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
                         document.getElementById(tabId).classList.remove('hidden');
                         document.querySelector(`[onclick="showTab('${tabId}')"]`).classList.add('active');
+                    }
+                    function refreshDashboard() {
+                        window.location.reload();
                     }
                     let challenge = 0;
                     for (let i = 0; i < 1000; i++) challenge += Math.random();
@@ -778,6 +795,7 @@ def dashboard():
                         <button class="tab px-4 py-2 bg-white rounded-lg active" onclick="showTab('urls-tab')">URLs</button>
                         <button class="tab px-4 py-2 bg-white rounded-lg" onclick="showTab('visitors-tab')">Visitor Views</button>
                         <button class="tab px-4 py-2 bg-white rounded-lg" onclick="showTab('bot-logs-tab')">Bot Logs</button>
+                        <button class="tab px-4 py-2 bg-white rounded-lg" onclick="showTab('analytics-tab')">Analytics</button>
                     </div>
                     <div id="urls-tab" class="tab-content">
                         <div class="bg-white p-8 rounded-xl card mb-8">
@@ -906,7 +924,10 @@ def dashboard():
                     </div>
                     <div id="visitors-tab" class="tab-content hidden">
                         <div class="bg-white p-8 rounded-xl card">
-                            <h2 class="text-2xl font-bold mb-6 text-gray-900">Visitor Views</h2>
+                            <div class="flex justify-between items-center mb-4">
+                                <h2 class="text-2xl font-bold text-gray-900">Visitor Views</h2>
+                                <button onclick="refreshDashboard()" class="refresh-btn bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700">Refresh</button>
+                            </div>
                             {% if visitors %}
                                 <div class="table-container">
                                     <table>
@@ -921,6 +942,7 @@ def dashboard():
                                                 <th>User Agent</th>
                                                 <th>Bot Status</th>
                                                 <th>Block Reason</th>
+                                                <th>Source</th>
                                             </tr>
                                         </thead>
                                         <tbody>
@@ -935,11 +957,13 @@ def dashboard():
                                                     <td>{{ visitor.user_agent }}</td>
                                                     <td>{{ visitor.bot_status }}</td>
                                                     <td>{{ visitor.block_reason }}</td>
+                                                    <td>{{ visitor.source }}</td>
                                                 </tr>
                                             {% endfor %}
                                         </tbody>
                                     </table>
                                 </div>
+                                <a href="/export_visitors" class="mt-4 inline-block bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export Visitors as CSV</a>
                             {% else %}
                                 <p class="text-gray-600">No visitor data available.</p>
                             {% endif %}
@@ -974,12 +998,160 @@ def dashboard():
                             {% endif %}
                         </div>
                     </div>
+                    <div id="analytics-tab" class="tab-content hidden">
+                        <div class="bg-white p-8 rounded-xl card">
+                            <h2 class="text-2xl font-bold mb-6 text-gray-900">Traffic Analytics</h2>
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <h3 class="text-lg font-semibold mb-4">Traffic Sources</h3>
+                                    <canvas id="traffic-source-chart"></canvas>
+                                    <script>
+                                        new Chart(document.getElementById('traffic-source-chart'), {
+                                            type: 'pie',
+                                            data: {
+                                                labels: {{ traffic_sources.keys()|tojson }},
+                                                datasets: [{
+                                                    data: {{ traffic_sources.values()|tojson }},
+                                                    backgroundColor: ['#4f46e5', '#7c3aed', '#3b82f6']
+                                                }]
+                                            },
+                                            options: {
+                                                responsive: true,
+                                                plugins: {
+                                                    legend: { position: 'top' }
+                                                }
+                                            }
+                                        });
+                                    </script>
+                                </div>
+                                <div>
+                                    <h3 class="text-lg font-semibold mb-4">Bot vs Human Ratio</h3>
+                                    <canvas id="bot-ratio-chart"></canvas>
+                                    <script>
+                                        new Chart(document.getElementById('bot-ratio-chart'), {
+                                            type: 'doughnut',
+                                            data: {
+                                                labels: {{ bot_ratio.keys()|tojson }},
+                                                datasets: [{
+                                                    data: {{ bot_ratio.values()|tojson }},
+                                                    backgroundColor: ['#10b981', '#ef4444']
+                                                }]
+                                            },
+                                            options: {
+                                                responsive: true,
+                                                plugins: {
+                                                    legend: { position: 'top' }
+                                                }
+                                            }
+                                        });
+                                    </script>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </body>
             </html>
-        """, username=username, urls=urls, visitors=visitors, bot_logs=bot_logs, primary_color=primary_color, error=error, valkey_error=valkey_error)
+        """, username=username, urls=urls, visitors=visitors, bot_logs=bot_logs, traffic_sources=traffic_sources, bot_ratio=bot_ratio, primary_color=primary_color, error=error, valkey_error=valkey_error)
     except Exception as e:
         logger.error(f"Error in dashboard: {str(e)}", exc_info=True)
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Internal Server Error</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                </div>
+            </body>
+            </html>
+        """), 500
+
+@app.route("/export_visitors", methods=["GET"])
+@login_required
+def export_visitors():
+    try:
+        username = session['username']
+        logger.debug(f"Exporting visitor data for user: {username}, session: {session}")
+        if valkey_client:
+            try:
+                visitor_keys = valkey_client.keys(f"user:{username}:visitor:*")
+                visitor_data = []
+                for key in visitor_keys:
+                    try:
+                        visitor = valkey_client.hgetall(key)
+                        visitor_data.append(visitor)
+                    except Exception as e:
+                        logger.error(f"Error processing visitor key {key}: {str(e)}")
+                output = StringIO()
+                writer = csv.writer(output)
+                writer.writerow(['Timestamp', 'IP', 'Country', 'City', 'Device', 'Application', 'User Agent', 'Bot Status', 'Block Reason', 'Source'])
+                for visitor in visitor_data:
+                    writer.writerow([
+                        datetime.fromtimestamp(int(visitor.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor.get('timestamp') else 'Unknown',
+                        visitor.get('ip', 'Unknown'),
+                        visitor.get('country', 'Unknown'),
+                        visitor.get('city', 'Unknown'),
+                        visitor.get('device', 'Unknown'),
+                        visitor.get('application', 'Unknown'),
+                        visitor.get('user_agent', 'Unknown'),
+                        visitor.get('bot_status', 'Unknown'),
+                        visitor.get('block_reason', 'N/A'),
+                        visitor.get('source', 'direct')
+                    ])
+                output.seek(0)
+                logger.debug(f"Exported visitor CSV for user: {username}")
+                return Response(
+                    output.getvalue(),
+                    mimetype='text/csv',
+                    headers={"Content-Disposition": f"attachment;filename=visitors_{username}.csv"}
+                )
+            except Exception as e:
+                logger.error(f"Valkey error in export_visitors: {str(e)}")
+                return render_template_string("""
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Error</title>
+                        <script src="https://cdn.tailwindcss.com"></script>
+                    </head>
+                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                            <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                            <p class="text-gray-600">Database unavailable. Unable to export data.</p>
+                        </div>
+                    </body>
+                    </html>
+                """), 500
+        else:
+            logger.warning("Valkey unavailable for export_visitors")
+            return render_template_string("""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Error</title>
+                    <script src="https://cdn.tailwindcss.com"></script>
+                </head>
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                        <p class="text-gray-600">Database unavailable. Unable to export data.</p>
+                    </div>
+                </body>
+                </html>
+            """), 500
+    except Exception as e:
+        logger.error(f"Error in export_visitors: {str(e)}", exc_info=True)
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -1138,179 +1310,8 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         user_agent = request.headers.get("User-Agent", "")
         ip = request.remote_addr
         headers = request.headers
-        logger.debug(f"Redirect handler for {username}.{base_domain}/{endpoint}, IP: {ip}, User-Agent: {user_agent}")
+        logger.debug(f"Redirect handler for {username}.{base_domain}/{endpoint}, IP: {ip}, User-Agent: {user_agent}, URL: {request.url}")
 
         # Bot detection
         is_bot_flag, bot_reason = is_bot(user_agent, headers, ip)
-        asn_blocked = check_asn(ip)
-        ua = parse(user_agent)
-        device = "Desktop"
-        if ua.is_mobile:
-            device = "Android" if "Android" in user_agent else "iPhone" if "iPhone" in user_agent else "Mobile"
-        app = "Unknown"
-        if "Outlook" in user_agent:
-            app = "Outlook"
-        elif ua.browser.family:
-            app = ua.browser.family
-        visit_type = "Human"
-        if is_bot_flag or asn_blocked:
-            visit_type = "Bot" if "curl/" in user_agent.lower() else "Mimicry" if "Mimicry" in bot_reason else "Bot"
-        elif app != "Unknown" and app != ua.browser.family:
-            visit_type = "App"
-
-        # GeoIP
-        location = get_geoip(ip)
-
-        # Log visitor
-        if valkey_client:
-            try:
-                visitor_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
-                valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
-                    "timestamp": int(time.time()),
-                    "ip": ip,
-                    "country": location['country'],
-                    "city": location['city'],
-                    "device": device,
-                    "application": app,
-                    "user_agent": user_agent,
-                    "bot_status": visit_type,
-                    "block_reason": bot_reason if is_bot_flag else "N/A"
-                })
-                valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
-                logger.debug(f"Logged visitor: {visitor_id} for user: {username}")
-            except Exception as e:
-                logger.error(f"Valkey error logging visitor: {str(e)}")
-
-        if is_bot_flag or asn_blocked:
-            logger.warning(f"Blocked redirect for IP {ip}: {bot_reason}")
-            abort(403, f"Access denied: {bot_reason}")
-
-        # Log visit
-        url_id = hashlib.sha256(request.url.encode()).hexdigest()
-        if valkey_client:
-            try:
-                valkey_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
-                valkey_client.lpush(f"user:{username}:url:{url_id}:visits", json.dumps({
-                    "timestamp": int(time.time()),
-                    "ip": ip,
-                    "device": device,
-                    "app": app,
-                    "type": visit_type,
-                    "location": location
-                }))
-                valkey_client.expire(f"user:{username}:url:{url_id}:visits", DATA_RETENTION_DAYS * 86400)
-                logger.debug(f"Logged visit for URL ID: {url_id}")
-            except Exception as e:
-                logger.error(f"Valkey error logging visit: {str(e)}")
-
-        # Decrypt payload
-        try:
-            encrypted_payload = urllib.parse.unquote(encrypted_payload)
-            logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}...")
-        except Exception as e:
-            logger.error(f"Error decoding encrypted_payload: {str(e)}", exc_info=True)
-            abort(400, "Invalid payload format")
-
-        payload = None
-        for method in ['heap_x3', 'slugstorm', 'pow', 'signed_token']:
-            try:
-                logger.debug(f"Trying decryption method: {method}")
-                if method == 'heap_x3':
-                    data = decrypt_heap_x3(encrypted_payload)
-                    payload = data['payload']
-                    if data['fingerprint'] != generate_fingerprint():
-                        logger.warning("Fingerprint mismatch")
-                        continue
-                elif method == 'slugstorm':
-                    data = decrypt_slugstorm(encrypted_payload)
-                    payload = data['payload']
-                elif method == 'pow':
-                    payload = decrypt_pow(encrypted_payload)
-                else:
-                    payload = decrypt_signed_token(encrypted_payload)
-                logger.debug(f"Decryption successful with {method}")
-                break
-            except Exception as e:
-                logger.debug(f"Decryption failed with {method}: {str(e)}")
-                continue
-
-        if not payload:
-            logger.error("All decryption methods failed")
-            abort(400, "Invalid payload")
-
-        try:
-            data = json.loads(payload)
-            redirect_url = data.get("student_link")
-            expiry = data.get("expiry", float('inf'))
-            if not redirect_url or not re.match(r"^https?://", redirect_url):
-                logger.error(f"Invalid redirect URL: {redirect_url}")
-                abort(400, "Invalid redirect URL")
-            if time.time() > expiry:
-                logger.warning("URL expired")
-                abort(410, "URL has expired")
-            logger.debug(f"Parsed payload: redirect_url={redirect_url}")
-        except Exception as e:
-            logger.error(f"Payload parsing error: {str(e)}", exc_info=True)
-            abort(400, "Invalid payload")
-
-        final_url = f"{redirect_url.rstrip('/')}/{path_segment}"
-        logger.info(f"Redirecting to {final_url}")
-        return redirect(final_url, code=302)
-    except Exception as e:
-        logger.error(f"Error in redirect_handler: {str(e)}", exc_info=True)
-        return render_template_string("""
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Internal Server Error</title>
-                <script src="https://cdn.tailwindcss.com"></script>
-            </head>
-            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
-                </div>
-            </body>
-            </html>
-        """), 500
-
-@app.route("/denied", methods=["GET"])
-def denied():
-    try:
-        logger.debug("Access denied page accessed")
-        return render_template_string("""
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="robots" content="noindex, nofollow">
-                <title>Access Denied</title>
-                <script src="https://cdn.tailwindcss.com"></script>
-            </head>
-            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Access Denied</h3>
-                    <p class="text-gray-600">Suspicious activity detected.</p>
-                </div>
-            </body>
-            </html>
-        """), 403
-    except Exception as e:
-        logger.error(f"Error in denied: {str(e)}", exc_info=True)
-        return "Access Denied", 403
-
-def generate_random_string(length):
-    try:
-        characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-        result = "".join(secrets.choice(characters) for _ in range(length))
-        logger.debug(f"Generated random string: {result}")
-        return result
-    except Exception as e:
-        logger.error(f"Error in generate_random_string: {str(e)}", exc_info=True)
-        return "x" * length
-
-if __name__ == "__main__":
-    logger.debug("Starting Flask app")
-    app.run(debug=False)
+        asn_block

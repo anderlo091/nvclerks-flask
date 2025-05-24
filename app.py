@@ -104,6 +104,10 @@ def is_bot(user_agent, headers, ip, endpoint):
         if 'username' in session:
             logger.debug(f"IP {ip} is authenticated, skipping bot check")
             return False, "Authenticated user"
+        # Skip JS verification for generated link routes
+        if endpoint.startswith("/") and endpoint != "/login":
+            logger.debug(f"IP {ip} allowed for generated link {endpoint}, skipping JS verification")
+            return False, "Generated link access"
         if not user_agent:
             logger.warning(f"Blocked IP {ip}: No User-Agent provided")
             return True, "Missing User-Agent"
@@ -397,8 +401,8 @@ def login_required(f):
 def block_ohio_subdomain():
     try:
         if request.host == 'ohioautocollection.nvclerks.com':
-            logger.debug(f"Blocked request to {request.host}: Returning 404")
-            abort(404)
+            logger.debug(f"Redirecting request to {request.host} to https://google.com")
+            return redirect("https://google.com", code=302)
     except Exception as e:
         logger.error(f"Error in block_ohio_subdomain: {str(e)}", exc_info=True)
 
@@ -1449,6 +1453,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                     "source": 'referral' if referer else 'direct',
                     "session_duration": session_duration
                 })
+                }))
                 valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
                 logger.debug(f"Logged visitor: {visitor_id} for user: {username}")
             except Exception as e:
@@ -1554,7 +1559,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
 @rate_limit(limit=5, per=60)
 def redirect_handler_no_subdomain(endpoint, encrypted_payload, path_segment):
     try:
-        # Extract username from URL or fallback to default
         host = request.host
         username = host.split('.')[0] if '.' in host else "default"
         logger.debug(f"Fallback redirect handler: username={username}, endpoint={endpoint}, "

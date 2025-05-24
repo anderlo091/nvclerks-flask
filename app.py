@@ -402,6 +402,13 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+# Block ohioautocollection.nvclerks.com
+@app.before_request
+def block_ohio_subdomain():
+    if request.host == 'ohioautocollection.nvclerks.com':
+        logger.debug(f"Blocked request to {request.host}: Returning 404")
+        abort(404)
+
 @app.route("/login", methods=["GET", "POST"])
 @rate_limit(limit=5, per=60)
 def login():
@@ -552,7 +559,7 @@ def dashboard():
             # Validate inputs
             if not re.match(r"^https?://", destination_link):
                 error = "Invalid URL"
-            elif not (2 <= len(subdomain) <= 100 and re.match(r"^[A-Za-z0-9\-]{2,100}$", subdomain)):
+            elif not (2 <= len(subdomain) <= 100 and re.match(r"^[A-Za-z0-9-]{2,100}$", subdomain)):
                 error = "Subdomain must be 2-100 characters (letters, numbers, or hyphens)"
             elif not (2 <= len(randomstring1) <= 100 and re.match(r"^[A-Za-z0-9_@.]{2,100}$", randomstring1)):
                 error = "Randomstring1 must be 2-100 characters (letters, numbers, _, @, .)"
@@ -670,6 +677,7 @@ def dashboard():
                 for key in visitor_keys:
                     try:
                         visitor_data = valkey_client.hgetall(key)
+                        source = 'referral' if visitor_data.get('referer') else 'direct'
                         visitors.append({
                             "timestamp": datetime.fromtimestamp(int(visitor_data.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor_data.get('timestamp') else 'Unknown',
                             "ip": visitor_data.get('ip', 'Unknown'),
@@ -680,7 +688,8 @@ def dashboard():
                             "user_agent": visitor_data.get('user_agent', 'Unknown'),
                             "bot_status": visitor_data.get('bot_status', 'Unknown'),
                             "block_reason": visitor_data.get('block_reason', 'N/A'),
-                            "source": visitor_data.get('source', 'direct')
+                            "source": source,
+                            "session_duration": int(visitor_data.get('session_duration', 0))
                         })
                         if visitor_data.get('bot_status') != 'Human':
                             bot_logs.append({
@@ -691,7 +700,6 @@ def dashboard():
                             bot_ratio['bot'] += 1
                         else:
                             bot_ratio['human'] += 1
-                        source = visitor_data.get('source', 'direct')
                         traffic_sources[source] = traffic_sources.get(source, 0) + 1
                     except Exception as e:
                         logger.error(f"Error processing visitor key {key}: {str(e)}")
@@ -803,7 +811,7 @@ def dashboard():
                             <form method="POST" class="space-y-5">
                                 <div>
                                     <label class="block text-sm font-medium text-gray-700">Subdomain</label>
-                                    <input type="text" name="subdomain" required minlength="2" maxlength="100" pattern="[A-Za-z0-9\-]{2,100}" title="Subdomain must be 2-100 characters (letters, numbers, or hyphens)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
+                                    <input type="text" name="subdomain" required minlength="2" maxlength="100" pattern="[A-Za-z0-9-]{2,100}" title="Subdomain must be 2-100 characters (letters, numbers, or hyphens)" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition">
                                 </div>
                                 <div>
                                     <label class="block text-sm font-medium text-gray-700">Randomstring1</label>
@@ -943,6 +951,7 @@ def dashboard():
                                                 <th>Bot Status</th>
                                                 <th>Block Reason</th>
                                                 <th>Source</th>
+                                                <th>Session Duration (s)</th>
                                             </tr>
                                         </thead>
                                         <tbody>
@@ -958,6 +967,7 @@ def dashboard():
                                                     <td>{{ visitor.bot_status }}</td>
                                                     <td>{{ visitor.block_reason }}</td>
                                                     <td>{{ visitor.source }}</td>
+                                                    <td>{{ visitor.session_duration }}</td>
                                                 </tr>
                                             {% endfor %}
                                         </tbody>
@@ -1091,7 +1101,7 @@ def export_visitors():
                         logger.error(f"Error processing visitor key {key}: {str(e)}")
                 output = StringIO()
                 writer = csv.writer(output)
-                writer.writerow(['Timestamp', 'IP', 'Country', 'City', 'Device', 'Application', 'User Agent', 'Bot Status', 'Block Reason', 'Source'])
+                writer.writerow(['Timestamp', 'IP', 'Country', 'City', 'Device', 'Application', 'User Agent', 'Bot Status', 'Block Reason', 'Source', 'Session Duration (s)'])
                 for visitor in visitor_data:
                     writer.writerow([
                         datetime.fromtimestamp(int(visitor.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor.get('timestamp') else 'Unknown',
@@ -1103,7 +1113,8 @@ def export_visitors():
                         visitor.get('user_agent', 'Unknown'),
                         visitor.get('bot_status', 'Unknown'),
                         visitor.get('block_reason', 'N/A'),
-                        visitor.get('source', 'direct')
+                        visitor.get('source', 'direct'),
+                        visitor.get('session_duration', '0')
                     ])
                 output.seek(0)
                 logger.debug(f"Exported visitor CSV for user: {username}")
@@ -1310,8 +1321,188 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         user_agent = request.headers.get("User-Agent", "")
         ip = request.remote_addr
         headers = request.headers
+        referer = headers.get("Referer", "")
+        session_start = session.get('session_start', int(time.time()))
+        session['session_start'] = session_start
         logger.debug(f"Redirect handler for {username}.{base_domain}/{endpoint}, IP: {ip}, User-Agent: {user_agent}, URL: {request.url}")
 
         # Bot detection
         is_bot_flag, bot_reason = is_bot(user_agent, headers, ip)
-        asn_block
+        asn_blocked = check_asn(ip)
+        ua = parse(user_agent)
+        device = "Desktop"
+        if ua.is_mobile:
+            device = "Android" if "Android" in user_agent else "iPhone" if "iPhone" in user_agent else "Mobile"
+        app = "Unknown"
+        if "Outlook" in user_agent:
+            app = "Outlook"
+        elif ua.browser.family:
+            app = ua.browser.family
+        visit_type = "Human"
+        if is_bot_flag or asn_blocked:
+            visit_type = "Bot" if "curl/" in user_agent.lower() else "Mimicry" if "Mimicry" in bot_reason else "Bot"
+        elif app != "Unknown" and app != ua.browser.family:
+            visit_type = "App"
+
+        # GeoIP
+        location = get_geoip(ip)
+
+        # Calculate session duration
+        session_duration = int(time.time()) - session_start
+
+        # Log visitor
+        if valkey_client:
+            try:
+                visitor_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
+                valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
+                    "timestamp": int(time.time()),
+                    "ip": ip,
+                    "country": location['country'],
+                    "city": location['city'],
+                    "device": device,
+                    "application": app,
+                    "user_agent": user_agent,
+                    "bot_status": visit_type,
+                    "block_reason": bot_reason if is_bot_flag or asn_blocked else "N/A",
+                    "referer": referer,
+                    "source": 'referral' if referer else 'direct',
+                    "session_duration": session_duration
+                })
+                valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
+                logger.debug(f"Logged visitor: {visitor_id} for user: {username}")
+            except Exception as e:
+                logger.error(f"Valkey error logging visitor: {str(e)}")
+
+        if is_bot_flag or asn_blocked:
+            logger.warning(f"Blocked redirect for IP {ip}: {bot_reason}")
+            abort(403, f"Access denied: {bot_reason}")
+
+        # Log visit
+        url_id = hashlib.sha256(request.url.encode()).hexdigest()
+        if valkey_client:
+            try:
+                valkey_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
+                valkey_client.lpush(f"user:{username}:url:{url_id}:visits", json.dumps({
+                    "timestamp": int(time.time()),
+                    "ip": ip,
+                    "device": device,
+                    "app": app,
+                    "type": visit_type,
+                    "location": location
+                }))
+                valkey_client.expire(f"user:{username}:url:{url_id}:visits", DATA_RETENTION_DAYS * 86400)
+                logger.debug(f"Logged visit for URL ID: {url_id}")
+            except Exception as e:
+                logger.error(f"Valkey error logging visit: {str(e)}")
+
+        # Decrypt payload
+        try:
+            encrypted_payload = urllib.parse.unquote(encrypted_payload)
+            logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}...")
+        except Exception as e:
+            logger.error(f"Error decoding encrypted_payload: {str(e)}", exc_info=True)
+            abort(400, "Invalid payload format")
+
+        payload = None
+        for method in ['heap_x3', 'slugstorm', 'pow', 'signed_token']:
+            try:
+                logger.debug(f"Trying decryption method: {method}")
+                if method == 'heap_x3':
+                    data = decrypt_heap_x3(encrypted_payload)
+                    payload = data['payload']
+                    if data['fingerprint'] != generate_fingerprint():
+                        logger.warning("Fingerprint mismatch")
+                        continue
+                elif method == 'slugstorm':
+                    data = decrypt_slugstorm(encrypted_payload)
+                    payload = data['payload']
+                elif method == 'pow':
+                    payload = decrypt_pow(encrypted_payload)
+                else:
+                    payload = decrypt_signed_token(encrypted_payload)
+                logger.debug(f"Decryption successful with {method}")
+                break
+            except Exception as e:
+                logger.debug(f"Decryption failed with {method}: {str(e)}")
+                continue
+
+        if not payload:
+            logger.error("All decryption methods failed")
+            abort(400, "Invalid payload")
+
+        try:
+            data = json.loads(payload)
+            redirect_url = data.get("student_link")
+            expiry = data.get("expiry", float('inf'))
+            if not redirect_url or not re.match(r"^https?://", redirect_url):
+                logger.error(f"Invalid redirect URL: {redirect_url}")
+                abort(400, "Invalid redirect URL")
+            if time.time() > expiry:
+                logger.warning("URL expired")
+                abort(410, "URL has expired")
+            logger.debug(f"Parsed payload: redirect_url={redirect_url}")
+        except Exception as e:
+            logger.error(f"Payload parsing error: {str(e)}", exc_info=True)
+            abort(400, "Invalid payload")
+
+        final_url = f"{redirect_url.rstrip('/')}/{path_segment}"
+        logger.info(f"Redirecting to {final_url}")
+        return redirect(final_url, code=302)
+    except Exception as e:
+        logger.error(f"Error in redirect_handler: {str(e)}", exc_info=True)
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Internal Server Error</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                </div>
+            </body>
+            </html>
+        """), 500
+
+@app.route("/denied", methods=["GET"])
+def denied():
+    try:
+        logger.debug("Access denied page accessed")
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="robots" content="noindex, nofollow">
+                <title>Access Denied</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Access Denied</h3>
+                    <p class="text-gray-600">Suspicious activity detected.</p>
+                </div>
+            </body>
+            </html>
+        """), 403
+    except Exception as e:
+        logger.error(f"Error in denied: {str(e)}", exc_info=True)
+        return "Access Denied", 403
+
+def generate_random_string(length):
+    try:
+        characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        result = "".join(secrets.choice(characters) for _ in range(length))
+        logger.debug(f"Generated random string: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"Error in generate_random_string: {str(e)}", exc_info=True)
+        return "x" * length
+
+if __name__ == "__main__":
+    logger.debug("Starting Flask app")
+    app.run(debug=False)

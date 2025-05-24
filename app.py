@@ -1456,7 +1456,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                     "source": 'referral' if referer else 'direct',
                     "session_duration": session_duration
                 })
-}))
                 valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
                 logger.debug(f"Logged visitor: {visitor_id} for user: {username}")
             except Exception as e:

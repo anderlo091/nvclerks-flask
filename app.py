@@ -886,6 +886,7 @@ def dashboard():
         total_humans = 0
         total_bots = 0
         total_bot_detections = 0
+        total_visits = 0
         device_types = {"Mobile": 0, "Tablet": 0, "Desktop": 0, "Not Available": 0}
         screen_types = {"Touchscreen": 0, "Standard": 0, "Not Available": 0}
         visitor_locations = []
@@ -914,6 +915,7 @@ def dashboard():
                             try:
                                 visit = json.loads(v)
                                 visit_data.append(visit)
+                                total_visits += 1
                                 if visit.get('type') == 'Human':
                                     human_visits += 1
                                     total_humans += 1
@@ -966,7 +968,6 @@ def dashboard():
         bot_logs = []
         traffic_sources = {"direct": 0, "referral": 0, "organic": 0}
         bot_ratio = {"human": 0, "bot": 0}
-        total_visits = 0
         if valkey_client:
             try:
                 logger.debug(f"Fetching visitor keys for user: {username}")
@@ -978,7 +979,6 @@ def dashboard():
                         if not visitor_data:
                             logger.warning(f"Empty visitor data for ID {visitor_id}")
                             continue
-                        total_visits += 1
                         source = 'referral' if visitor_data.get('referer') else 'direct'
                         visitor_entry = {
                             "timestamp": datetime.fromtimestamp(int(visitor_data.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor_data.get('timestamp') else 'Not Available',
@@ -1090,89 +1090,123 @@ def dashboard():
                 </style>
                 <script>
                     function toggleAnalytics(id) {
-                        document.getElementById('analytics-' + id).classList.toggle('hidden');
+                        try {
+                            document.getElementById('analytics-' + id).classList.toggle('hidden');
+                        } catch (e) {
+                            console.error('Error toggling analytics:', e);
+                        }
                     }
                     function applyFilters(id) {
-                        let device = document.getElementById('filter-device-' + id).value;
-                        let type = document.getElementById('filter-type-' + id).value;
-                        let rows = document.querySelectorAll('#visits-' + id + ' tr');
-                        rows.forEach(row => {
-                            let deviceCell = row.cells[2].textContent;
-                            let typeCell = row.cells[4].textContent;
-                            row.style.display = (
-                                (device === '' || deviceCell.includes(device)) &&
-                                (type === '' || typeCell.includes(type))
-                            ) ? '' : 'none';
-                        });
+                        try {
+                            let device = document.getElementById('filter-device-' + id).value;
+                            let type = document.getElementById('filter-type-' + id).value;
+                            let rows = document.querySelectorAll('#visits-' + id + ' tr');
+                            rows.forEach(row => {
+                                let deviceCell = row.cells[2].textContent;
+                                let typeCell = row.cells[4].textContent;
+                                row.style.display = (
+                                    (device === '' || deviceCell.includes(device)) &&
+                                    (type === '' || typeCell.includes(type))
+                                ) ? '' : 'none';
+                            });
+                        } catch (e) {
+                            console.error('Error applying filters:', e);
+                        }
                     }
                     function showTab(tabId) {
-                        document.querySelectorAll('.tab-content').forEach(tab => tab.classList.add('hidden'));
-                        document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
-                        document.getElementById(tabId).classList.remove('hidden');
-                        document.querySelector(`[onclick="showTab('${tabId}')"]`).classList.add('active');
+                        try {
+                            console.log('Switching to tab:', tabId);
+                            document.querySelectorAll('.tab-content').forEach(tab => {
+                                tab.classList.add('hidden');
+                            });
+                            document.querySelectorAll('.tab').forEach(tab => {
+                                tab.classList.remove('active');
+                            });
+                            document.getElementById(tabId).classList.remove('hidden');
+                            document.querySelector(`[onclick="showTab('${tabId}')"]`).classList.add('active');
+                        } catch (e) {
+                            console.error('Error switching tab:', e);
+                        }
                     }
                     function refreshDashboard() {
                         window.location.reload();
                     }
                     function toggleAnalyticsSwitch(urlId, index) {
-                        fetch('/toggle_analytics/' + urlId, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' }
-                        }).then(response => {
-                            if (response.ok) {
-                                let checkbox = document.getElementById('analytics-toggle-' + index);
-                                checkbox.checked = !checkbox.checked;
-                            } else {
-                                alert('Failed to toggle analytics');
-                            }
-                        }).catch(error => {
-                            console.error('Error toggling analytics:', error);
-                            alert('Error toggling analytics');
-                        });
+                        try {
+                            fetch('/toggle_analytics/' + urlId, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' }
+                            }).then(response => {
+                                if (response.ok) {
+                                    let checkbox = document.getElementById('analytics-toggle-' + index);
+                                    checkbox.checked = !checkbox.checked;
+                                } else {
+                                    alert('Failed to toggle analytics');
+                                }
+                            }).catch(error => {
+                                console.error('Error toggling analytics:', error);
+                                alert('Error toggling analytics');
+                            });
+                        } catch (e) {
+                            console.error('Error in toggleAnalyticsSwitch:', e);
+                        }
                     }
                     function pollClicks(lastTimestamp) {
-                        fetch('/poll_clicks?last_timestamp=' + lastTimestamp)
-                            .then(response => response.json())
-                            .then(data => {
-                                if (data.clicks && data.clicks.length > 0) {
-                                    updateClickCounts(data.clicks);
-                                    lastTimestamp = data.clicks[0].timestamp;
-                                }
-                                setTimeout(() => pollClicks(lastTimestamp), 5000);
-                            })
-                            .catch(error => {
-                                console.error('Polling error:', error);
-                                setTimeout(() => pollClicks(lastTimestamp), 5000);
-                            });
+                        try {
+                            fetch('/poll_clicks?last_timestamp=' + lastTimestamp)
+                                .then(response => response.json())
+                                .then(data => {
+                                    if (data.clicks && data.clicks.length > 0) {
+                                        updateClickCounts(data.clicks);
+                                        lastTimestamp = data.clicks[0].timestamp;
+                                    }
+                                    setTimeout(() => pollClicks(lastTimestamp), 5000);
+                                })
+                                .catch(error => {
+                                    console.error('Polling error:', error);
+                                    setTimeout(() => pollClicks(lastTimestamp), 5000);
+                                });
+                        } catch (e) {
+                            console.error('Error in pollClicks:', e);
+                        }
                     }
                     function updateClickCounts(clicks) {
-                        let totalHumans = parseInt(document.getElementById('total-humans').textContent);
-                        let totalBots = parseInt(document.getElementById('total-bots').textContent);
-                        let totalBotDetections = parseInt(document.getElementById('total-bot-detections').textContent);
-                        let totalVisits = parseInt(document.getElementById('total-visits').textContent);
-                        clicks.forEach(click => {
-                            totalVisits++;
-                            if (click.type === 'Human') {
-                                totalHumans++;
-                            } else {
-                                totalBots++;
-                                totalBotDetections++;
-                            }
-                        });
-                        document.getElementById('total-humans').textContent = totalHumans;
-                        document.getElementById('total-bots').textContent = totalBots;
-                        document.getElementById('total-bot-detections').textContent = totalBotDetections;
-                        document.getElementById('total-visits').textContent = totalVisits;
+                        try {
+                            let totalHumans = parseInt(document.getElementById('total-humans').textContent);
+                            let totalBots = parseInt(document.getElementById('total-bots').textContent);
+                            let totalBotDetections = parseInt(document.getElementById('total-bot-detections').textContent);
+                            let totalVisits = parseInt(document.getElementById('total-visits').textContent);
+                            clicks.forEach(click => {
+                                totalVisits++;
+                                if (click.type === 'Human') {
+                                    totalHumans++;
+                                } else {
+                                    totalBots++;
+                                    totalBotDetections++;
+                                }
+                            });
+                            document.getElementById('total-humans').textContent = totalHumans;
+                            document.getElementById('total-bots').textContent = totalBots;
+                            document.getElementById('total-bot-detections').textContent = totalBotDetections;
+                            document.getElementById('total-visits').textContent = totalVisits;
+                        } catch (e) {
+                            console.error('Error updating click counts:', e);
+                        }
                     }
                     window.onload = function() {
-                        let lastTimestamp = {{ latest_timestamp }};
-                        pollClicks(lastTimestamp);
-                        let map = L.map('heatmap').setView([0, 0], 2);
-                        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                            attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-                        }).addTo(map);
-                        let heatPoints = {{ visitor_locations|tojson }}.map(loc => [loc.lat, loc.lng, 1]);
-                        L.heatLayer(heatPoints, { radius: 25 }).addTo(map);
+                        try {
+                            let lastTimestamp = {{ latest_timestamp }};
+                            pollClicks(lastTimestamp);
+                            let map = L.map('heatmap').setView([0, 0], 2);
+                            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                                attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+                            }).addTo(map);
+                            let heatPoints = {{ visitor_locations|tojson }}.map(loc => [loc.lat, loc.lng, 1]);
+                            L.heatLayer(heatPoints, { radius: 25 }).addTo(map);
+                            showTab('urls-tab'); // Ensure URLs tab is active by default
+                        } catch (e) {
+                            console.error('Error on page load:', e);
+                        }
                     };
                 </script>
             </head>
@@ -1361,13 +1395,13 @@ def dashboard():
                             {% endif %}
                         </div>
                     </div>
-                    <div id="visitors-tab" class="tab-content hidden">
+                                        <div id="visitors-tab" class="tab-content hidden">
                         <div class="bg-white p-8 rounded-xl card">
                             <div class="flex justify-between items-center mb-4">
                                 <h2 class="text-2xl font-bold text-gray-900">Visitor Views</h2>
                                 <button onclick="refreshDashboard()" class="refresh-btn bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700">Refresh</button>
                             </div>
-                                                        {% if visitors %}
+                            {% if visitors %}
                                 <div class="table-container">
                                     <table>
                                         <thead>
@@ -1573,7 +1607,7 @@ def dashboard():
            visitor_locations=visitor_locations, total_humans=total_humans, total_bots=total_bots,
            total_bot_detections=total_bot_detections, total_visits=total_visits, last_login=last_login,
            primary_color=primary_color, error=error, valkey_error=valkey_error,
-           latest_timestamp=max([v.get('timestamp', 0) for v in visitors] or [int(time.time())]))
+           latest_timestamp=max([float(v.get('timestamp', 0)) for v in visitors] or [int(time.time())]))
     except Exception as e:
         logger.error(f"Dashboard error for user {username}: {str(e)}", exc_info=True)
         return render_template_string("""

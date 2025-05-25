@@ -1433,7 +1433,7 @@ def clear_views(url_id):
         else:
             logger.warning("Valkey unavailable for clear_views")
             return render_template_string("""
-               <!DOCTYPE html>
+                <!DOCTYPE html>
                 <html lang="en">
                 <head>
                     <meta charset="UTF-8">
@@ -1474,6 +1474,7 @@ def clear_views(url_id):
 def delete_url(url_id):
     try:
         username = session['username']
+        logger.debug(f"Deleting URL {url_id} for user: {username}")
         if valkey_client:
             key = f"user:{username}:url:{url_id}"
             if not valkey_client.exists(key):
@@ -1503,6 +1504,7 @@ def delete_url(url_id):
             """), 500
     except Exception as e:
         logger.error(f"Error in delete_url: {str(e)}")
+        session.modified = True  # Ensure session persists
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -1563,6 +1565,7 @@ def export_visitors():
                     ])
                 output.seek(0)
                 logger.debug(f"Exported visitor CSV for user: {username}")
+                session.modified = True
                 return Response(
                     output.getvalue(),
                     mimetype='text/csv',
@@ -1570,6 +1573,7 @@ def export_visitors():
                 )
             except Exception as e:
                 logger.error(f"Valkey error in export_visitors: {str(e)}")
+                session.modified = True
                 return render_template_string("""
                     <!DOCTYPE html>
                     <html lang="en">
@@ -1589,6 +1593,7 @@ def export_visitors():
                 """), 500
         else:
             logger.warning("Valkey unavailable for export_visitors")
+            session.modified = True
             return render_template_string("""
                 <!DOCTYPE html>
                 <html lang="en">
@@ -1608,6 +1613,7 @@ def export_visitors():
             """), 500
     except Exception as e:
         logger.error(f"Error in export_visitors: {str(e)}")
+        session.modified = True
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -1663,6 +1669,7 @@ def export(index):
                     ])
                 output.seek(0)
                 logger.debug(f"Exported CSV for URL ID: {url_id}")
+                session.modified = True
                 return Response(
                     output.getvalue(),
                     mimetype='text/csv',
@@ -1670,6 +1677,7 @@ def export(index):
                 )
             except Exception as e:
                 logger.error(f"Valkey error in export: {str(e)}")
+                session.modified = True
                 return render_template_string("""
                     <!DOCTYPE html>
                     <html lang="en">
@@ -1689,6 +1697,7 @@ def export(index):
                 """), 500
         else:
             logger.warning("Valkey unavailable for export")
+            session.modified = True
             return render_template_string("""
                 <!DOCTYPE html>
                 <html lang="en">
@@ -1708,6 +1717,7 @@ def export(index):
             """), 500
     except Exception as e:
         logger.error(f"Error in export: {str(e)}")
+        session.modified = True
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -1740,6 +1750,7 @@ def challenge():
         return jsonify({"status": "ok"}), 200
     except Exception as e:
         logger.error(f"Error in challenge: {str(e)}")
+        session.modified = True
         return jsonify({"status": "error"}), 500
 
 @app.route("/fingerprint", methods=["POST"])
@@ -1754,9 +1765,11 @@ def fingerprint():
                     logger.debug(f"Fingerprint stored: {fingerprint[:10]}...")
                 except Exception as e:
                     logger.error(f"Valkey error storing fingerprint: {str(e)}")
+        session.modified = True
         return jsonify({"status": "ok"}), 200
     except Exception as e:
         logger.error(f"Error in fingerprint: {str(e)}")
+        session.modified = True
         return jsonify({"status": "error"}), 500
 
 @app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>", methods=["GET"], subdomain="<username>")
@@ -1770,6 +1783,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         referer = headers.get("Referer", "")
         session_start = session.get('session_start', int(time.time()))
         session['session_start'] = session_start
+        session.modified = True
         logger.debug(f"Redirect handler: username={username}, base_domain={base_domain}, endpoint={endpoint}, "
                      f"payload={encrypted_payload[:20]}..., path_segment={path_segment}, IP={ip}, UA={user_agent}, URL={request.url}")
         logger.debug(f"ENCRYPTION_KEY hash: {hashlib.sha256(ENCRYPTION_KEY).hexdigest()[:10]}...")
@@ -1886,9 +1900,11 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
 
         final_url = f"{redirect_url.rstrip('/')}/{path_segment}"
         logger.info(f"Redirecting to {final_url}")
+        session.modified = True
         return redirect(final_url, code=302)
     except Exception as e:
         logger.error(f"Error in redirect_handler: {str(e)}")
+        session.modified = True
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -1915,9 +1931,11 @@ def redirect_handler_no_subdomain(endpoint, encrypted_payload, path_segment):
         username = host.split('.')[0] if '.' in host else "default"
         logger.debug(f"Fallback redirect handler: username={username}, endpoint={endpoint}, "
                      f"payload={encrypted_payload[:20]}..., path_segment={path_segment}, URL={request.url}")
+        session.modified = True
         return redirect_handler(username, endpoint, encrypted_payload, path_segment)
     except Exception as e:
         logger.error(f"Error in redirect_handler_no_subdomain: {str(e)}")
+        session.modified = True
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -1940,6 +1958,7 @@ def redirect_handler_no_subdomain(endpoint, encrypted_payload, path_segment):
 def denied():
     try:
         logger.debug("Access denied page accessed")
+        session.modified = True
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -1959,28 +1978,51 @@ def denied():
         """), 403
     except Exception as e:
         logger.error(f"Error in denied: {str(e)}")
+        session.modified = True
         return "Access Denied", 403
 
 @app.route("/<path:path>", methods=["GET"])
 def catch_all(path):
-    logger.warning(f"404 Not Found for path: {path}, host: {request.host}, url: {request.url}")
-    return render_template_string("""
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Not Found</title>
-            <script src="https://cdn.tailwindcss.com"></script>
-        </head>
-        <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-            <div class="bg-white p-8 rounded-lg shadow-lg max-w-md w-full text-center">
-                <h3 class="text-lg font-bold mb-4 text-red-600">Not Found</h3>
-                <p class="text-gray-600">The requested URL was not found on the server.</p>
-            </div>
-        </body>
-        </html>
-    """), 404
+    try:
+        logger.warning(f"404 Not Found for path: {path}, host: {request.host}, url: {request.url}")
+        session.modified = True
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Not Found</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-lg shadow-lg max-w-md w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Not Found</h3>
+                    <p class="text-gray-600">The requested URL was not found on the server.</p>
+                </div>
+            </body>
+            </html>
+        """), 404
+    except Exception as e:
+        logger.error(f"Error in catch_all: {str(e)}")
+        session.modified = True
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Internal Server Error</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-lg shadow-lg max-w-md w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
+                </div>
+            </body>
+            </html>
+        """, error=str(e)), 500
 
 def generate_random_string(length):
     try:

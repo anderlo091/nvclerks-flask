@@ -1,6 +1,7 @@
 from flask import Flask, request, redirect, render_template_string, abort, url_for, session, jsonify, Response
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes, hmac
+from cryptography.hazmat.primitives.padding import PKCS7
 from cryptography.hazmat.backends import default_backend
 import os
 import base64
@@ -152,23 +153,37 @@ def check_asn(ip):
 
 def get_geoip(ip):
     try:
-        response = requests.get(f"https://ip-api.com/json/{ip}?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp,org,as,query")
+        # Check cache first
+        if valkey_client:
+            cache_key = f"geoip:{ip}"
+            cached = valkey_client.get(cache_key)
+            if cached:
+                logger.debug(f"GeoIP cache hit for IP {ip}")
+                return json.loads(cached)
+        response = requests.get(f"https://ipapi.co/{ip}/json/")
         response.raise_for_status()
         data = response.json()
-        if data.get('status') != 'success':
-            logger.error(f"IP-API.com error for IP {ip}: {data.get('message', 'Unknown error')}")
+        if data.get('error'):
+            logger.error(f"ipapi.co error for IP {ip}: {data.get('reason', 'Unknown error')}")
             return {"country": "Unknown", "city": "Unknown", "region": "Unknown", "lat": 0.0, "lon": 0.0, "isp": "Unknown", "timezone": "Unknown"}
-        return {
-            "country": data.get('country', 'Unknown'),
+        geo_data = {
+            "country": data.get('country_name', 'Unknown'),
             "city": data.get('city', 'Unknown'),
-            "region": data.get('regionName', 'Unknown'),
-            "lat": data.get('lat', 0.0),
-            "lon": data.get('lon', 0.0),
-            "isp": data.get('isp', 'Unknown'),
+            "region": data.get('region', 'Unknown'),
+            "lat": data.get('latitude', 0.0),
+            "lon": data.get('longitude', 0.0),
+            "isp": data.get('org', 'Unknown'),
             "timezone": data.get('timezone', 'Unknown')
         }
+        if valkey_client:
+            try:
+                valkey_client.setex(cache_key, 86400, json.dumps(geo_data))
+                logger.debug(f"Cached GeoIP for IP {ip}")
+            except Exception as e:
+                logger.error(f"Valkey error caching GeoIP: {str(e)}")
+        return geo_data
     except Exception as e:
-        logger.error(f"IP-API.com failed for IP {ip}: {str(e)}", exc_info=True)
+        logger.error(f"ipapi.co failed for IP {ip}: {str(e)}", exc_info=True)
         return {"country": "Unknown", "city": "Unknown", "region": "Unknown", "lat": 0.0, "lon": 0.0, "isp": "Unknown", "timezone": "Unknown"}
 
 def rate_limit(limit=5, per=60):
@@ -360,6 +375,45 @@ def decrypt_signed_token(encrypted):
         logger.error(f"Signed Token decryption error: {str(e)}", exc_info=True)
         raise ValueError("Invalid payload")
 
+def encrypt_aes_cbc_hmac(payload):
+    try:
+        iv = secrets.token_bytes(16)
+        cipher = Cipher(algorithms.AES(ENCRYPTION_KEY), modes.CBC(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        padder = PKCS7(128).padder()
+        padded_data = padder.update(payload.encode()) + padder.finalize()
+        ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+        h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
+        h.update(iv + ciphertext)
+        signature = h.finalize()
+        result = f"{base64.urlsafe_b64encode(iv + ciphertext).decode()}.{base64.urlsafe_b64encode(signature).decode()}"
+        logger.debug(f"AES-CBC-HMAC encrypted payload: {result[:20]}...")
+        return result
+    except Exception as e:
+        logger.error(f"AES-CBC-HMAC encryption error: {str(e)}", exc_info=True)
+        raise ValueError("Encryption failed")
+
+def decrypt_aes_cbc_hmac(encrypted):
+    try:
+        data_b64, sig_b64 = encrypted.split('.')
+        data = base64.urlsafe_b64decode(data_b64)
+        signature = base64.urlsafe_b64decode(sig_b64)
+        h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
+        h.update(data)
+        h.verify(signature)
+        iv = data[:16]
+        ciphertext = data[16:]
+        cipher = Cipher(algorithms.AES(ENCRYPTION_KEY), modes.CBC(iv), backend=default_backend())
+        decryptor = cipher.decryptor()
+        padded_data = decryptor.update(ciphertext) + decryptor.finalize()
+        unpadder = PKCS7(128).unpadder()
+        result = unpadder.update(padded_data) + unpadder.finalize()
+        logger.debug(f"AES-CBC-HMAC decrypted payload: {result[:50]}...")
+        return result.decode()
+    except Exception as e:
+        logger.error(f"AES-CBC-HMAC decryption error: {str(e)}", exc_info=True)
+        raise ValueError("Invalid payload")
+
 def get_valid_usernames():
     try:
         if valkey_client:
@@ -436,28 +490,30 @@ def log_visitor():
         session_duration = int(time.time()) - session_start
         if valkey_client:
             try:
-                visitor_id = hashlib.sha256(f"{ip}{time.time()}".encode()).hexdigest()
-                valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
-                    "timestamp": int(time.time()),
-                    "ip": ip,
-                    "country": location['country'],
-                    "city": location['city'],
-                    "region": location['region'],
-                    "lat": str(location['lat']),
-                    "lon": str(location['lon']),
-                    "isp": location['isp'],
-                    "timezone": location['timezone'],
-                    "device": device,
-                    "application": app,
-                    "user_agent": user_agent,
-                    "bot_status": visit_type,
-                    "block_reason": bot_reason if is_bot_flag else "N/A",
-                    "referer": referer,
-                    "source": 'referral' if referer else 'direct',
-                    "session_duration": session_duration
-                })
-                valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
-                logger.debug(f"Logged visitor: {visitor_id} for user: {username}")
+                fingerprint = generate_fingerprint()
+                visitor_id = hashlib.sha256(f"{ip}{fingerprint}".encode()).hexdigest()
+                if not valkey_client.exists(f"user:{username}:visitor:{visitor_id}"):
+                    valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
+                        "timestamp": int(time.time()),
+                        "ip": ip,
+                        "country": location['country'],
+                        "city": location['city'],
+                        "region": location['region'],
+                        "lat": str(location['lat']),
+                        "lon": str(location['lon']),
+                        "isp": location['isp'],
+                        "timezone": location['timezone'],
+                        "device": device,
+                        "application": app,
+                        "user_agent": user_agent,
+                        "bot_status": visit_type,
+                        "block_reason": bot_reason if is_bot_flag else "N/A",
+                        "referer": referer,
+                        "source": 'referral' if referer else 'direct',
+                        "session_duration": session_duration
+                    })
+                    valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
+                    logger.debug(f"Logged visitor: {visitor_id} for user: {username}")
             except Exception as e:
                 logger.error(f"Valkey error logging visitor: {str(e)}", exc_info=True)
     except Exception as e:
@@ -710,7 +766,7 @@ def dashboard():
                 base64_email = base64email
                 path_segment = f"{randomstring1}{base64_email}{randomstring2}"
                 endpoint = generate_random_string(8)
-                encryption_methods = ['heap_x3', 'slugstorm', 'pow', 'signed_token']
+                encryption_methods = ['heap_x3', 'slugstorm', 'pow', 'signed_token', 'aes_cbc_hmac']
                 method = secrets.choice(encryption_methods)
                 fingerprint = generate_fingerprint()
                 expiry_timestamp = int(time.time()) + expiry
@@ -729,8 +785,10 @@ def dashboard():
                         encrypted_payload = encrypt_slugstorm(payload)
                     elif method == 'pow':
                         encrypted_payload = encrypt_pow(payload)
-                    else:
+                    elif method == 'signed_token':
                         encrypted_payload = encrypt_signed_token(payload)
+                    else:
+                        encrypted_payload = encrypt_aes_cbc_hmac(payload)
                 except Exception as e:
                     logger.error(f"Encryption failed with {method}: {str(e)}", exc_info=True)
                     error = "Failed to encrypt payload"
@@ -825,48 +883,55 @@ def dashboard():
         bot_logs = []
         traffic_sources = {"direct": 0, "referral": 0, "organic": 0}
         bot_ratio = {"human": 0, "bot": 0}
+        visitor_index = 1
         if valkey_client:
             try:
                 logger.debug(f"Fetching visitor keys for user: {username}")
                 visitor_keys = valkey_client.keys(f"user:{username}:visitor:*")
                 logger.debug(f"Found {len(visitor_keys)} visitor keys")
+                visitor_data = []
                 for key in visitor_keys:
                     try:
-                        visitor_data = valkey_client.hgetall(key)
-                        if not visitor_data:
+                        data = valkey_client.hgetall(key)
+                        if not data:
                             logger.warning(f"Empty visitor data for key {key}")
                             continue
-                        source = 'referral' if visitor_data.get('referer') else 'direct'
-                        visitors.append({
-                            "timestamp": datetime.fromtimestamp(int(visitor_data.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor_data.get('timestamp') else 'Unknown',
-                            "ip": visitor_data.get('ip', 'Unknown'),
-                            "country": visitor_data.get('country', 'Unknown'),
-                            "region": visitor_data.get('region', 'Unknown'),
-                            "city": visitor_data.get('city', 'Unknown'),
-                            "lat": float(visitor_data.get('lat', 0.0)),
-                            "lon": float(visitor_data.get('lon', 0.0)),
-                            "isp": visitor_data.get('isp', 'Unknown'),
-                            "timezone": visitor_data.get('timezone', 'Unknown'),
-                            "device": visitor_data.get('device', 'Unknown'),
-                            "application": visitor_data.get('application', 'Unknown'),
-                            "user_agent": visitor_data.get('user_agent', 'Unknown'),
-                            "bot_status": visitor_data.get('bot_status', 'Unknown'),
-                            "block_reason": visitor_data.get('block_reason', 'N/A'),
-                            "source": source,
-                            "session_duration": int(visitor_data.get('session_duration', 0))
-                        })
-                        if visitor_data.get('bot_status') != 'Human':
-                            bot_logs.append({
-                                "timestamp": visitor_data.get('timestamp', 'Unknown'),
-                                "ip": visitor_data.get('ip', 'Unknown'),
-                                "block_reason": visitor_data.get('block_reason', 'Unknown')
-                            })
-                            bot_ratio['bot'] += 1
-                        else:
-                            bot_ratio['human'] += 1
-                        traffic_sources[source] = traffic_sources.get(source, 0) + 1
+                        visitor_data.append((int(data.get('timestamp', 0)), data))
                     except Exception as e:
                         logger.error(f"Error processing visitor key {key}: {str(e)}")
+                visitor_data.sort(key=lambda x: x[0], reverse=True)
+                for _, visitor_data in visitor_data:
+                    source = 'referral' if visitor_data.get('referer') else 'direct'
+                    visitors.append({
+                        "index": visitor_index,
+                        "timestamp": datetime.fromtimestamp(int(visitor_data.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor_data.get('timestamp') else 'Unknown',
+                        "ip": visitor_data.get('ip', 'Unknown'),
+                        "country": visitor_data.get('country', 'Unknown'),
+                        "region": visitor_data.get('region', 'Unknown'),
+                        "city": visitor_data.get('city', 'Unknown'),
+                        "lat": float(visitor_data.get('lat', 0.0)),
+                        "lon": float(visitor_data.get('lon', 0.0)),
+                        "isp": visitor_data.get('isp', 'Unknown'),
+                        "timezone": visitor_data.get('timezone', 'Unknown'),
+                        "device": visitor_data.get('device', 'Unknown'),
+                        "application": visitor_data.get('application', 'Unknown'),
+                        "user_agent": visitor_data.get('user_agent', 'Unknown'),
+                        "bot_status": visitor_data.get('bot_status', 'Unknown'),
+                        "block_reason": visitor_data.get('block_reason', 'N/A'),
+                        "source": source,
+                        "session_duration": int(visitor_data.get('session_duration', 0))
+                    })
+                    visitor_index += 1
+                    if visitor_data.get('bot_status') != 'Human':
+                        bot_logs.append({
+                            "timestamp": visitor_data.get('timestamp', 'Unknown'),
+                            "ip": visitor_data.get('ip', 'Unknown'),
+                            "block_reason": visitor_data.get('block_reason', 'Unknown')
+                        })
+                        bot_ratio['bot'] += 1
+                    else:
+                        bot_ratio['human'] += 1
+                    traffic_sources[source] = traffic_sources.get(source, 0) + 1
             except Exception as e:
                 logger.error(f"Valkey error fetching visitors: {str(e)}")
                 valkey_error = "Unable to fetch visitor data due to database error"
@@ -1142,6 +1207,7 @@ def dashboard():
                                     <table>
                                         <thead>
                                             <tr class="bg-gray-200">
+                                                <th>#</th>
                                                 <th>Timestamp</th>
                                                 <th>IP</th>
                                                 <th>Country</th>
@@ -1163,6 +1229,7 @@ def dashboard():
                                         <tbody>
                                             {% for visitor in visitors %}
                                                 <tr class="{% if visitor.bot_status != 'Human' %}bot{% endif %}">
+                                                    <td>{{ visitor.index }}</td>
                                                     <td>{{ visitor.timestamp }}</td>
                                                     <td>{{ visitor.ip }}</td>
                                                     <td>{{ visitor.country }}</td>
@@ -1390,7 +1457,7 @@ def delete_url(url_id):
         else:
             logger.warning("Valkey unavailable for delete_url")
             return render_template_string("""
-                <!DOCTYPE html>
+<!DOCTYPE html>
                 <html lang="en">
                 <head>
                     <meta charset="UTF-8">
@@ -1444,9 +1511,11 @@ def export_visitors():
                         logger.error(f"Error processing visitor key {key}: {str(e)}")
                 output = StringIO()
                 writer = csv.writer(output)
-                writer.writerow(['Timestamp', 'IP', 'Country', 'Region', 'City', 'Lat', 'Lon', 'ISP', 'Timezone', 'Device', 'Application', 'User Agent', 'Bot Status', 'Block Reason', 'Source', 'Session Duration (s)'])
-                for visitor in visitor_data:
+                writer.writerow(['Index', 'Timestamp', 'IP', 'Country', 'Region', 'City', 'Lat', 'Lon', 'ISP', 'Timezone', 'Device', 'Application', 'User Agent', 'Bot Status', 'Block Reason', 'Source', 'Session Duration (s)'])
+                visitor_data.sort(key=lambda x: int(x.get('timestamp', 0)), reverse=True)
+                for index, visitor in enumerate(visitor_data, 1):
                     writer.writerow([
+                        index,
                         datetime.fromtimestamp(int(visitor.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor.get('timestamp') else 'Unknown',
                         visitor.get('ip', 'Unknown'),
                         visitor.get('country', 'Unknown'),
@@ -1474,7 +1543,7 @@ def export_visitors():
             except Exception as e:
                 logger.error(f"Valkey error in export_visitors: {str(e)}")
                 return render_template_string("""
-                   <!DOCTYPE html>
+                    <!DOCTYPE html>
                     <html lang="en">
                     <head>
                         <meta charset="UTF-8">
@@ -1516,7 +1585,7 @@ def export_visitors():
             <html lang="en">
             <head>
                 <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <meta name="viewport" content="width=device-width,Lockdown Browser
                 <title>Internal Server Error</title>
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
@@ -1704,26 +1773,29 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             try:
                 analytics_enabled = valkey_client.hget(f"user:{username}:url:{url_id}", "analytics_enabled") == "1"
                 if analytics_enabled:
-                    valkey_client.hset(f"user:{username}:visitor:{hashlib.sha256(f'{ip}{time.time()}'.encode()).hexdigest()}", mapping={
-                        "timestamp": int(time.time()),
-                        "ip": ip,
-                        "country": location['country'],
-                        "city": location['city'],
-                        "region": location['region'],
-                        "lat": str(location['lat']),
-                        "lon": str(location['lon']),
-                        "isp": location['isp'],
-                        "timezone": location['timezone'],
-                        "device": device,
-                        "application": app,
-                        "user_agent": user_agent,
-                        "bot_status": visit_type,
-                        "block_reason": bot_reason if is_bot_flag or asn_blocked else "N/A",
-                        "referer": referer,
-                        "source": 'referral' if referer else 'direct',
-                        "session_duration": session_duration
-                    })
-                    valkey_client.expire(f"user:{username}:visitor:{hashlib.sha256(f'{ip}{time.time()}'.encode()).hexdigest()}", DATA_RETENTION_DAYS * 86400)
+                    fingerprint = generate_fingerprint()
+                    visitor_id = hashlib.sha256(f"{ip}{fingerprint}".encode()).hexdigest()
+                    if not valkey_client.exists(f"user:{username}:visitor:{visitor_id}"):
+                        valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
+                            "timestamp": int(time.time()),
+                            "ip": ip,
+                            "country": location['country'],
+                            "city": location['city'],
+                            "region": location['region'],
+                            "lat": str(location['lat']),
+                            "lon": str(location['lon']),
+                            "isp": location['isp'],
+                            "timezone": location['timezone'],
+                            "device": device,
+                            "application": app,
+                            "user_agent": user_agent,
+                            "bot_status": visit_type,
+                            "block_reason": bot_reason if is_bot_flag or asn_blocked else "N/A",
+                            "referer": referer,
+                            "source": 'referral' if referer else 'direct',
+                            "session_duration": session_duration
+                        })
+                        valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
                     valkey_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
                     valkey_client.lpush(f"user:{username}:url:{url_id}:visits", json.dumps({
                         "timestamp": int(time.time()),
@@ -1751,7 +1823,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             abort(400, "Invalid payload format")
 
         payload = None
-        for method in ['heap_x3', 'slugstorm', 'pow', 'signed_token']:
+        for method in ['heap_x3', 'slugstorm', 'pow', 'signed_token', 'aes_cbc_hmac']:
             try:
                 logger.debug(f"Trying decryption method: {method}")
                 if method == 'heap_x3':
@@ -1765,8 +1837,10 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                     payload = data['payload']
                 elif method == 'pow':
                     payload = decrypt_pow(encrypted_payload)
-                else:
+                elif method == 'signed_token':
                     payload = decrypt_signed_token(encrypted_payload)
+                else:
+                    payload = decrypt_aes_cbc_hmac(encrypted_payload)
                 logger.debug(f"Decryption successful with {method}")
                 break
             except Exception as e:

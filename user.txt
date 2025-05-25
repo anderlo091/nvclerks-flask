@@ -1,4 +1,7 @@
-beam
+beam1
+king
+dream
+scar
 unseen
 sang
 man

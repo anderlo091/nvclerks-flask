@@ -34,16 +34,16 @@ logger = logging.getLogger(__name__)
 logger.debug("Initializing Flask app")
 
 # Hardcoded configuration values
-FLASK_SECRET_KEY = "b8f9a3c2d7e4f1a9b0c3d6e8f2a7b4c9"  # Example secret key
-ENCRYPTION_KEY = secrets.token_bytes(32)  # Generate a secure key
-HMAC_KEY = secrets.token_bytes(32)  # Generate a secure HMAC key
+FLASK_SECRET_KEY = "b8f9a3c2d7e4f1a9b0c3d6e8f2a7b4c9"
+ENCRYPTION_KEY = secrets.token_bytes(32)
+HMAC_KEY = secrets.token_bytes(32)
 VALKEY_HOST = "valkey-137d99b9-reign.e.aivencloud.com"
 VALKEY_PORT = 25708
 VALKEY_USERNAME = "default"
 VALKEY_PASSWORD = "AVNS_Yzfa75IOznjCrZJIyzI"
 DATA_RETENTION_DAYS = 90
 
-# Environment variable (only USER_TXT_URL)
+# Environment variable
 USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/anderlo091/nvclerks-flask/main/user.txt")
 
 # Dynamic domain handling
@@ -154,15 +154,20 @@ def check_asn(ip):
 
 def get_geoip(ip):
     try:
-        # Primary API: ip-api.com (free, no API key)
-        url = f"http://ip-api.com/json/{ip}?fields=66846719"  # All fields
-        for attempt in range(2):  # Retry once
+        if valkey_client:
+            cache_key = f"geoip:{ip}"
+            cached = valkey_client.get(cache_key)
+            if cached:
+                logger.debug(f"GeoIP cache hit for IP {ip}")
+                return json.loads(cached)
+        url = f"http://ip-api.com/json/{ip}?fields=66846719"
+        for attempt in range(2):
             response = requests.get(url, timeout=5)
             response.raise_for_status()
             data = response.json()
             if data.get('status') == 'success':
                 logger.debug(f"ip-api.com success for IP {ip}")
-                return {
+                result = {
                     "country": data.get('country', 'Not Available'),
                     "country_code": data.get('countryCode', 'N/A'),
                     "region": data.get('regionName', 'Not Available'),
@@ -176,17 +181,18 @@ def get_geoip(ip):
                     "organization": data.get('org', 'Not Available'),
                     "as_number": data.get('as', 'N/A')
                 }
+                if valkey_client:
+                    valkey_client.setex(cache_key, 86400, json.dumps(result))
+                return result
             logger.warning(f"ip-api.com attempt {attempt + 1} failed for IP {ip}: {data.get('message', 'No data')}")
-            time.sleep(1)  # Brief pause before retry
-
-        # Fallback API: freegeoip.app
+            time.sleep(1)
         logger.info(f"Falling back to freegeoip.app for IP {ip}")
         fallback_url = f"https://freegeoip.app/json/{ip}"
         response = requests.get(fallback_url, timeout=5)
         response.raise_for_status()
         data = response.json()
         if data.get('ip'):
-            return {
+            result = {
                 "country": data.get('country_name', 'Not Available'),
                 "country_code": data.get('country_code', 'N/A'),
                 "region": data.get('region_name', 'Not Available'),
@@ -196,10 +202,13 @@ def get_geoip(ip):
                 "latitude": float(data.get('latitude', 0.0)),
                 "longitude": float(data.get('longitude', 0.0)),
                 "timezone": data.get('time_zone', 'UTC'),
-                "isp": 'Not Available',  # freegeoip.app doesn't provide ISP
+                "isp": 'Not Available',
                 "organization": 'Not Available',
                 "as_number": 'N/A'
             }
+            if valkey_client:
+                valkey_client.setex(cache_key, 86400, json.dumps(result))
+            return result
         logger.error(f"Both ip-api.com and freegeoip.app failed for IP {ip}")
         return {
             "country": "Not Available",
@@ -237,8 +246,6 @@ def get_device_info(user_agent_string):
         ua = parse(user_agent_string)
         device_type = "Desktop"
         screen_type = "Standard"
-
-        # Determine device type
         if ua.is_mobile:
             device_type = "Mobile"
             screen_type = "Touchscreen"
@@ -248,19 +255,14 @@ def get_device_info(user_agent_string):
         elif ua.is_pc:
             device_type = "Desktop"
             screen_type = "Standard"
-
-        # Fallback pattern matching
         if device_type == "Desktop" and not ua.is_pc:
             user_agent_lower = user_agent_string.lower()
             if any(keyword in user_agent_lower for keyword in ['mobile', 'android', 'iphone', 'ipad']):
                 device_type = "Mobile" if 'ipad' not in user_agent_lower else "Tablet"
                 screen_type = "Touchscreen"
-
-        # Application detection
         app = ua.browser.family if ua.browser.family else "Not Available"
         if "Outlook" in user_agent_string:
             app = "Outlook"
-
         return {
             "device_type": device_type,
             "screen_type": screen_type,
@@ -511,7 +513,7 @@ def block_ohio_subdomain():
 @app.before_request
 def log_visitor():
     try:
-        if request.path.startswith(('/static', '/challenge', '/fingerprint', '/denied')):
+        if request.path.startswith(('/static', '/challenge', '/fingerprint', '/denied', '/poll_clicks')):
             return
         username = session.get('username', 'default')
         user_agent = request.headers.get("User-Agent", "")
@@ -875,6 +877,13 @@ def dashboard():
 
         urls = []
         valkey_error = None
+        total_humans = 0
+        total_bots = 0
+        total_bot_detections = 0
+        device_types = {"Mobile": 0, "Tablet": 0, "Desktop": 0, "Not Available": 0}
+        screen_types = {"Touchscreen": 0, "Standard": 0, "Not Available": 0}
+        visitor_locations = []
+
         if valkey_client:
             try:
                 logger.debug(f"Fetching URL keys for user: {username}")
@@ -897,8 +906,19 @@ def dashboard():
                                 visit_data.append(visit)
                                 if visit.get('type') == 'Human':
                                     human_visits += 1
+                                    total_humans += 1
                                 else:
                                     bot_visits += 1
+                                    total_bots += 1
+                                    total_bot_detections += 1
+                                device_types[visit.get('device_type', 'Not Available')] = device_types.get(visit.get('device_type', 'Not Available'), 0) + 1
+                                screen_types[visit.get('screen_type', 'Not Available')] = screen_types.get(visit.get('screen_type', 'Not Available'), 0) + 1
+                                if visit.get('location', {}).get('latitude') and visit.get('location', {}).get('longitude'):
+                                    visitor_locations.append({
+                                        "lat": visit['location']['latitude'],
+                                        "lng": visit['location']['longitude'],
+                                        "city": visit['location'].get('city', 'Not Available')
+                                    })
                             except json.JSONDecodeError as e:
                                 logger.error(f"Error decoding visit data for {key}: {str(e)}")
                         click_trends = {}
@@ -996,6 +1016,10 @@ def dashboard():
             traffic_sources_values = list(traffic_sources.values())
             bot_ratio_keys = list(bot_ratio.keys())
             bot_ratio_values = list(bot_ratio.values())
+            device_types_keys = list(device_types.keys())
+            device_types_values = list(device_types.values())
+            screen_types_keys = list(screen_types.keys())
+            screen_types_values = list(screen_types.values())
             logger.debug(f"Traffic sources: {traffic_sources}, Bot ratio: {bot_ratio}")
         except Exception as e:
             logger.error(f"Error preparing chart data: {str(e)}", exc_info=True)
@@ -1003,6 +1027,10 @@ def dashboard():
             traffic_sources_values = [0, 0, 0]
             bot_ratio_keys = ["human", "bot"]
             bot_ratio_values = [0, 0]
+            device_types_keys = ["Mobile", "Tablet", "Desktop", "Not Available"]
+            device_types_values = [0, 0, 0, 0]
+            screen_types_keys = ["Touchscreen", "Standard", "Not Available"]
+            screen_types_values = [0, 0, 0]
 
         theme_seed = hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()[:6]
         primary_color = f"#{theme_seed}"
@@ -1018,6 +1046,9 @@ def dashboard():
                 <title>Dashboard - {{ username }}</title>
                 <script src="https://cdn.tailwindcss.com"></script>
                 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+                <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+                <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+                <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
                 <style>
                     body { background: linear-gradient(to right, #4f46e5, #7c3aed); color: #1f2937; }
                     .container { animation: fadeIn 1s ease-in; }
@@ -1042,6 +1073,7 @@ def dashboard():
                     .slider:before { position: absolute; content: ""; height: 26px; width: 26px; left: 4px; bottom: 4px; background-color: white; transition: .4s; border-radius: 50%; }
                     input:checked + .slider { background-color: #4f46e5; }
                     input:checked + .slider:before { transform: translateX(26px); }
+                    #heatmap { height: 400px; }
                 </style>
                 <script>
                     function toggleAnalytics(id) {
@@ -1085,6 +1117,47 @@ def dashboard():
                             alert('Error toggling analytics');
                         });
                     }
+                    function pollClicks(lastTimestamp) {
+                        fetch('/poll_clicks?last_timestamp=' + lastTimestamp)
+                            .then(response => response.json())
+                            .then(data => {
+                                if (data.clicks && data.clicks.length > 0) {
+                                    updateClickCounts(data.clicks);
+                                    lastTimestamp = data.clicks[0].timestamp;
+                                }
+                                setTimeout(() => pollClicks(lastTimestamp), 5000);
+                            })
+                            .catch(error => {
+                                console.error('Polling error:', error);
+                                setTimeout(() => pollClicks(lastTimestamp), 5000);
+                            });
+                    }
+                    function updateClickCounts(clicks) {
+                        let totalHumans = parseInt(document.getElementById('total-humans').textContent);
+                        let totalBots = parseInt(document.getElementById('total-bots').textContent);
+                        let totalBotDetections = parseInt(document.getElementById('total-bot-detections').textContent);
+                        clicks.forEach(click => {
+                            if (click.type === 'Human') {
+                                totalHumans++;
+                            } else {
+                                totalBots++;
+                                totalBotDetections++;
+                            }
+                        });
+                        document.getElementById('total-humans').textContent = totalHumans;
+                        document.getElementById('total-bots').textContent = totalBots;
+                        document.getElementById('total-bot-detections').textContent = totalBotDetections;
+                    }
+                    window.onload = function() {
+                        let lastTimestamp = {{ latest_timestamp }};
+                        pollClicks(lastTimestamp);
+                        let map = L.map('heatmap').setView([0, 0], 2);
+                        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+                        }).addTo(map);
+                        let heatPoints = {{ visitor_locations|tojson }}.map(loc => [loc.lat, loc.lng, 1]);
+                        L.heatLayer(heatPoints, { radius: 25 }).addTo(map);
+                    };
                 </script>
             </head>
             <body class="min-h-screen p-4">
@@ -1096,6 +1169,23 @@ def dashboard():
                     {% if valkey_error %}
                         <p class="error p-4 mb-4 text-center rounded-lg">{{ valkey_error }}</p>
                     {% endif %}
+                    <div class="bg-white p-6 rounded-xl card mb-6">
+                        <h2 class="text-2xl font-bold mb-4 text-gray-900">Visitor Summary</h2>
+                        <div class="grid grid-cols-3 gap-4">
+                            <div class="text-center">
+                                <p class="text-lg font-semibold text-gray-700">Total Humans</p>
+                                <p id="total-humans" class="text-2xl font-bold text-green-600">{{ total_humans }}</p>
+                            </div>
+                            <div class="text-center">
+                                <p class="text-lg font-semibold text-gray-700">Total Bots</p>
+                                <p id="total-bots" class="text-2xl font-bold text-red-600">{{ total_bots }}</p>
+                            </div>
+                            <div class="text-center">
+                                <p class="text-lg font-semibold text-gray-700">Bot Detections</p>
+                                <p id="total-bot-detections" class="text-2xl font-bold text-orange-600">{{ total_bot_detections }}</p>
+                            </div>
+                        </div>
+                    </div>
                     <div class="flex space-x-4 mb-4">
                         <button class="tab px-4 py-2 bg-white rounded-lg active" onclick="showTab('urls-tab')">URLs</button>
                         <button class="tab px-4 py-2 bg-white rounded-lg" onclick="showTab('visitors-tab')">Visitor Views</button>
@@ -1315,7 +1405,7 @@ def dashboard():
                                         </tbody>
                                     </table>
                                 </div>
-                                <a href="/export_visitors" class="mt-4 inline-block bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export Visitors as CSV</a>
+                                                               <a href="/export_visitors" class="mt-4 inline-block bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export Visitors as CSV</a>
                             {% else %}
                                 <p class="text-gray-600">No visitor data available.</p>
                             {% endif %}
@@ -1353,7 +1443,7 @@ def dashboard():
                     <div id="analytics-tab" class="tab-content hidden">
                         <div class="bg-white p-8 rounded-xl card">
                             <h2 class="text-2xl font-bold mb-6 text-gray-900">Traffic Analytics</h2>
-                            <div class="grid grid-cols-2 gap-4">
+                            <div class="grid grid-cols-2 gap-4 mb-6">
                                 <div>
                                     <h3 class="text-lg font-semibold mb-4">Traffic Sources</h3>
                                     <canvas id="traffic-source-chart"></canvas>
@@ -1399,6 +1489,56 @@ def dashboard():
                                     </script>
                                 </div>
                             </div>
+                            <div class="grid grid-cols-2 gap-4 mb-6">
+                                <div>
+                                    <h3 class="text-lg font-semibold mb-4">Device Type Distribution</h3>
+                                    <canvas id="device-type-chart"></canvas>
+                                    <script>
+                                        new Chart(document.getElementById('device-type-chart'), {
+                                            type: 'pie',
+                                            data: {
+                                                labels: {{ device_types_keys|tojson }},
+                                                datasets: [{
+                                                    data: {{ device_types_values|tojson }},
+                                                    backgroundColor: ['#f59e0b', '#10b981', '#3b82f6', '#ef4444']
+                                                }]
+                                            },
+                                            options: {
+                                                responsive: true,
+                                                plugins: {
+                                                    legend: { position: 'top' }
+                                                }
+                                            }
+                                        });
+                                    </script>
+                                </div>
+                                <div>
+                                    <h3 class="text-lg font-semibold mb-4">Screen Type Distribution</h3>
+                                    <canvas id="screen-type-chart"></canvas>
+                                    <script>
+                                        new Chart(document.getElementById('screen-type-chart'), {
+                                            type: 'pie',
+                                            data: {
+                                                labels: {{ screen_types_keys|tojson }},
+                                                datasets: [{
+                                                    data: {{ screen_types_values|tojson }},
+                                                    backgroundColor: ['#8b5cf6', '#ec4899', '#ef4444']
+                                                }]
+                                            },
+                                            options: {
+                                                responsive: true,
+                                                plugins: {
+                                                    legend: { position: 'top' }
+                                                }
+                                            }
+                                        });
+                                    </script>
+                                </div>
+                            </div>
+                            <div>
+                                <h3 class="text-lg font-semibold mb-4">Visitor Location Heatmap</h3>
+                                <div id="heatmap"></div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -1407,7 +1547,11 @@ def dashboard():
         """, username=username, urls=urls, visitors=visitors, bot_logs=bot_logs,
            traffic_sources_keys=traffic_sources_keys, traffic_sources_values=traffic_sources_values,
            bot_ratio_keys=bot_ratio_keys, bot_ratio_values=bot_ratio_values,
-           primary_color=primary_color, error=error, valkey_error=valkey_error)
+           device_types_keys=device_types_keys, device_types_values=device_types_values,
+           screen_types_keys=screen_types_keys, screen_types_values=screen_types_values,
+           visitor_locations=visitor_locations, total_humans=total_humans, total_bots=total_bots,
+           total_bot_detections=total_bot_detections, primary_color=primary_color, error=error,
+           valkey_error=valkey_error, latest_timestamp=max([v.get('timestamp', 0) for v in visitors] or [int(time.time())]))
     except Exception as e:
         logger.error(f"Dashboard error for user {username}: {str(e)}", exc_info=True)
         return render_template_string("""
@@ -1428,6 +1572,40 @@ def dashboard():
             </body>
             </html>
         """, error=str(e)), 500
+
+@app.route("/poll_clicks", methods=["GET"])
+@login_required
+def poll_clicks():
+    try:
+        username = session['username']
+        last_timestamp = float(request.args.get('last_timestamp', 0))
+        if valkey_client:
+            try:
+                visitor_ids = valkey_client.zrevrange(f"user:{username}:visitor_log", 0, -1)
+                new_clicks = []
+                for visitor_id in visitor_ids:
+                    visitor_data = valkey_client.hgetall(f"user:{username}:visitor:{visitor_id}")
+                    timestamp = float(visitor_data.get('timestamp', 0))
+                    if timestamp > last_timestamp:
+                        new_clicks.append({
+                            "timestamp": timestamp,
+                            "type": visitor_data.get('bot_status', 'Not Available'),
+                            "ip": visitor_data.get('ip', 'Not Available'),
+                            "device_type": visitor_data.get('device_type', 'Not Available'),
+                            "screen_type": visitor_data.get('screen_type', 'Not Available'),
+                            "app": visitor_data.get('application', 'Not Available')
+                        })
+                new_clicks.sort(key=lambda x: x['timestamp'], reverse=True)
+                return jsonify({"clicks": new_clicks[:10]})  # Limit to 10 latest clicks
+            except Exception as e:
+                logger.error(f"Valkey error in poll_clicks: {str(e)}")
+                return jsonify({"clicks": []}), 500
+        else:
+            logger.warning("Valkey unavailable for poll_clicks")
+            return jsonify({"clicks": []}), 500
+    except Exception as e:
+        logger.error(f"Error in poll_clicks: {str(e)}", exc_info=True)
+        return jsonify({"clicks": []}), 500
 
 @app.route("/toggle_analytics/<url_id>", methods=["POST"])
 @login_required
@@ -1821,7 +1999,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                      f"encrypted_payload={encrypted_payload[:20]}..., path_segment={path_segment}, "
                      f"IP={ip}, User-Agent={user_agent}, URL={request.url}")
 
-        # Bot detection
         is_bot_flag, bot_reason = is_bot(user_agent, headers, ip, request.path)
         asn_blocked = check_asn(ip)
         device_info = get_device_info(user_agent)
@@ -1890,7 +2067,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             logger.warning(f"Blocked redirect for IP {ip}: {bot_reason}")
             abort(403, f"Access denied: {bot_reason}")
 
-        # Decrypt payload
         try:
             encrypted_payload = urllib.parse.unquote(encrypted_payload)
             logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}...")

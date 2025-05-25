@@ -589,6 +589,12 @@ def login():
                 session['username'] = username
                 session.permanent = True
                 session.modified = True
+                if valkey_client:
+                    try:
+                        valkey_client.set(f"user:{username}:last_login", int(time.time()))
+                        logger.debug(f"Stored last login for {username}")
+                    except Exception as e:
+                        logger.error(f"Valkey error storing last login: {str(e)}")
                 logger.debug(f"User {username} logged in, session: {session}")
                 next_url = request.form.get('next') or url_for('dashboard')
                 logger.debug(f"Redirecting to {next_url}")
@@ -883,9 +889,13 @@ def dashboard():
         device_types = {"Mobile": 0, "Tablet": 0, "Desktop": 0, "Not Available": 0}
         screen_types = {"Touchscreen": 0, "Standard": 0, "Not Available": 0}
         visitor_locations = []
+        last_login = "Never"
 
         if valkey_client:
             try:
+                last_login_ts = valkey_client.get(f"user:{username}:last_login")
+                if last_login_ts:
+                    last_login = datetime.fromtimestamp(int(last_login_ts)).strftime('%Y-%m-%d %H:%M:%S')
                 logger.debug(f"Fetching URL keys for user: {username}")
                 url_keys = valkey_client.keys(f"user:{username}:url:*")
                 logger.debug(f"Found {len(url_keys)} URL keys")
@@ -956,6 +966,7 @@ def dashboard():
         bot_logs = []
         traffic_sources = {"direct": 0, "referral": 0, "organic": 0}
         bot_ratio = {"human": 0, "bot": 0}
+        total_visits = 0
         if valkey_client:
             try:
                 logger.debug(f"Fetching visitor keys for user: {username}")
@@ -967,8 +978,9 @@ def dashboard():
                         if not visitor_data:
                             logger.warning(f"Empty visitor data for ID {visitor_id}")
                             continue
+                        total_visits += 1
                         source = 'referral' if visitor_data.get('referer') else 'direct'
-                        visitors.append({
+                        visitor_entry = {
                             "timestamp": datetime.fromtimestamp(int(visitor_data.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor_data.get('timestamp') else 'Not Available',
                             "ip": visitor_data.get('ip', 'Not Available'),
                             "country": visitor_data.get('country', 'Not Available'),
@@ -991,7 +1003,8 @@ def dashboard():
                             "block_reason": visitor_data.get('block_reason', 'N/A'),
                             "source": source,
                             "session_duration": int(visitor_data.get('session_duration', 0))
-                        })
+                        }
+                        visitors.append(visitor_entry)
                         if visitor_data.get('bot_status') != 'Human':
                             bot_logs.append({
                                 "timestamp": visitor_data.get('timestamp', 'Not Available'),
@@ -1136,7 +1149,9 @@ def dashboard():
                         let totalHumans = parseInt(document.getElementById('total-humans').textContent);
                         let totalBots = parseInt(document.getElementById('total-bots').textContent);
                         let totalBotDetections = parseInt(document.getElementById('total-bot-detections').textContent);
+                        let totalVisits = parseInt(document.getElementById('total-visits').textContent);
                         clicks.forEach(click => {
+                            totalVisits++;
                             if (click.type === 'Human') {
                                 totalHumans++;
                             } else {
@@ -1147,13 +1162,14 @@ def dashboard():
                         document.getElementById('total-humans').textContent = totalHumans;
                         document.getElementById('total-bots').textContent = totalBots;
                         document.getElementById('total-bot-detections').textContent = totalBotDetections;
+                        document.getElementById('total-visits').textContent = totalVisits;
                     }
                     window.onload = function() {
                         let lastTimestamp = {{ latest_timestamp }};
                         pollClicks(lastTimestamp);
                         let map = L.map('heatmap').setView([0, 0], 2);
                         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+                            attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
                         }).addTo(map);
                         let heatPoints = {{ visitor_locations|tojson }}.map(loc => [loc.lat, loc.lng, 1]);
                         L.heatLayer(heatPoints, { radius: 25 }).addTo(map);
@@ -1162,7 +1178,8 @@ def dashboard():
             </head>
             <body class="min-h-screen p-4">
                 <div class="container max-w-7xl mx-auto">
-                    <h1 class="text-4xl font-extrabold mb-8 text-center text-white">Welcome, {{ username }}</h1>
+                    <h1 class="text-4xl font-extrabold mb-4 text-center text-white">Welcome, {{ username }}</h1>
+                    <p class="text-lg text-center text-white mb-8">Last Login: {{ last_login }}</p>
                     {% if error %}
                         <p class="error p-4 mb-4 text-center rounded-lg">{{ error }}</p>
                     {% endif %}
@@ -1171,7 +1188,11 @@ def dashboard():
                     {% endif %}
                     <div class="bg-white p-6 rounded-xl card mb-6">
                         <h2 class="text-2xl font-bold mb-4 text-gray-900">Visitor Summary</h2>
-                        <div class="grid grid-cols-3 gap-4">
+                        <div class="grid grid-cols-4 gap-4">
+                            <div class="text-center">
+                                <p class="text-lg font-semibold text-gray-700">Total Visits</p>
+                                <p id="total-visits" class="text-2xl font-bold text-blue-600">{{ total_visits }}</p>
+                            </div>
                             <div class="text-center">
                                 <p class="text-lg font-semibold text-gray-700">Total Humans</p>
                                 <p id="total-humans" class="text-2xl font-bold text-green-600">{{ total_humans }}</p>
@@ -1346,7 +1367,7 @@ def dashboard():
                                 <h2 class="text-2xl font-bold text-gray-900">Visitor Views</h2>
                                 <button onclick="refreshDashboard()" class="refresh-btn bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700">Refresh</button>
                             </div>
-                            {% if visitors %}
+                                                        {% if visitors %}
                                 <div class="table-container">
                                     <table>
                                         <thead>
@@ -1405,7 +1426,7 @@ def dashboard():
                                         </tbody>
                                     </table>
                                 </div>
-                                                               <a href="/export_visitors" class="mt-4 inline-block bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export Visitors as CSV</a>
+                                <a href="/export_visitors" class="mt-4 inline-block bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export Visitors as CSV</a>
                             {% else %}
                                 <p class="text-gray-600">No visitor data available.</p>
                             {% endif %}
@@ -1550,8 +1571,9 @@ def dashboard():
            device_types_keys=device_types_keys, device_types_values=device_types_values,
            screen_types_keys=screen_types_keys, screen_types_values=screen_types_values,
            visitor_locations=visitor_locations, total_humans=total_humans, total_bots=total_bots,
-           total_bot_detections=total_bot_detections, primary_color=primary_color, error=error,
-           valkey_error=valkey_error, latest_timestamp=max([v.get('timestamp', 0) for v in visitors] or [int(time.time())]))
+           total_bot_detections=total_bot_detections, total_visits=total_visits, last_login=last_login,
+           primary_color=primary_color, error=error, valkey_error=valkey_error,
+           latest_timestamp=max([v.get('timestamp', 0) for v in visitors] or [int(time.time())]))
     except Exception as e:
         logger.error(f"Dashboard error for user {username}: {str(e)}", exc_info=True)
         return render_template_string("""

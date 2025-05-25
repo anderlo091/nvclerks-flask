@@ -33,17 +33,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.debug("Initializing Flask app")
 
-# Environment variables
-FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
-ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", secrets.token_bytes(32))
-HMAC_KEY = os.getenv("HMAC_KEY", secrets.token_bytes(32))
-VALKEY_HOST = os.getenv("VALKEY_HOST", "valkey-137d99b9-reign.e.aivencloud.com")
-VALKEY_PORT = int(os.getenv("VALKEY_PORT", 25708))
-VALKEY_USERNAME = os.getenv("VALKEY_USERNAME", "default")
-VALKEY_PASSWORD = os.getenv("VALKEY_PASSWORD", "AVNS_Yzfa75IOznjCrZJIyzI")
+# Hardcoded configuration values
+FLASK_SECRET_KEY = "b8f9a3c2d7e4f1a9b0c3d6e8f2a7b4c9"  # Example secret key
+ENCRYPTION_KEY = secrets.token_bytes(32)  # Generate a secure key
+HMAC_KEY = secrets.token_bytes(32)  # Generate a secure HMAC key
+VALKEY_HOST = "valkey-137d99b9-reign.e.aivencloud.com"
+VALKEY_PORT = 25708
+VALKEY_USERNAME = "default"
+VALKEY_PASSWORD = "AVNS_Yzfa75IOznjCrZJIyzI"
+DATA_RETENTION_DAYS = 90
+
+# Environment variable (only USER_TXT_URL)
 USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/anderlo091/nvclerks-flask/main/user.txt")
-DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", 90))
-IPAPI_KEY = os.getenv("IPAPI_KEY", "your_ipapi_key_here")  # Add your ipapi.co API key in .env
 
 # Dynamic domain handling
 def get_base_domain():
@@ -92,7 +93,7 @@ def datetime_filter(timestamp):
         return datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
     except (TypeError, ValueError) as e:
         logger.error(f"Error formatting timestamp: {str(e)}")
-        return "Unknown"
+        return "Not Available"
 
 app.jinja_env.filters['datetime'] = datetime_filter
 
@@ -153,55 +154,124 @@ def check_asn(ip):
 
 def get_geoip(ip):
     try:
-        url = f"https://ipapi.co/{ip}/json/?key={IPAPI_KEY}"
-        response = requests.get(url)
+        # Primary API: ip-api.com (free, no API key)
+        url = f"http://ip-api.com/json/{ip}?fields=66846719"  # All fields
+        for attempt in range(2):  # Retry once
+            response = requests.get(url, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            if data.get('status') == 'success':
+                logger.debug(f"ip-api.com success for IP {ip}")
+                return {
+                    "country": data.get('country', 'Not Available'),
+                    "country_code": data.get('countryCode', 'N/A'),
+                    "region": data.get('regionName', 'Not Available'),
+                    "region_code": data.get('region', 'N/A'),
+                    "city": data.get('city', 'Not Available'),
+                    "zip": data.get('zip', 'N/A'),
+                    "latitude": float(data.get('lat', 0.0)),
+                    "longitude": float(data.get('lon', 0.0)),
+                    "timezone": data.get('timezone', 'UTC'),
+                    "isp": data.get('isp', 'Not Available'),
+                    "organization": data.get('org', 'Not Available'),
+                    "as_number": data.get('as', 'N/A')
+                }
+            logger.warning(f"ip-api.com attempt {attempt + 1} failed for IP {ip}: {data.get('message', 'No data')}")
+            time.sleep(1)  # Brief pause before retry
+
+        # Fallback API: freegeoip.app
+        logger.info(f"Falling back to freegeoip.app for IP {ip}")
+        fallback_url = f"https://freegeoip.app/json/{ip}"
+        response = requests.get(fallback_url, timeout=5)
         response.raise_for_status()
         data = response.json()
-        if 'error' in data:
-            logger.error(f"ipapi.co error for IP {ip}: {data.get('error', 'Unknown error')}")
+        if data.get('ip'):
             return {
-                "country": "Unknown",
-                "country_code": "Unknown",
-                "region": "Unknown",
-                "region_code": "Unknown",
-                "city": "Unknown",
-                "zip": "Unknown",
-                "latitude": 0.0,
-                "longitude": 0.0,
-                "timezone": "Unknown",
-                "isp": "Unknown",
-                "organization": "Unknown",
-                "as_number": "Unknown"
+                "country": data.get('country_name', 'Not Available'),
+                "country_code": data.get('country_code', 'N/A'),
+                "region": data.get('region_name', 'Not Available'),
+                "region_code": data.get('region_code', 'N/A'),
+                "city": data.get('city', 'Not Available'),
+                "zip": data.get('zip_code', 'N/A'),
+                "latitude": float(data.get('latitude', 0.0)),
+                "longitude": float(data.get('longitude', 0.0)),
+                "timezone": data.get('time_zone', 'UTC'),
+                "isp": 'Not Available',  # freegeoip.app doesn't provide ISP
+                "organization": 'Not Available',
+                "as_number": 'N/A'
             }
+        logger.error(f"Both ip-api.com and freegeoip.app failed for IP {ip}")
         return {
-            "country": data.get('country_name', 'Unknown'),
-            "country_code": data.get('country_code', 'Unknown'),
-            "region": data.get('region', 'Unknown'),
-            "region_code": data.get('region_code', 'Unknown'),
-            "city": data.get('city', 'Unknown'),
-            "zip": data.get('postal', 'Unknown'),
-            "latitude": data.get('latitude', 0.0),
-            "longitude": data.get('longitude', 0.0),
-            "timezone": data.get('timezone', 'Unknown'),
-            "isp": data.get('isp', 'Unknown'),
-            "organization": data.get('org', 'Unknown'),
-            "as_number": data.get('asn', 'Unknown')
-        }
-    except Exception as e:
-        logger.error(f"ipapi.co failed for IP {ip}: {str(e)}", exc_info=True)
-        return {
-            "country": "Unknown",
-            "country_code": "Unknown",
-            "region": "Unknown",
-            "region_code": "Unknown",
-            "city": "Unknown",
-            "zip": "Unknown",
+            "country": "Not Available",
+            "country_code": "N/A",
+            "region": "Not Available",
+            "region_code": "N/A",
+            "city": "Not Available",
+            "zip": "N/A",
             "latitude": 0.0,
             "longitude": 0.0,
-            "timezone": "Unknown",
-            "isp": "Unknown",
-            "organization": "Unknown",
-            "as_number": "Unknown"
+            "timezone": "UTC",
+            "isp": "Not Available",
+            "organization": "Not Available",
+            "as_number": "N/A"
+        }
+    except Exception as e:
+        logger.error(f"GeoIP lookup failed for IP {ip}: {str(e)}", exc_info=True)
+        return {
+            "country": "Not Available",
+            "country_code": "N/A",
+            "region": "Not Available",
+            "region_code": "N/A",
+            "city": "Not Available",
+            "zip": "N/A",
+            "latitude": 0.0,
+            "longitude": 0.0,
+            "timezone": "UTC",
+            "isp": "Not Available",
+            "organization": "Not Available",
+            "as_number": "N/A"
+        }
+
+def get_device_info(user_agent_string):
+    try:
+        ua = parse(user_agent_string)
+        device_type = "Desktop"
+        screen_type = "Standard"
+
+        # Determine device type
+        if ua.is_mobile:
+            device_type = "Mobile"
+            screen_type = "Touchscreen"
+        elif ua.is_tablet:
+            device_type = "Tablet"
+            screen_type = "Touchscreen"
+        elif ua.is_pc:
+            device_type = "Desktop"
+            screen_type = "Standard"
+
+        # Fallback pattern matching
+        if device_type == "Desktop" and not ua.is_pc:
+            user_agent_lower = user_agent_string.lower()
+            if any(keyword in user_agent_lower for keyword in ['mobile', 'android', 'iphone', 'ipad']):
+                device_type = "Mobile" if 'ipad' not in user_agent_lower else "Tablet"
+                screen_type = "Touchscreen"
+
+        # Application detection
+        app = ua.browser.family if ua.browser.family else "Not Available"
+        if "Outlook" in user_agent_string:
+            app = "Outlook"
+
+        return {
+            "device_type": device_type,
+            "screen_type": screen_type,
+            "application": app
+        }
+    except Exception as e:
+        logger.error(f"Device info parsing failed for UA {user_agent_string}: {str(e)}")
+        return {
+            "device_type": "Not Available",
+            "screen_type": "Not Available",
+            "application": "Not Available"
         }
 
 def rate_limit(limit=5, per=60):
@@ -450,29 +520,26 @@ def log_visitor():
         referer = headers.get("Referer", "")
         session_start = session.get('session_start', int(time.time()))
         session['session_start'] = session_start
-        ua = parse(user_agent)
-        device = "Desktop"
-        if ua.is_mobile:
-            device = "Android" if "Android" in user_agent else "iPhone" if "iPhone" in user_agent else "Mobile"
-        app = "Unknown"
-        if "Outlook" in user_agent:
-            app = "Outlook"
-        elif ua.browser.family:
-            app = ua.browser.family
+
+        device_info = get_device_info(user_agent)
+        device_type = device_info['device_type']
+        screen_type = device_info['screen_type']
+        app = device_info['application']
+
         is_bot_flag, bot_reason = is_bot(user_agent, headers, ip, request.path)
         visit_type = "Human"
         if is_bot_flag:
             visit_type = "Bot" if "curl/" in user_agent.lower() else "Mimicry" if "Mimicry" in bot_reason else "Bot"
-        elif app != "Unknown" and app != ua.browser.family:
+        elif app != "Not Available" and app != device_info['application']:
             visit_type = "App"
+
         location = get_geoip(ip)
         session_duration = int(time.time()) - session_start
         timestamp = int(time.time())
         visitor_id = hashlib.sha256(f"{ip}{timestamp}".encode()).hexdigest()
-        
+
         if valkey_client:
             try:
-                # Store visitor data in a hash
                 valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
                     "timestamp": timestamp,
                     "ip": ip,
@@ -488,7 +555,8 @@ def log_visitor():
                     "organization": location['organization'],
                     "as_number": location['as_number'],
                     "timezone": location['timezone'],
-                    "device": device,
+                    "device_type": device_type,
+                    "screen_type": screen_type,
                     "application": app,
                     "user_agent": user_agent,
                     "bot_status": visit_type,
@@ -497,11 +565,8 @@ def log_visitor():
                     "source": 'referral' if referer else 'direct',
                     "session_duration": session_duration
                 })
-                # Add to sorted set for chronological ordering
                 valkey_client.zadd(f"user:{username}:visitor_log", {visitor_id: timestamp})
-                # Set expiration for visitor data
                 valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
-                # Trim sorted set to keep only last 1000 entries
                 valkey_client.zremrangebyrank(f"user:{username}:visitor_log", 0, -1001)
                 logger.debug(f"Logged visitor: {visitor_id} for user: {username} at timestamp: {timestamp}")
             except Exception as e:
@@ -847,8 +912,8 @@ def dashboard():
                             "url": url_data.get('url', ''),
                             "destination": url_data.get('destination', ''),
                             "path_segment": url_data.get('path_segment', ''),
-                            "created": datetime.fromtimestamp(int(url_data.get('created', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('created') else 'Unknown',
-                            "expiry": datetime.fromtimestamp(int(url_data.get('expiry', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('expiry') else 'Unknown',
+                            "created": datetime.fromtimestamp(int(url_data.get('created', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('created') else 'Not Available',
+                            "expiry": datetime.fromtimestamp(int(url_data.get('expiry', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('expiry') else 'Not Available',
                             "clicks": int(url_data.get('clicks', 0)) if url_data.get('clicks') else 0,
                             "analytics_enabled": url_data.get('analytics_enabled', '0') == '1',
                             "visits": visit_data,
@@ -874,7 +939,6 @@ def dashboard():
         if valkey_client:
             try:
                 logger.debug(f"Fetching visitor keys for user: {username}")
-                # Get visitor IDs from sorted set in reverse order (newest first)
                 visitor_ids = valkey_client.zrevrange(f"user:{username}:visitor_log", 0, -1)
                 logger.debug(f"Found {len(visitor_ids)} visitor IDs")
                 for visitor_id in visitor_ids:
@@ -885,33 +949,34 @@ def dashboard():
                             continue
                         source = 'referral' if visitor_data.get('referer') else 'direct'
                         visitors.append({
-                            "timestamp": datetime.fromtimestamp(int(visitor_data.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor_data.get('timestamp') else 'Unknown',
-                            "ip": visitor_data.get('ip', 'Unknown'),
-                            "country": visitor_data.get('country', 'Unknown'),
-                            "country_code": visitor_data.get('country_code', 'Unknown'),
-                            "region": visitor_data.get('region', 'Unknown'),
-                            "region_code": visitor_data.get('region_code', 'Unknown'),
-                            "city": visitor_data.get('city', 'Unknown'),
-                            "zip": visitor_data.get('zip', 'Unknown'),
+                            "timestamp": datetime.fromtimestamp(int(visitor_data.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor_data.get('timestamp') else 'Not Available',
+                            "ip": visitor_data.get('ip', 'Not Available'),
+                            "country": visitor_data.get('country', 'Not Available'),
+                            "country_code": visitor_data.get('country_code', 'N/A'),
+                            "region": visitor_data.get('region', 'Not Available'),
+                            "region_code": visitor_data.get('region_code', 'N/A'),
+                            "city": visitor_data.get('city', 'Not Available'),
+                            "zip": visitor_data.get('zip', 'N/A'),
                             "latitude": float(visitor_data.get('latitude', 0.0)),
                             "longitude": float(visitor_data.get('longitude', 0.0)),
-                            "isp": visitor_data.get('isp', 'Unknown'),
-                            "organization": visitor_data.get('organization', 'Unknown'),
-                            "as_number": visitor_data.get('as_number', 'Unknown'),
-                            "timezone": visitor_data.get('timezone', 'Unknown'),
-                            "device": visitor_data.get('device', 'Unknown'),
-                            "application": visitor_data.get('application', 'Unknown'),
-                            "user_agent": visitor_data.get('user_agent', 'Unknown'),
-                            "bot_status": visitor_data.get('bot_status', 'Unknown'),
+                            "isp": visitor_data.get('isp', 'Not Available'),
+                            "organization": visitor_data.get('organization', 'Not Available'),
+                            "as_number": visitor_data.get('as_number', 'N/A'),
+                            "timezone": visitor_data.get('timezone', 'UTC'),
+                            "device_type": visitor_data.get('device_type', 'Not Available'),
+                            "screen_type": visitor_data.get('screen_type', 'Not Available'),
+                            "application": visitor_data.get('application', 'Not Available'),
+                            "user_agent": visitor_data.get('user_agent', 'Not Available'),
+                            "bot_status": visitor_data.get('bot_status', 'Not Available'),
                             "block_reason": visitor_data.get('block_reason', 'N/A'),
                             "source": source,
                             "session_duration": int(visitor_data.get('session_duration', 0))
                         })
                         if visitor_data.get('bot_status') != 'Human':
                             bot_logs.append({
-                                "timestamp": visitor_data.get('timestamp', 'Unknown'),
-                                "ip": visitor_data.get('ip', 'Unknown'),
-                                "block_reason": visitor_data.get('block_reason', 'Unknown')
+                                "timestamp": visitor_data.get('timestamp', 'Not Available'),
+                                "ip": visitor_data.get('ip', 'Not Available'),
+                                "block_reason": visitor_data.get('block_reason', 'N/A')
                             })
                             bot_ratio['bot'] += 1
                         else:
@@ -1129,8 +1194,8 @@ def dashboard():
                                                 <label class="block text-sm font-medium text-gray-700">Filter by Device</label>
                                                 <select id="filter-device-{{ loop.index }}" onchange="applyFilters('{{ loop.index }}')" class="mt-1 w-full p-3 border rounded-lg">
                                                     <option value="">All</option>
-                                                    <option value="Android">Android</option>
-                                                    <option value="iPhone">iPhone</option>
+                                                    <option value="Mobile">Mobile</option>
+                                                    <option value="Tablet">Tablet</option>
                                                     <option value="Desktop">Desktop</option>
                                                 </select>
                                             </div>
@@ -1151,7 +1216,8 @@ def dashboard():
                                                         <tr class="bg-gray-200">
                                                             <th>Timestamp</th>
                                                             <th>IP</th>
-                                                            <th>Device</th>
+                                                            <th>Device Type</th>
+                                                            <th>Screen Type</th>
                                                             <th>App</th>
                                                             <th>Type</th>
                                                             <th>Country</th>
@@ -1164,7 +1230,8 @@ def dashboard():
                                                             <tr class="{% if visit.type != 'Human' %}bot{% endif %}">
                                                                 <td>{{ visit.timestamp|datetime }}</td>
                                                                 <td>{{ visit.ip }}</td>
-                                                                <td>{{ visit.device }}</td>
+                                                                <td>{{ visit.device_type }}</td>
+                                                                <td>{{ visit.screen_type }}</td>
                                                                 <td>{{ visit.app }}</td>
                                                                 <td>{{ visit.type }}</td>
                                                                 <td>{{ visit.location.country }}</td>
@@ -1208,7 +1275,8 @@ def dashboard():
                                                 <th>Organization</th>
                                                 <th>AS Number</th>
                                                 <th>Timezone</th>
-                                                <th>Device</th>
+                                                <th>Device Type</th>
+                                                <th>Screen Type</th>
                                                 <th>Application</th>
                                                 <th>User Agent</th>
                                                 <th>Bot Status</th>
@@ -1234,7 +1302,8 @@ def dashboard():
                                                     <td>{{ visitor.organization }}</td>
                                                     <td>{{ visitor.as_number }}</td>
                                                     <td>{{ visitor.timezone }}</td>
-                                                    <td>{{ visitor.device }}</td>
+                                                    <td>{{ visitor.device_type }}</td>
+                                                    <td>{{ visitor.screen_type }}</td>
                                                     <td>{{ visitor.application }}</td>
                                                     <td>{{ visitor.user_agent }}</td>
                                                     <td>{{ visitor.bot_status }}</td>
@@ -1335,9 +1404,9 @@ def dashboard():
                 </div>
             </body>
             </html>
-        """, username=username, urls=urls, visitors=visitors, bot_logs=bot_logs, 
-           traffic_sources_keys=traffic_sources_keys, traffic_sources_values=traffic_sources_values, 
-           bot_ratio_keys=bot_ratio_keys, bot_ratio_values=bot_ratio_values, 
+        """, username=username, urls=urls, visitors=visitors, bot_logs=bot_logs,
+           traffic_sources_keys=traffic_sources_keys, traffic_sources_values=traffic_sources_values,
+           bot_ratio_keys=bot_ratio_keys, bot_ratio_values=bot_ratio_values,
            primary_color=primary_color, error=error, valkey_error=valkey_error)
     except Exception as e:
         logger.error(f"Dashboard error for user {username}: {str(e)}", exc_info=True)
@@ -1509,29 +1578,30 @@ def export_visitors():
                 writer.writerow([
                     'Timestamp', 'IP', 'Country', 'Country Code', 'Region', 'Region Code',
                     'City', 'Zip', 'Latitude', 'Longitude', 'ISP', 'Organization',
-                    'AS Number', 'Timezone', 'Device', 'Application', 'User Agent',
-                    'Bot Status', 'Block Reason', 'Source', 'Session Duration (s)'
+                    'AS Number', 'Timezone', 'Device Type', 'Screen Type', 'Application',
+                    'User Agent', 'Bot Status', 'Block Reason', 'Source', 'Session Duration (s)'
                 ])
                 for visitor in visitor_data:
                     writer.writerow([
-                        datetime.fromtimestamp(int(visitor.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor.get('timestamp') else 'Unknown',
-                        visitor.get('ip', 'Unknown'),
-                        visitor.get('country', 'Unknown'),
-                        visitor.get('country_code', 'Unknown'),
-                        visitor.get('region', 'Unknown'),
-                        visitor.get('region_code', 'Unknown'),
-                        visitor.get('city', 'Unknown'),
-                        visitor.get('zip', 'Unknown'),
+                        datetime.fromtimestamp(int(visitor.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor.get('timestamp') else 'Not Available',
+                        visitor.get('ip', 'Not Available'),
+                        visitor.get('country', 'Not Available'),
+                        visitor.get('country_code', 'N/A'),
+                        visitor.get('region', 'Not Available'),
+                        visitor.get('region_code', 'N/A'),
+                        visitor.get('city', 'Not Available'),
+                        visitor.get('zip', 'N/A'),
                         visitor.get('latitude', '0.0'),
                         visitor.get('longitude', '0.0'),
-                        visitor.get('isp', 'Unknown'),
-                        visitor.get('organization', 'Unknown'),
-                        visitor.get('as_number', 'Unknown'),
-                        visitor.get('timezone', 'Unknown'),
-                        visitor.get('device', 'Unknown'),
-                        visitor.get('application', 'Unknown'),
-                        visitor.get('user_agent', 'Unknown'),
-                        visitor.get('bot_status', 'Unknown'),
+                        visitor.get('isp', 'Not Available'),
+                        visitor.get('organization', 'Not Available'),
+                        visitor.get('as_number', 'N/A'),
+                        visitor.get('timezone', 'UTC'),
+                        visitor.get('device_type', 'Not Available'),
+                        visitor.get('screen_type', 'Not Available'),
+                        visitor.get('application', 'Not Available'),
+                        visitor.get('user_agent', 'Not Available'),
+                        visitor.get('bot_status', 'Not Available'),
                         visitor.get('block_reason', 'N/A'),
                         visitor.get('source', 'direct'),
                         visitor.get('session_duration', '0')
@@ -1625,17 +1695,18 @@ def export(index):
                         logger.error(f"Error decoding visit data: {str(e)}")
                 output = StringIO()
                 writer = csv.writer(output)
-                writer.writerow(['Timestamp', 'IP', 'Device', 'App', 'Type', 'Country', 'Region', 'City'])
+                writer.writerow(['Timestamp', 'IP', 'Device Type', 'Screen Type', 'App', 'Type', 'Country', 'Region', 'City'])
                 for visit in visit_data:
                     writer.writerow([
-                        datetime.fromtimestamp(visit.get('timestamp', 0)).strftime('%Y-%m-%d %H:%M:%S') if visit.get('timestamp') else 'Unknown',
-                        visit.get('ip', 'Unknown'),
-                        visit.get('device', 'Unknown'),
-                        visit.get('app', 'Unknown'),
-                        visit.get('type', 'Unknown'),
-                        visit.get('location', {}).get('country', 'Unknown'),
-                        visit.get('location', {}).get('region', 'Unknown'),
-                        visit.get('location', {}).get('city', 'Unknown')
+                        datetime.fromtimestamp(visit.get('timestamp', 0)).strftime('%Y-%m-%d %H:%M:%S') if visit.get('timestamp') else 'Not Available',
+                        visit.get('ip', 'Not Available'),
+                        visit.get('device_type', 'Not Available'),
+                        visit.get('screen_type', 'Not Available'),
+                        visit.get('app', 'Not Available'),
+                        visit.get('type', 'Not Available'),
+                        visit.get('location', {}).get('country', 'Not Available'),
+                        visit.get('location', {}).get('region', 'Not Available'),
+                        visit.get('location', {}).get('city', 'Not Available')
                     ])
                 output.seek(0)
                 logger.debug(f"Exported CSV for URL ID: {url_id}")
@@ -1753,19 +1824,14 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         # Bot detection
         is_bot_flag, bot_reason = is_bot(user_agent, headers, ip, request.path)
         asn_blocked = check_asn(ip)
-        ua = parse(user_agent)
-        device = "Desktop"
-        if ua.is_mobile:
-            device = "Android" if "Android" in user_agent else "iPhone" if "iPhone" in user_agent else "Mobile"
-        app = "Unknown"
-        if "Outlook" in user_agent:
-            app = "Outlook"
-        elif ua.browser.family:
-            app = ua.browser.family
+        device_info = get_device_info(user_agent)
+        device_type = device_info['device_type']
+        screen_type = device_info['screen_type']
+        app = device_info['application']
         visit_type = "Human"
         if is_bot_flag or asn_blocked:
             visit_type = "Bot" if "curl/" in user_agent.lower() else "Mimicry" if "Mimicry" in bot_reason else "Bot"
-        elif app != "Unknown" and app != ua.browser.family:
+        elif app != "Not Available" and app != device_info['application']:
             visit_type = "App"
 
         location = get_geoip(ip)
@@ -1793,7 +1859,8 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                         "organization": location['organization'],
                         "as_number": location['as_number'],
                         "timezone": location['timezone'],
-                        "device": device,
+                        "device_type": device_type,
+                        "screen_type": screen_type,
                         "application": app,
                         "user_agent": user_agent,
                         "bot_status": visit_type,
@@ -1808,7 +1875,8 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                     valkey_client.lpush(f"user:{username}:url:{url_id}:visits", json.dumps({
                         "timestamp": timestamp,
                         "ip": ip,
-                        "device": device,
+                        "device_type": device_type,
+                        "screen_type": screen_type,
                         "app": app,
                         "type": visit_type,
                         "location": location

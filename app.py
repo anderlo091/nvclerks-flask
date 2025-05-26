@@ -79,8 +79,8 @@ Talisman(
         'base-uri': "'self'",
         'form-action': "'self'"
     },
-    x_frame_options='DENY',
-    x_content_type_options='nosniff'
+    frame_options='DENY',
+    content_type_options=True
 )
 logger.debug("Flask-Talisman configured with security headers")
 
@@ -630,7 +630,7 @@ def log_visitor():
                 valkey_client.zadd(f"user:{username}:visitor_log", {visitor_id: timestamp})
                 valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
                 valkey_client.zremrangebyrank(f"user:{username}:visitor_log", 0, -1001)
-                logger.debug(f"Logged visitor: {visitor_id} for user: {username} at timestamp: {timestamp}")
+                logger.debug(f"Logged visitor: {visitor_id} for user: {username}")
             except Exception as e:
                 logger.error(f"Valkey error logging visitor: {str(e)}", exc_info=True)
     except Exception as e:
@@ -888,7 +888,7 @@ def dashboard():
                 logger.debug(f"Fetching URL keys for user: {username}")
                 url_keys = valkey_client.keys(f"user:{username}:url:*")
                 total_urls = len(url_keys)
-                url_keys = sorted(url_keys, reverse=True)  # Sort for consistent pagination
+                url_keys = sorted(url_keys, reverse=True)
                 start = (url_page - 1) * items_per_page
                 end = start + items_per_page
                 url_keys = url_keys[start:end]
@@ -969,7 +969,7 @@ def dashboard():
                             continue
                         source = 'referral' if visitor_data.get('referer') else 'direct'
                         visitor_entry = {
-                            "number": index,  # Sequential numbering
+                            "number": index,
                             "timestamp": datetime.fromtimestamp(int(visitor_data.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor_data.get('timestamp') else 'Not Available',
                             "ip": visitor_data.get('ip', 'Not Available'),
                             "country": visitor_data.get('country', 'Not Available'),
@@ -1031,7 +1031,6 @@ def dashboard():
         theme_seed = hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()[:6]
         primary_color = f"#{theme_seed}"
 
-        # Pagination calculations
         total_url_pages = (total_urls + items_per_page - 1) // items_per_page
         total_visitor_pages = (total_visits + items_per_page - 1) // items_per_page
         url_page_range = range(max(1, url_page - 2), min(total_url_pages + 1, url_page + 3))
@@ -1452,7 +1451,7 @@ def dashboard():
                                         });
                                     </script>
                                 </div>
-                                                                   <div>
+                                    <div>
                                         <h3 class="text-lg font-semibold mb-4">Bot vs Human Ratio</h3>
                                         <canvas id=bot-ratio-chart></canvas>
                                         <script>

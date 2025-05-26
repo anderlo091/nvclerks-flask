@@ -2,7 +2,6 @@ from flask import Flask, request, redirect, render_template_string, abort, url_f
 from flask_wtf import FlaskForm, CSRFProtect
 from wtforms import StringField, SubmitField, SelectField, BooleanField, HiddenField
 from wtforms.validators import DataRequired, Length, Regexp, URL
-from flask_talisman import Talisman
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.backends import default_backend
@@ -38,7 +37,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.debug("Initializing Flask app")
 
-# Hardcoded configuration values (TODO: Move to environment variables for production)
+# Hardcoded configuration values
 FLASK_SECRET_KEY = "b8f9a3c2d7e4f1a9b0c3d6e8f2a7b4c9"
 WTF_CSRF_SECRET_KEY = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
 ENCRYPTION_KEY = secrets.token_bytes(32)
@@ -63,26 +62,24 @@ except Exception as e:
     logger.error(f"Error setting Flask config: {str(e)}", exc_info=True)
     raise
 
-# Security headers with Flask-Talisman
-Talisman(
-    app,
-    force_https=True,
-    strict_transport_security=True,
-    content_security_policy={
-        'default-src': "'self'",
-        'script-src': ["'self'", "https://cdn.tailwindcss.com", "https://cdn.jsdelivr.net"],
-        'style-src': ["'self'", "https://cdn.tailwindcss.com", "'unsafe-inline'"],
-        'connect-src': ["'self'"],
-        'img-src': ["'self'", "data:"],
-        'font-src': ["'self'"],
-        'object-src': "'none'",
-        'base-uri': "'self'",
-        'form-action': "'self'"
-    },
-    frame_options='DENY',
-    content_type_options=True
-)
-logger.debug("Flask-Talisman configured with security headers")
+# Manual security headers
+@app.after_request
+def add_security_headers(response):
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Content-Security-Policy'] = (
+        "default-src 'self'; "
+        "script-src 'self' https://cdn.tailwindcss.com https://cdn.jsdelivr.net; "
+        "style-src 'self' https://cdn.tailwindcss.com 'unsafe-inline'; "
+        "connect-src 'self'; "
+        "img-src 'self' data:; "
+        "font-src 'self'; "
+        "object-src 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'"
+    )
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    return response
 
 # CSRF protection
 csrf = CSRFProtect(app)
@@ -630,9 +627,9 @@ def log_visitor():
                 valkey_client.zadd(f"user:{username}:visitor_log", {visitor_id: timestamp})
                 valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
                 valkey_client.zremrangebyrank(f"user:{username}:visitor_log", 0, -1001)
-                logger.debug(f"Logged visitor: {visitor_id} for user: {username}")
+                logger.debug(f"Logged visitor: {visitor_id} for user: {username}, type: {visit_type}")
             except Exception as e:
-                logger.error(f"Valkey error logging visitor: {str(e)}", exc_info=True)
+                logger.error(f"Valkey error logging visitor {visitor_id}: {str(e)}", exc_info=True)
     except Exception as e:
         logger.error(f"Error in log_visitor: {str(e)}", exc_info=True)
 
@@ -889,7 +886,7 @@ def dashboard():
                 url_keys = valkey_client.keys(f"user:{username}:url:*")
                 total_urls = len(url_keys)
                 url_keys = sorted(url_keys, reverse=True)
-                start = (url_page - 1) * items_per_page
+                start = max(0, (url_page - 1) * items_per_page)
                 end = start + items_per_page
                 url_keys = url_keys[start:end]
                 logger.debug(f"Found {total_urls} URL keys, displaying {len(url_keys)} for page {url_page}")
@@ -957,7 +954,7 @@ def dashboard():
                 logger.debug(f"Fetching visitor keys for user: {username}")
                 visitor_ids = valkey_client.zrevrange(f"user:{username}:visitor_log", 0, -1)
                 total_visits = len(visitor_ids)
-                start = (visitor_page - 1) * items_per_page
+                start = max(0, (visitor_page - 1) * items_per_page)
                 end = start + items_per_page
                 visitor_ids = visitor_ids[start:end]
                 logger.debug(f"Found {total_visits} visitor IDs, displaying {len(visitor_ids)} for page {visitor_page}")
@@ -1036,7 +1033,7 @@ def dashboard():
         url_page_range = range(max(1, url_page - 2), min(total_url_pages + 1, url_page + 3))
         visitor_page_range = range(max(1, visitor_page - 2), min(total_visitor_pages + 1, visitor_page + 3))
 
-        logger.debug(f"Rendering dashboard template for user: {username}")
+        logger.debug(f"Rendering dashboard for user: {username}, total_visits: {total_visits}, human: {total_human_visits}, bot: {total_bot_visits}")
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -1310,9 +1307,9 @@ def dashboard():
                                 <button onclick=refreshDashboard() class="refresh-btn bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700">Refresh</button>
                             </div>
                             <div class="mb-4 p-4 bg-gray-100 rounded-lg">
-                                <p class="text-gray-800"><strong>Total Visits:</strong> {{ total_visits }}</p>
-                                <p class="text-gray-800"><strong>Total Human Visits:</strong> {{ total_human_visits }}</p>
-                                <p class="text-gray-800"><strong>Total Bot Visits:</strong> {{ total_bot_visits }}</p>
+                                <p class="text-gray-800"><strong>Total Visitors:</strong> {{ total_visits }}</p>
+                                <p class="text-gray-800"><strong>Total Human Visitors:</strong> {{ total_human_visits }}</p>
+                                <p class="text-gray-800"><strong>Total Bot Visitors:</strong> {{ total_bot_visits }}</p>
                             </div>
                             {% if visitors %}
                                 <div class=table-container>
@@ -1396,99 +1393,98 @@ def dashboard():
                             {% endif %}
                         </div>
                     </div>
-                    <div id=bot-logs-tab class="tab-content hidden">
-                        <div class="bg-white p-8 rounded-xl card">
-                            <h2 class="text-2xl font-bold mb-6 text-gray-900">Bot Detection Logs</h2>
-                            {% if bot_logs %}
-                                <div class=table-container>
-                                    <table>
-                                        <thead>
-                                            <tr class=bg-gray-200>
-                                                <th>Timestamp</th>
-                                                <th>IP</th>
-                                                <th>Block Reason</th>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            {% for log in bot_logs %}
-                                                <tr class=bot>
-                                                    <td>{{ log.timestamp|datetime }}</td>
-                                                    <td>{{ log.ip }}</td>
-                                                    <td>{{ log.block_reason }}</td>
-                                                </tr>
-                                            {% endfor %}
-                                        </tbody>
-                                    </table>
+                                               <div id=bot-logs-tab class="tab-content hidden">
+                                <div class="bg-white p-8 rounded-xl card">
+                                    <h2 class="text-2xl font-bold mb-6 text-gray-900">Bot Detection Logs</h2>
+                                    {% if bot_logs %}
+                                        <div class=table-container>
+                                            <table>
+                                                <thead>
+                                                    <tr class=bg-gray-200>
+                                                        <th>Timestamp</th>
+                                                        <th>IP</th>
+                                                        <th>Block Reason</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {% for log in bot_logs %}
+                                                        <tr class=bot>
+                                                            <td>{{ log.timestamp|datetime }}</td>
+                                                            <td>{{ log.ip }}</td>
+                                                            <td>{{ log.block_reason }}</td>
+                                                        </tr>
+                                                    {% endfor %}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    {% else %}
+                                        <p class=text-gray-600>No bot detections logged.</p>
+                                    {% endif %}
                                 </div>
-                            {% else %}
-                                <p class=text-gray-600>No bot detections logged.</p>
-                            {% endif %}
-                        </div>
-                    </div>
-                    <div id=analytics-tab class="tab-content hidden">
-                        <div class="bg-white p-8 rounded-xl card">
-                            <h2 class="text-2xl font-bold mb-6 text-gray-900">Traffic Analytics</h2>
-                            <div class="grid grid-cols-2 gap-4">
-                                <div>
-                                    <h3 class="text-lg font-semibold mb-4">Traffic Sources</h3>
-                                    <canvas id=traffic-source-chart></canvas>
-                                    <script>
-                                        new Chart(document.getElementById('traffic-source-chart'), {
-                                            type: 'pie',
-                                            data: {
-                                                labels: {{ traffic_sources_keys|tojson }},
-                                                datasets: [{
-                                                    data: {{ traffic_sources_values|tojson }},
-                                                    backgroundColor: ['#4f46e5', '#7c3aed', '#3b82f6']
-                                                }]
-                                            },
-                                            options: {
-                                                responsive: true,
-                                                plugins: {
-                                                    legend: { position: 'top' }
-                                                }
-                                            }
-                                        });
-                                    </script>
-                                </div>
-                                    <div>
-                                        <h3 class="text-lg font-semibold mb-4">Bot vs Human Ratio</h3>
-                                        <canvas id=bot-ratio-chart></canvas>
-                                        <script>
-                                            new Chart(document.getElementById('bot-ratio-chart'), {
-                                                type: 'doughnut',
-                                                data: {
-                                                    labels: {{ bot_ratio_keys|tojson }},
-                                                    datasets: [{
-                                                        data: {{ bot_ratio_values|tojson }},
-                                                        backgroundColor: ['#10b981', '#ef4444']
-                                                    }]
-                                                },
-                                                options: {
-                                                    responsive: true,
-                                                    plugins: {
-                                                        legend: { position: 'top' }
+                            </div>
+                            <div id=analytics-tab class="tab-content hidden">
+                                <div class="bg-white p-8 rounded-xl card">
+                                    <h2 class="text-2xl font-bold mb-6 text-gray-900">Traffic Analytics</h2>
+                                    <div class="grid grid-cols-2 gap-6">
+                                        <div>
+                                            <h3 class="text-lg font-semibold mb-4">Traffic Sources</h3>
+                                            <canvas id=traffic-source-chart></canvas>
+                                            <script>
+                                                new Chart(document.getElementById('traffic-source-chart'), {
+                                                    type: 'pie',
+                                                    data: {
+                                                        labels: {{ traffic_sources_keys|safe }},
+                                                        datasets: [{
+                                                            data: {{ traffic_sources_values|safe }},
+                                                            backgroundColor: ['#4f46e5', '#7c3aed', '#3b82f6']
+                                                        }]
+                                                    },
+                                                    options: {
+                                                        responsive: true,
+                                                        plugins: {
+                                                            legend: { position: 'top' }
+                                                        }
                                                     }
-                                                }
-                                            });
-                                        </script>
+                                                });
+                                            </script>
+                                        </div>
+                                        <div>
+                                            <h3 class="text-lg font-semibold mb-4">Bot vs Human Ratio</h3>
+                                            <canvas id=bot-ratio-chart></canvas>
+                                            <script>
+                                                new Chart(document.getElementById('bot-ratio-chart'), {
+                                                    type: 'doughnut',
+                                                    data: {
+                                                        labels: {{ bot_ratio_keys|safe }},
+                                                        datasets: [{
+                                                            data: {{ bot_ratio_values|safe }},
+                                                            backgroundColor: ['#10b981', '#ef4444']
+                                                        }]
+                                                    },
+                                                    options: {
+                                                        responsive: true,
+                                                        plugins: {
+                                                            legend: { position: 'top' }
+                                                        }
+                                                    }
+                                                });
+                                            </script>
+                                        </div>
                                     </div>
                                 </div>
                             </div>
                         </div>
-                    </div>
-                </div>
-            </body>
-            </html>
-        """, username=username, form=form, urls=urls, visitors=visitors, bot_logs=bot_logs,
-           traffic_sources_keys=traffic_sources_keys, traffic_sources_values=traffic_sources_values,
-           bot_ratio_keys=bot_ratio_keys, bot_ratio_values=bot_ratio_values,
-           primary_color=primary_color, error=error, valkey_error=valkey_error,
-           total_urls=total_urls, total_url_pages=total_url_pages, url_page=url_page,
-           url_page_range=url_page_range, total_visits=total_visits,
-           total_bot_visits=total_bot_visits, total_human_visits=total_human_visits,
-           total_visitor_pages=total_visitor_pages, visitor_page=visitor_page,
-           visitor_page_range=visitor_page_range)
+                    </body>
+                    </html>
+                """, username=username, form=form, urls=urls, visitors=visitors, bot_logs=bot_logs,
+                   traffic_sources_keys=traffic_sources_keys, traffic_sources_values=traffic_sources_values,
+                   bot_ratio_keys=bot_ratio_keys, bot_ratio_values=bot_ratio_values,
+                   primary_color=primary_color, error=error, valkey_error=valkey_error,
+                   total_urls=total_urls, total_url_pages=total_url_pages, url_page=url_page,
+                   url_page_range=url_page_range, total_visits=total_visits,
+                   total_bot_visits=total_bot_visits, total_human_visits=total_human_visits,
+                   total_visitor_pages=total_visitor_pages, visitor_page=visitor_page,
+                   visitor_page_range=visitor_page_range)
     except Exception as e:
         logger.error(f"Dashboard error for user {username}: {str(e)}", exc_info=True)
         return render_template_string("""
@@ -1972,7 +1968,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                         "location": location
                     }))
                     valkey_client.expire(f"user:{username}:url:{url_id}:visits", DATA_RETENTION_DAYS * 86400)
-                    logger.debug(f"Logged visit for URL ID: {url_id}, visitor: {visitor_id}")
+                    logger.debug(f"Logged visit for URL ID: {url_id}, visitor: {visitor_id}, type: {visit_type}")
             except Exception as e:
                 logger.error(f"Valkey error logging visit: {str(e)}", exc_info=True)
 
@@ -2148,3 +2144,9 @@ if __name__ == "__main__":
         logger.error(f"Error starting Flask app: {str(e)}", exc_info=True)
         import sys
         sys.exit(1)
+</xaiArtifact>
+
+### Supporting Files
+To ensure Vercel deployment and the improvements work correctly, include these files:
+
+#### `requirements.txt`

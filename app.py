@@ -1509,34 +1509,42 @@ def dashboard():
                                     <h3 class="text-lg font-semibold mb-4">Traffic Sources</h3>
                                     <canvas id="traffic-source-chart"></canvas>
                                     <script>
-                                        new Chart(document.getElementById('traffic-source-chart'), {
-                                            type: 'pie',
-                                            data: {
-                                                labels: {{ traffic_sources_keys|tojson }},
-                                                datasets: [{
-                                                    data: {{ traffic_sources_values|tojson }},
-                                                    backgroundColor: ['#4f46e5', '#7c3aed', '#3b82f6']
-                                                }]
-                                            },
-                                            options: { responsive: true, plugins: { legend: { position: 'top' } } }
-                                        });
+                                        try {
+                                            new Chart(document.getElementById('traffic-source-chart'), {
+                                                type: 'pie',
+                                                data: {
+                                                    labels: {{ traffic_sources_keys|tojson }},
+                                                    datasets: [{
+                                                        data: {{ traffic_sources_values|tojson }},
+                                                        backgroundColor: ['#4f46e5', '#7c3aed', '#3b82f6']
+                                                    }]
+                                                },
+                                                options: { responsive: true, plugins: { legend: { position: 'top' } } }
+                                            });
+                                        } catch (e) {
+                                            console.error('Error rendering traffic source chart:', e);
+                                        }
                                     </script>
                                 </div>
                                 <div>
                                     <h3 class="text-lg font-semibold mb-4">Bot vs Human Ratio</h3>
                                     <canvas id="bot-ratio-chart"></canvas>
                                     <script>
-                                        new Chart(document.getElementById('bot-ratio-chart'), {
-                                            type: 'doughnut',
-                                            data: {
-                                                labels: {{ bot_ratio_keys|tojson }},
-                                                datasets: [{
-                                                    data: {{ bot_ratio_values|tojson }},
-                                                    backgroundColor: ['#10b981', '#ef4444']
-                                                }]
-                                            },
-                                            options: { responsive: true, plugins: { legend: { position: 'top' } } }
-                                        });
+                                        try {
+                                            new Chart(document.getElementById('bot-ratio-chart'), {
+                                                type: 'doughnut',
+                                                data: {
+                                                    labels: {{ bot_ratio_keys|tojson }},
+                                                    datasets: [{
+                                                        data: {{ bot_ratio_values|tojson }},
+                                                        backgroundColor: ['#10b981', '#ef4444']
+                                                    }]
+                                                },
+                                                options: { responsive: true, plugins: { legend: { position: 'top' } } }
+                                            });
+                                        } catch (e) {
+                                            console.error('Error rendering bot ratio chart:', e);
+                                        }
                                     </script>
                                 </div>
                             </div>
@@ -1545,34 +1553,42 @@ def dashboard():
                                     <h3 class="text-lg font-semibold mb-4">Device Type Distribution</h3>
                                     <canvas id="device-type-chart"></canvas>
                                     <script>
-                                        new Chart(document.getElementById('device-type-chart'), {
-                                            type: 'pie',
-                                            data: {
-                                                labels: {{ device_types_keys|tojson }},
-                                                datasets: [{
-                                                    data: {{ device_types_values|tojson }},
-                                                    backgroundColor: ['#f59e0b', '#10b981', '#3b82f6', '#ef4444']
-                                                }]
-                                            },
-                                            options: { responsive: true, plugins: { legend: { position: 'top' } } }
-                                        });
+                                        try {
+                                            new Chart(document.getElementById('device-type-chart'), {
+                                                type: 'pie',
+                                                data: {
+                                                    labels: {{ device_types_keys|tojson }},
+                                                    datasets: [{
+                                                        data: {{ device_types_values|tojson }},
+                                                        backgroundColor: ['#f59e0b', '#10b981', '#3b82f6', '#ef4444']
+                                                    }]
+                                                },
+                                                options: { responsive: true, plugins: { legend: { position: 'top' } } }
+                                            });
+                                        } catch (e) {
+                                            console.error('Error rendering device type chart:', e);
+                                        }
                                     </script>
                                 </div>
                                 <div>
                                     <h3 class="text-lg font-semibold mb-4">Screen Type Distribution</h3>
                                     <canvas id="screen-type-chart"></canvas>
                                     <script>
-                                        new Chart(document.getElementById('screen-type-chart'), {
-                                            type: 'pie',
-                                            data: {
-                                                labels: {{ screen_types_keys|tojson }},
-                                                datasets: [{
-                                                    data: {{ screen_types_values|tojson }},
-                                                    backgroundColor: ['#8b5cf6', '#ec4899', '#ef4444']
-                                                }]
-                                            },
-                                            options: { responsive: true, plugins: { legend: { position: 'top' } } }
-                                        });
+                                        try {
+                                            new Chart(document.getElementById('screen-type-chart'), {
+                                                type: 'pie',
+                                                data: {
+                                                    labels: {{ screen_types_keys|tojson }},
+                                                    datasets: [{
+                                                        data: {{ screen_types_values|tojson }},
+                                                        backgroundColor: ['#8b5cf6', '#ec4899', '#ef4444']
+                                                    }]
+                                                },
+                                                options: { responsive: true, plugins: { legend: { position: 'top' } } }
+                                            });
+                                        } catch (e) {
+                                            console.error('Error rendering screen type chart:', e);
+                                        }
                                     </script>
                                 </div>
                             </div>
@@ -1621,6 +1637,9 @@ def poll_clicks():
     try:
         username = session.get('username')
         last_timestamp = float(request.args.get('last_timestamp', 0))
+        if not username:
+            logger.error("No username in session for poll_clicks")
+            return jsonify({"clicks": []}), 401
         if valkey_client:
             try:
                 visitor_ids = valkey_client.zrevrange(f"user:{username}:visitor_log", 0, -1)
@@ -1638,6 +1657,7 @@ def poll_clicks():
                             "app": visitor_data.get('application', 'Not Available')
                         })
                 new_clicks.sort(key=lambda x: x['timestamp'], reverse=True)
+                logger.debug(f"Polled {len(new_clicks)} new clicks for user: {username}")
                 return jsonify({"clicks": new_clicks[:10]})
             except Exception as e:
                 logger.error(f"Valkey error in poll_clicks: {str(e)}")
@@ -1654,6 +1674,9 @@ def poll_clicks():
 def toggle_analytics(url_id):
     try:
         username = session.get('username')
+        if not username:
+            logger.error("No username in session for toggle_analytics")
+            return jsonify({"status": "error", "message": "Unauthorized"}), 401
         if valkey_client:
             key = f"user:{username}:url:{url_id}"
             if not valkey_client.exists(key):
@@ -1676,6 +1699,9 @@ def toggle_analytics(url_id):
 def clear_views(url_id):
     try:
         username = session.get('username')
+        if not username:
+            logger.error("No username in session for clear_views")
+            return redirect(url_for('login'))
         if valkey_client:
             key = f"user:{username}:url:{url_id}"
             if not valkey_client.exists(key):
@@ -1718,17 +1744,21 @@ def clear_views(url_id):
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
+                    <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
             </body>
             </html>
-        """), 500
+        """, error=str(e)), 500
 
 @app.route("/delete_url/<url_id>", methods=["GET"])
 @login_required
 def delete_url(url_id):
     try:
         username = session.get('username')
+        if not username:
+            logger.error("No username in session for delete_url")
+            return redirect(url_for('login'))
         if valkey_client:
             key = f"user:{username}:url:{url_id}"
             if not valkey_client.exists(key):
@@ -1771,18 +1801,22 @@ def delete_url(url_id):
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
+                    <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
             </body>
             </html>
-        """), 500
+        """, error=str(e)), 500
 
 @app.route("/export_visitors", methods=["GET"])
 @login_required
 def export_visitors():
     try:
         username = session.get('username')
-        logger.debug(f"Exporting visitor data for user: {username}, session: {session}")
+        if not username:
+            logger.error("No username in session for export_visitors")
+            return redirect(url_for('login'))
+        logger.debug(f"Exporting visitor data for user: {username}")
         if valkey_client:
             try:
                 visitor_ids = valkey_client.zrevrange(f"user:{username}:visitor_log", 0, -1)
@@ -1897,7 +1931,10 @@ def export_visitors():
 def export(index):
     try:
         username = session.get('username')
-        logger.debug(f"Exporting data for user: {username}, session: {session}")
+        if not username:
+            logger.error("No username in session for export")
+            return redirect(url_for('login'))
+        logger.debug(f"Exporting data for user: {username}, index: {index}")
         if valkey_client:
             try:
                 url_keys = valkey_client.keys(f"user:{username}:url:*")
@@ -2038,7 +2075,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         referer = headers.get("Referer", "")
         session_start = session.get('session_start', int(time.time()))
         session['session_start'] = session_start
-        logger.debug(f"Redirect handler called: username={username}, base_domain={base_domain}, endpoint={endpoint}, "
+        logger.debug(f"Redirect handler: username={username}, endpoint={endpoint}, "
                      f"encrypted_payload={encrypted_payload[:20]}..., path_segment={path_segment}, "
                      f"IP={ip}, User-Agent={user_agent}, URL={request.url}")
 
@@ -2114,8 +2151,24 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             encrypted_payload = urllib.parse.unquote(encrypted_payload)
             logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}...")
         except Exception as e:
-            logger.error(f"Error decoding encrypted_payload: {str(e)}", exc_info=True)
-            abort(400, "Invalid payload format")
+            logger.error(f"Error decoding encrypted_payload: {str(e)}")
+            return render_template_string("""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Invalid Request</title>
+                    <script src="https://cdn.tailwindcss.com"></script>
+                </head>
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Invalid Request</h3>
+                        <p class="text-gray-600">The provided URL is malformed. Please check and try again.</p>
+                    </div>
+                </body>
+                </html>
+            """), 400
 
         payload = None
         for method in ['heap_x3', 'slugstorm', 'pow', 'signed_token']:
@@ -2141,8 +2194,24 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 continue
 
         if not payload:
-            logger.error("All decryption methods failed")
-            abort(400, "Invalid payload")
+            logger.error(f"Failed to decrypt payload: {encrypted_payload[:50]}...")
+            return render_template_string("""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Invalid Request</title>
+                    <script src="https://cdn.tailwindcss.com"></script>
+                </head>
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Invalid Request</h3>
+                        <p class="text-gray-600">The provided URL is invalid or corrupted. Please generate a new link.</p>
+                    </div>
+                </body>
+                </html>
+            """), 400
 
         try:
             data = json.loads(payload)
@@ -2150,14 +2219,62 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             expiry = float(data.get("expiry", float('inf')))
             if not redirect_url or not re.match(r"^https?://", redirect_url):
                 logger.error(f"Invalid redirect URL: {redirect_url}")
-                abort(400, "Invalid redirect URL")
+                return render_template_string("""
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Invalid Request</title>
+                        <script src="https://cdn.tailwindcss.com"></script>
+                    </head>
+                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                            <h3 class="text-lg font-bold mb-4 text-red-600">Invalid Request</h3>
+                            <p class="text-gray-600">The redirect URL is invalid. Please generate a new link.</p>
+                        </div>
+                    </body>
+                    </html>
+                """), 400
             if time.time() > expiry:
                 logger.warning("URL expired")
-                abort(410, "URL has expired")
+                return render_template_string("""
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>URL Expired</title>
+                        <script src="https://cdn.tailwindcss.com"></script>
+                    </head>
+                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                            <h3 class="text-lg font-bold mb-4 text-red-600">URL Expired</h3>
+                            <p class="text-gray-600">This URL has expired. Please generate a new link.</p>
+                        </div>
+                    </body>
+                    </html>
+                """), 410
             logger.debug(f"Parsed payload: redirect_url={redirect_url}")
-        except Exception as e:
-            logger.error(f"Payload parsing error: {str(e)}", exc_info=True)
-            abort(400, "Invalid payload")
+        except json.JSONDecodeError as e:
+            logger.error(f"Payload JSON parsing error: {str(e)}, payload: {payload[:50]}...")
+            return render_template_string("""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Invalid Request</title>
+                    <script src="https://cdn.tailwindcss.com"></script>
+                </head>
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Invalid Request</h3>
+                        <p class="text-gray-600">The provided URL data is corrupted. Please generate a new link.</p>
+                    </div>
+                </body>
+                </html>
+            """), 400
 
         final_url = f"{redirect_url.rstrip('/')}/{path_segment}"
         logger.info(f"Redirecting to {final_url}")

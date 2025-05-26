@@ -2144,9 +2144,3 @@ if __name__ == "__main__":
         logger.error(f"Error starting Flask app: {str(e)}", exc_info=True)
         import sys
         sys.exit(1)
-</xaiArtifact>
-
-### Supporting Files
-To ensure Vercel deployment and the improvements work correctly, include these files:
-
-#### `requirements.txt`

@@ -90,7 +90,7 @@ except Exception as e:
 # Custom Jinja2 filter for datetime
 def datetime_filter(timestamp):
     try:
-        return datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+        return datetime.fromtimestamp(float(timestamp)).strftime('%Y-%m-%d %H:%M:%S')
     except (TypeError, ValueError) as e:
         logger.error(f"Error formatting timestamp: {str(e)}")
         return "Not Available"
@@ -543,7 +543,7 @@ def log_visitor():
         if valkey_client:
             try:
                 valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
-                    "timestamp": timestamp,
+                    "timestamp": str(timestamp),
                     "ip": ip,
                     "country": location['country'],
                     "country_code": location['country_code'],
@@ -565,7 +565,7 @@ def log_visitor():
                     "block_reason": bot_reason if is_bot_flag else "N/A",
                     "referer": referer,
                     "source": 'referral' if referer else 'direct',
-                    "session_duration": session_duration
+                    "session_duration": str(session_duration)
                 })
                 valkey_client.zadd(f"user:{username}:visitor_log", {visitor_id: timestamp})
                 valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
@@ -863,9 +863,9 @@ def dashboard():
                                 "url": generated_url,
                                 "destination": destination_link,
                                 "path_segment": path_segment,
-                                "created": int(time.time()),
-                                "expiry": expiry_timestamp,
-                                "clicks": 0,
+                                "created": str(int(time.time())),
+                                "expiry": str(expiry_timestamp),
+                                "clicks": "0",
                                 "analytics_enabled": "1" if analytics_enabled else "0"
                             })
                             valkey_client.expire(f"user:{username}:url:{url_id}", DATA_RETENTION_DAYS * 86400)
@@ -891,6 +891,7 @@ def dashboard():
         screen_types = {"Touchscreen": 0, "Standard": 0, "Not Available": 0}
         visitor_locations = []
         last_login = "Never"
+        raw_timestamps = []
 
         if valkey_client:
             try:
@@ -936,7 +937,7 @@ def dashboard():
                         click_trends = {}
                         for visit in visit_data:
                             try:
-                                date = datetime.fromtimestamp(visit.get('timestamp', 0)).strftime('%Y-%m-%d')
+                                date = datetime.fromtimestamp(float(visit.get('timestamp', 0))).strftime('%Y-%m-%d')
                                 click_trends[date] = click_trends.get(date, 0) + 1
                             except (KeyError, ValueError) as e:
                                 logger.error(f"Error processing visit timestamp: {str(e)}")
@@ -944,9 +945,9 @@ def dashboard():
                             "url": url_data.get('url', ''),
                             "destination": url_data.get('destination', ''),
                             "path_segment": url_data.get('path_segment', ''),
-                            "created": datetime.fromtimestamp(int(url_data.get('created', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('created') else 'Not Available',
-                            "expiry": datetime.fromtimestamp(int(url_data.get('expiry', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('expiry') else 'Not Available',
-                            "clicks": int(url_data.get('clicks', 0)) if url_data.get('clicks') else 0,
+                            "created": datetime.fromtimestamp(float(url_data.get('created', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('created') else 'Not Available',
+                            "expiry": datetime.fromtimestamp(float(url_data.get('expiry', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('expiry') else 'Not Available',
+                            "clicks": int(url_data.get('clicks', 0)),
                             "analytics_enabled": url_data.get('analytics_enabled', '0') == '1',
                             "visits": visit_data,
                             "human_visits": human_visits,
@@ -979,9 +980,12 @@ def dashboard():
                         if not visitor_data:
                             logger.warning(f"Empty visitor data for ID {visitor_id}")
                             continue
+                        timestamp = float(visitor_data.get('timestamp', 0))
+                        raw_timestamps.append(timestamp)
                         source = 'referral' if visitor_data.get('referer') else 'direct'
                         visitor_entry = {
-                            "timestamp": datetime.fromtimestamp(int(visitor_data.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor_data.get('timestamp') else 'Not Available',
+                            "raw_timestamp": timestamp,
+                            "timestamp": datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S') if timestamp else 'Not Available',
                             "ip": visitor_data.get('ip', 'Not Available'),
                             "country": visitor_data.get('country', 'Not Available'),
                             "country_code": visitor_data.get('country_code', 'N/A'),
@@ -1002,12 +1006,12 @@ def dashboard():
                             "bot_status": visitor_data.get('bot_status', 'Not Available'),
                             "block_reason": visitor_data.get('block_reason', 'N/A'),
                             "source": source,
-                            "session_duration": int(visitor_data.get('session_duration', 0))
+                            "session_duration": int(float(visitor_data.get('session_duration', 0)))
                         }
                         visitors.append(visitor_entry)
                         if visitor_data.get('bot_status') != 'Human':
                             bot_logs.append({
-                                "timestamp": visitor_data.get('timestamp', 'Not Available'),
+                                "timestamp": visitor_data.get('timestamp', '0'),
                                 "ip": visitor_data.get('ip', 'Not Available'),
                                 "block_reason": visitor_data.get('block_reason', 'N/A')
                             })
@@ -1203,7 +1207,7 @@ def dashboard():
                             }).addTo(map);
                             let heatPoints = {{ visitor_locations|tojson }}.map(loc => [loc.lat, loc.lng, 1]);
                             L.heatLayer(heatPoints, { radius: 25 }).addTo(map);
-                            showTab('urls-tab'); // Ensure URLs tab is active by default
+                            showTab('urls-tab');
                         } catch (e) {
                             console.error('Error on page load:', e);
                         }
@@ -1395,7 +1399,7 @@ def dashboard():
                             {% endif %}
                         </div>
                     </div>
-                                        <div id="visitors-tab" class="tab-content hidden">
+                    <div id="visitors-tab" class="tab-content hidden">
                         <div class="bg-white p-8 rounded-xl card">
                             <div class="flex justify-between items-center mb-4">
                                 <h2 class="text-2xl font-bold text-gray-900">Visitor Views</h2>
@@ -1514,9 +1518,7 @@ def dashboard():
                                             },
                                             options: {
                                                 responsive: true,
-                                                plugins: {
-                                                    legend: { position: 'top' }
-                                                }
+                                                plugins: { legend: { position: 'top' } }
                                             }
                                         });
                                     </script>
@@ -1536,9 +1538,7 @@ def dashboard():
                                             },
                                             options: {
                                                 responsive: true,
-                                                plugins: {
-                                                    legend: { position: 'top' }
-                                                }
+                                                plugins: { legend: { position: 'top' } }
                                             }
                                         });
                                     </script>
@@ -1560,9 +1560,7 @@ def dashboard():
                                             },
                                             options: {
                                                 responsive: true,
-                                                plugins: {
-                                                    legend: { position: 'top' }
-                                                }
+                                                plugins: { legend: { position: 'top' } }
                                             }
                                         });
                                     </script>
@@ -1582,9 +1580,7 @@ def dashboard():
                                             },
                                             options: {
                                                 responsive: true,
-                                                plugins: {
-                                                    legend: { position: 'top' }
-                                                }
+                                                plugins: { legend: { position: 'top' } }
                                             }
                                         });
                                     </script>
@@ -1607,7 +1603,7 @@ def dashboard():
            visitor_locations=visitor_locations, total_humans=total_humans, total_bots=total_bots,
            total_bot_detections=total_bot_detections, total_visits=total_visits, last_login=last_login,
            primary_color=primary_color, error=error, valkey_error=valkey_error,
-           latest_timestamp=max([float(v.get('timestamp', 0)) for v in visitors] or [int(time.time())]))
+           latest_timestamp=max(raw_timestamps or [int(time.time())]))
     except Exception as e:
         logger.error(f"Dashboard error for user {username}: {str(e)}", exc_info=True)
         return render_template_string("""
@@ -1652,7 +1648,7 @@ def poll_clicks():
                             "app": visitor_data.get('application', 'Not Available')
                         })
                 new_clicks.sort(key=lambda x: x['timestamp'], reverse=True)
-                return jsonify({"clicks": new_clicks[:10]})  # Limit to 10 latest clicks
+                return jsonify({"clicks": new_clicks[:10]})
             except Exception as e:
                 logger.error(f"Valkey error in poll_clicks: {str(e)}")
                 return jsonify({"clicks": []}), 500
@@ -1696,7 +1692,7 @@ def clear_views(url_id):
                 logger.warning(f"URL {url_id} not found for user {username}")
                 abort(404, "URL not found")
             valkey_client.delete(f"user:{username}:url:{url_id}:visits")
-            valkey_client.hset(key, "clicks", 0)
+            valkey_client.hset(key, "clicks", "0")
             logger.debug(f"Cleared views for URL {url_id}")
             return redirect(url_for('dashboard'))
         else:
@@ -1817,7 +1813,7 @@ def export_visitors():
                 ])
                 for visitor in visitor_data:
                     writer.writerow([
-                        datetime.fromtimestamp(int(visitor.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor.get('timestamp') else 'Not Available',
+                        datetime.fromtimestamp(float(visitor.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor.get('timestamp') else 'Not Available',
                         visitor.get('ip', 'Not Available'),
                         visitor.get('country', 'Not Available'),
                         visitor.get('country_code', 'N/A'),
@@ -1932,7 +1928,7 @@ def export(index):
                 writer.writerow(['Timestamp', 'IP', 'Device Type', 'Screen Type', 'App', 'Type', 'Country', 'Region', 'City'])
                 for visit in visit_data:
                     writer.writerow([
-                        datetime.fromtimestamp(visit.get('timestamp', 0)).strftime('%Y-%m-%d %H:%M:%S') if visit.get('timestamp') else 'Not Available',
+                        datetime.fromtimestamp(float(visit.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visit.get('timestamp') else 'Not Available',
                         visit.get('ip', 'Not Available'),
                         visit.get('device_type', 'Not Available'),
                         visit.get('screen_type', 'Not Available'),
@@ -2078,7 +2074,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 analytics_enabled = valkey_client.hget(f"user:{username}:url:{url_id}", "analytics_enabled") == "1"
                 if analytics_enabled:
                     valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
-                        "timestamp": timestamp,
+                        "timestamp": str(timestamp),
                         "ip": ip,
                         "country": location['country'],
                         "country_code": location['country_code'],
@@ -2100,13 +2096,13 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                         "block_reason": bot_reason if is_bot_flag or asn_blocked else "N/A",
                         "referer": referer,
                         "source": 'referral' if referer else 'direct',
-                        "session_duration": session_duration
+                        "session_duration": str(session_duration)
                     })
                     valkey_client.zadd(f"user:{username}:visitor_log", {visitor_id: timestamp})
                     valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
                     valkey_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
                     valkey_client.lpush(f"user:{username}:url:{url_id}:visits", json.dumps({
-                        "timestamp": timestamp,
+                        "timestamp": str(timestamp),
                         "ip": ip,
                         "device_type": device_type,
                         "screen_type": screen_type,
@@ -2160,7 +2156,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         try:
             data = json.loads(payload)
             redirect_url = data.get("student_link")
-            expiry = data.get("expiry", float('inf'))
+            expiry = float(data.get("expiry", float('inf')))
             if not redirect_url or not re.match(r"^https?://", redirect_url):
                 logger.error(f"Invalid redirect URL: {redirect_url}")
                 abort(400, "Invalid redirect URL")

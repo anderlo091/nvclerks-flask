@@ -1452,7 +1452,7 @@ def dashboard():
                                         });
                                     </script>
                                 </div>
-                                    <div>
+                                                                   <div>
                                         <h3 class="text-lg font-semibold mb-4">Bot vs Human Ratio</h3>
                                         <canvas id=bot-ratio-chart></canvas>
                                         <script>

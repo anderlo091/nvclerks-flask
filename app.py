@@ -1,4 +1,4 @@
-from flask import Flask, request, redirect, render_template_string, abort, url_for, session, jsonify, Response, send_from_directory
+from flask import Flask, request, redirect, render_template_string, abort, url_for, session, jsonify, Response
 from flask_wtf import FlaskForm, CSRFProtect
 from wtforms import StringField, SubmitField, SelectField, BooleanField, HiddenField
 from wtforms.validators import DataRequired, Length, Regexp, URL
@@ -37,9 +37,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.debug("Initializing Flask app")
 
-# Hardcoded configuration values
+# Hardcoded configuration values (TODO: Move to environment variables for production)
 FLASK_SECRET_KEY = "b8f9a3c2d7e4f1a9b0c3d6e8f2a7b4c9"
-WTF_CSRF_SECRET_KEY = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
+WTF_CSRF_SECRET_KEY = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"  # Separate key for CSRF
 ENCRYPTION_KEY = secrets.token_bytes(32)
 HMAC_KEY = secrets.token_bytes(32)
 VALKEY_HOST = "valkey-137d99b9-reign.e.aivencloud.com"
@@ -61,25 +61,6 @@ try:
 except Exception as e:
     logger.error(f"Error setting Flask config: {str(e)}", exc_info=True)
     raise
-
-# Manual security headers
-@app.after_request
-def add_security_headers(response):
-    response.headers['X-Frame-Options'] = 'DENY'
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    response.headers['Content-Security-Policy'] = (
-        "default-src 'self'; "
-        "script-src 'self' https://cdn.tailwindcss.com https://cdn.jsdelivr.net; "
-        "style-src 'self' https://cdn.tailwindcss.com 'unsafe-inline'; "
-        "connect-src 'self'; "
-        "img-src 'self' data:; "
-        "font-src 'self'; "
-        "object-src 'none'; "
-        "base-uri 'self'; "
-        "form-action 'self'"
-    )
-    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
-    return response
 
 # CSRF protection
 csrf = CSRFProtect(app)
@@ -547,6 +528,7 @@ def login_required(f):
             return redirect(url_for('login'))
     return decorated_function
 
+# Dynamic domain handling
 def get_base_domain():
     try:
         host = request.host
@@ -570,7 +552,7 @@ def block_ohio_subdomain():
 @app.before_request
 def log_visitor():
     try:
-        if request.path.startswith(('/static', '/challenge', '/fingerprint', '/denied', '/favicon.ico')):
+        if request.path.startswith(('/static', '/challenge', '/fingerprint', '/denied')):
             return
         username = session.get('username', 'default')
         user_agent = request.headers.get("User-Agent", "")
@@ -627,19 +609,11 @@ def log_visitor():
                 valkey_client.zadd(f"user:{username}:visitor_log", {visitor_id: timestamp})
                 valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
                 valkey_client.zremrangebyrank(f"user:{username}:visitor_log", 0, -1001)
-                logger.debug(f"Logged visitor: {visitor_id} for user: {username}, type: {visit_type}")
+                logger.debug(f"Logged visitor: {visitor_id} for user: {username} at timestamp: {timestamp}")
             except Exception as e:
-                logger.error(f"Valkey error logging visitor {visitor_id}: {str(e)}", exc_info=True)
+                logger.error(f"Valkey error logging visitor: {str(e)}", exc_info=True)
     except Exception as e:
         logger.error(f"Error in log_visitor: {str(e)}", exc_info=True)
-
-@app.route("/favicon.ico")
-def favicon():
-    try:
-        return send_from_directory(os.path.join(app.root_path, 'static'), 'favicon.ico', mimetype='image/vnd.microsoft.icon')
-    except Exception as e:
-        logger.error(f"Error serving favicon: {str(e)}")
-        return "", 404
 
 @app.route("/login", methods=["GET", "POST"])
 @rate_limit(limit=5, per=60)
@@ -711,8 +685,8 @@ def login():
                     };
                 </script>
             </head>
-            <body class=min-h-screen flex items-center justify-center p-4>
-                <div class=container bg-white p-8 rounded-xl shadow-2xl max-w-md w-full>
+            <body class="min-h-screen flex items-center justify-center p-4">
+                <div class="container bg-white p-8 rounded-xl shadow-2xl max-w-md w-full">
                     <h1 class="text-3xl font-extrabold mb-6 text-center text-gray-900">Login</h1>
                     {% if form.errors %}
                         <p class="text-red-600 mb-4 text-center">
@@ -723,7 +697,7 @@ def login():
                             {% endfor %}
                         </p>
                     {% endif %}
-                    <form method=POST class=space-y-5>
+                    <form method="POST" class="space-y-5">
                         {{ form.csrf_token }}
                         {{ form.next_url(value=request.args.get('next', '')) }}
                         <div>
@@ -747,10 +721,10 @@ def login():
                 <title>Internal Server Error</title>
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
-            <body class=min-h-screen bg-gray-100 flex items-center justify-center p-4>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class=text-gray-600>Something went wrong. Please try again later.</p>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
                 </div>
             </body>
             </html>
@@ -777,10 +751,10 @@ def index():
                 <title>Internal Server Error</title>
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
-            <body class=min-h-screen bg-gray-100 flex items-center justify-center p-4>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class=text-gray-600>Something went wrong. Please try again later.</p>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
                 </div>
             </body>
             </html>
@@ -797,11 +771,6 @@ def dashboard():
         username = session['username']
         logger.debug(f"Accessing dashboard for user: {username}, session: {session}")
 
-        # Pagination parameters
-        url_page = int(request.args.get('url_page', 1))
-        visitor_page = int(request.args.get('visitor_page', 1))
-        items_per_page = 10
-
         base_domain = get_base_domain()
         form = GenerateURLForm()
         error = None
@@ -816,6 +785,7 @@ def dashboard():
             analytics_enabled = form.analytics_enabled.data
             expiry = int(form.expiry.data)
 
+            # Additional URL validation
             parsed_url = urllib.parse.urlparse(destination_link)
             if not parsed_url.scheme in ('http', 'https') or not parsed_url.netloc:
                 error = "Invalid URL: Must be a valid http:// or https:// URL"
@@ -878,18 +848,12 @@ def dashboard():
                         return redirect(url_for('dashboard'))
 
         urls = []
-        total_urls = 0
         valkey_error = None
         if valkey_client:
             try:
                 logger.debug(f"Fetching URL keys for user: {username}")
                 url_keys = valkey_client.keys(f"user:{username}:url:*")
-                total_urls = len(url_keys)
-                url_keys = sorted(url_keys, reverse=True)
-                start = max(0, (url_page - 1) * items_per_page)
-                end = start + items_per_page
-                url_keys = url_keys[start:end]
-                logger.debug(f"Found {total_urls} URL keys, displaying {len(url_keys)} for page {url_page}")
+                logger.debug(f"Found {len(url_keys)} URL keys")
                 for key in url_keys:
                     try:
                         url_data = valkey_client.hgetall(key)
@@ -943,9 +907,6 @@ def dashboard():
             valkey_error = "Database unavailable"
 
         visitors = []
-        total_visits = 0
-        total_bot_visits = 0
-        total_human_visits = 0
         bot_logs = []
         traffic_sources = {"direct": 0, "referral": 0, "organic": 0}
         bot_ratio = {"human": 0, "bot": 0}
@@ -953,20 +914,15 @@ def dashboard():
             try:
                 logger.debug(f"Fetching visitor keys for user: {username}")
                 visitor_ids = valkey_client.zrevrange(f"user:{username}:visitor_log", 0, -1)
-                total_visits = len(visitor_ids)
-                start = max(0, (visitor_page - 1) * items_per_page)
-                end = start + items_per_page
-                visitor_ids = visitor_ids[start:end]
-                logger.debug(f"Found {total_visits} visitor IDs, displaying {len(visitor_ids)} for page {visitor_page}")
-                for index, visitor_id in enumerate(visitor_ids, start=start + 1):
+                logger.debug(f"Found {len(visitor_ids)} visitor IDs")
+                for visitor_id in visitor_ids:
                     try:
                         visitor_data = valkey_client.hgetall(f"user:{username}:visitor:{visitor_id}")
                         if not visitor_data:
                             logger.warning(f"Empty visitor data for ID {visitor_id}")
                             continue
                         source = 'referral' if visitor_data.get('referer') else 'direct'
-                        visitor_entry = {
-                            "number": index,
+                        visitors.append({
                             "timestamp": datetime.fromtimestamp(int(visitor_data.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor_data.get('timestamp') else 'Not Available',
                             "ip": visitor_data.get('ip', 'Not Available'),
                             "country": visitor_data.get('country', 'Not Available'),
@@ -989,8 +945,7 @@ def dashboard():
                             "block_reason": visitor_data.get('block_reason', 'N/A'),
                             "source": source,
                             "session_duration": int(visitor_data.get('session_duration', 0))
-                        }
-                        visitors.append(visitor_entry)
+                        })
                         if visitor_data.get('bot_status') != 'Human':
                             bot_logs.append({
                                 "timestamp": visitor_data.get('timestamp', 'Not Available'),
@@ -998,10 +953,8 @@ def dashboard():
                                 "block_reason": visitor_data.get('block_reason', 'N/A')
                             })
                             bot_ratio['bot'] += 1
-                            total_bot_visits += 1
                         else:
                             bot_ratio['human'] += 1
-                            total_human_visits += 1
                         traffic_sources[source] = traffic_sources.get(source, 0) + 1
                     except Exception as e:
                         logger.error(f"Error processing visitor ID {visitor_id}: {str(e)}")
@@ -1028,12 +981,7 @@ def dashboard():
         theme_seed = hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()[:6]
         primary_color = f"#{theme_seed}"
 
-        total_url_pages = (total_urls + items_per_page - 1) // items_per_page
-        total_visitor_pages = (total_visits + items_per_page - 1) // items_per_page
-        url_page_range = range(max(1, url_page - 2), min(total_url_pages + 1, url_page + 3))
-        visitor_page_range = range(max(1, visitor_page - 2), min(total_visitor_pages + 1, visitor_page + 3))
-
-        logger.debug(f"Rendering dashboard for user: {username}, total_visits: {total_visits}, human: {total_human_visits}, bot: {total_bot_visits}")
+        logger.debug(f"Rendering dashboard template for user: {username}")
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -1043,14 +991,16 @@ def dashboard():
                 <meta name="robots" content="noindex, nofollow">
                 <title>Dashboard - {{ username }}</title>
                 <script src="https://cdn.tailwindcss.com"></script>
-                <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.min.js"></script>
+                <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
                 <style>
                     body { background: linear-gradient(to right, #4f46e5, #7c3aed); color: #1f2937; }
                     .container { animation: fadeIn 1s ease-in; }
                     @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
                     .card { transition: all 0.3s; box-shadow: 0 10px 15px rgba(0,0,0,0.1); }
                     .card:hover { transform: translateY(-5px); }
-                    canvas { max-height: 200px !important; }
+                    canvas { max-height: 200px; }
+                    .tab { cursor: pointer; transition: all 0.3s; }
+                    .tab.active { background-color: #4f46e5; color: white; }
                     .table-container { max-height: 400px; overflow-y: auto; }
                     table { width: 100%; border-collapse: collapse; }
                     th, td { padding: 12px; text-align: left; }
@@ -1066,11 +1016,6 @@ def dashboard():
                     .slider:before { position: absolute; content: ""; height: 26px; width: 26px; left: 4px; bottom: 4px; background-color: white; transition: .4s; border-radius: 50%; }
                     input:checked + .slider { background-color: #4f46e5; }
                     input:checked + .slider:before { transform: translateX(26px); }
-                    .pagination { margin-top: 1rem; display: flex; justify-content: center; gap: 0.5rem; }
-                    .pagination a { padding: 0.5rem 1rem; background-color: #e5e7eb; border-radius: 0.5rem; text-decoration: none; color: #1f2937; }
-                    .pagination a:hover { background-color: #d1d5db; }
-                    .pagination a.active { background-color: #4f46e5; color: white; }
-                    .pagination a.disabled { background-color: #f3f4f6; color: #9ca3af; pointer-events: none; }
                 </style>
                 <script>
                     function toggleAnalytics(id) {
@@ -1117,8 +1062,8 @@ def dashboard():
                     }
                 </script>
             </head>
-            <body class=min-h-screen p-4>
-                <div class=container max-w-7xl mx-auto>
+            <body class="min-h-screen p-4">
+                <div class="container max-w-7xl mx-auto">
                     <h1 class="text-4xl font-extrabold mb-8 text-center text-white">Welcome, {{ username }}</h1>
                     {% if form.errors %}
                         <p class="error p-4 mb-4 text-center rounded-lg">
@@ -1141,10 +1086,10 @@ def dashboard():
                         <button class="tab px-4 py-2 bg-white rounded-lg" onclick="showTab('bot-logs-tab')">Bot Logs</button>
                         <button class="tab px-4 py-2 bg-white rounded-lg" onclick="showTab('analytics-tab')">Analytics</button>
                     </div>
-                    <div id=urls-tab class=tab-content>
+                    <div id="urls-tab" class="tab-content">
                         <div class="bg-white p-8 rounded-xl card mb-8">
                             <h2 class="text-2xl font-bold mb-6 text-gray-900">Generate New URL</h2>
-                            <form method=POST class=space-y-5>
+                            <form method="POST" class="space-y-5">
                                 {{ form.csrf_token }}
                                 <div>
                                     <label class="block text-sm font-medium text-gray-700">Subdomain</label>
@@ -1178,23 +1123,23 @@ def dashboard():
                             </form>
                         </div>
                         <div class="bg-white p-8 rounded-xl card">
-                            <h2 class="text-2xl font-bold mb-6 text-gray-900">URL History ({{ total_urls }} Total)</h2>
+                            <h2 class="text-2xl font-bold mb-6 text-gray-900">URL History</h2>
                             {% if urls %}
                                 {% for url in urls %}
                                     <div class="card bg-gray-50 p-6 rounded-lg mb-4">
                                         <h3 class="text-xl font-semibold text-gray-900">{{ url.destination }}</h3>
-                                        <p class=text-gray-600 break-all><strong>URL:</strong> <a href="{{ url.url }}" target=_blank class=text-indigo-600>{{ url.url }}</a></p>
-                                        <p class=text-gray-600><strong>Path Segment:</strong> {{ url.path_segment }}</p>
-                                        <p class=text-gray-600><strong>Created:</strong> {{ url.created }}</p>
-                                        <p class=text-gray-600><strong>Expires:</strong> {{ url.expiry }}</p>
-                                        <p class=text-gray-600><strong>Total Clicks:</strong> {{ url.clicks }}</p>
-                                        <p class=text-gray-600><strong>Human Clicks:</strong> {{ url.human_visits }}</p>
-                                        <p class=text-gray-600><strong>Bot Clicks:</strong> {{ url.bot_visits }}</p>
+                                        <p class="text-gray-600 break-all"><strong>URL:</strong> <a href="{{ url.url }}" target="_blank" class="text-indigo-600">{{ url.url }}</a></p>
+                                        <p class="text-gray-600"><strong>Path Segment:</strong> {{ url.path_segment }}</p>
+                                        <p class="text-gray-600"><strong>Created:</strong> {{ url.created }}</p>
+                                        <p class="text-gray-600"><strong>Expires:</strong> {{ url.expiry }}</p>
+                                        <p class="text-gray-600"><strong>Total Clicks:</strong> {{ url.clicks }}</p>
+                                        <p class="text-gray-600"><strong>Human Clicks:</strong> {{ url.human_visits }}</p>
+                                        <p class="text-gray-600"><strong>Bot Clicks:</strong> {{ url.bot_visits }}</p>
                                         <div class="flex items-center mt-2">
                                             <label class="text-sm font-medium text-gray-700 mr-2">Analytics:</label>
-                                            <label class=toggle-switch>
-                                                <input type=checkbox id="analytics-toggle-{{ loop.index }}" {% if url.analytics_enabled %}checked{% endif %} onchange="toggleAnalyticsSwitch('{{ url.url_id }}', '{{ loop.index }}')">
-                                                <span class=slider></span>
+                                            <label class="toggle-switch">
+                                                <input type="checkbox" id="analytics-toggle-{{ loop.index }}" {% if url.analytics_enabled %}checked{% endif %} onchange="toggleAnalyticsSwitch('{{ url.url_id }}', '{{ loop.index }}')">
+                                                <span class="slider"></span>
                                             </label>
                                         </div>
                                         <div class="mt-2 flex space-x-2">
@@ -1204,7 +1149,7 @@ def dashboard():
                                         </div>
                                         <div id="analytics-{{ loop.index }}" class="hidden mt-4">
                                             <h4 class="text-lg font-semibold text-gray-900">Visitor Analytics</h4>
-                                            <canvas id="chart-{{ loop.index }}" class=mt-4></canvas>
+                                            <canvas id="chart-{{ loop.index }}" class="mt-4"></canvas>
                                             <script>
                                                 new Chart(document.getElementById('chart-{{ loop.index }}'), {
                                                     type: 'line',
@@ -1225,30 +1170,30 @@ def dashboard():
                                                     }
                                                 });
                                             </script>
-                                            <div class=mt-4>
+                                            <div class="mt-4">
                                                 <label class="block text-sm font-medium text-gray-700">Filter by Device</label>
                                                 <select id="filter-device-{{ loop.index }}" onchange="applyFilters('{{ loop.index }}')" class="mt-1 w-full p-3 border rounded-lg">
                                                     <option value="">All</option>
-                                                    <option value=Mobile>Mobile</option>
-                                                    <option value=Tablet>Tablet</option>
-                                                    <option value=Desktop>Desktop</option>
+                                                    <option value="Mobile">Mobile</option>
+                                                    <option value="Tablet">Tablet</option>
+                                                    <option value="Desktop">Desktop</option>
                                                 </select>
                                             </div>
-                                            <div class=mt-4>
+                                            <div class="mt-4">
                                                 <label class="block text-sm font-medium text-gray-700">Filter by Type</label>
                                                 <select id="filter-type-{{ loop.index }}" onchange="applyFilters('{{ loop.index }}')" class="mt-1 w-full p-3 border rounded-lg">
                                                     <option value="">All</option>
-                                                    <option value=Human>Human</option>
-                                                    <option value=Bot>Bot</option>
-                                                    <option value=Mimicry>Mimicry</option>
-                                                    <option value=App>App</option>
+                                                    <option value="Human">Human</option>
+                                                    <option value="Bot">Bot</option>
+                                                    <option value="Mimicry">Mimicry</option>
+                                                    <option value="App">App</option>
                                                 </select>
                                             </div>
                                             <a href="/export/{{ loop.index }}" class="mt-4 inline-block bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export as CSV</a>
-                                            <div class=table-container mt-4>
+                                            <div class="table-container mt-4">
                                                 <table>
                                                     <thead>
-                                                        <tr class=bg-gray-200>
+                                                        <tr class="bg-gray-200">
                                                             <th>Timestamp</th>
                                                             <th>IP</th>
                                                             <th>Device Type</th>
@@ -1280,43 +1225,22 @@ def dashboard():
                                         </div>
                                     </div>
                                 {% endfor %}
-                                <div class=pagination>
-                                    {% if url_page > 1 %}
-                                        <a href="{{ url_for('dashboard', url_page=url_page-1, visitor_page=visitor_page) }}">Previous</a>
-                                    {% else %}
-                                        <a class=disabled>Previous</a>
-                                    {% endif %}
-                                    {% for page in url_page_range %}
-                                        <a href="{{ url_for('dashboard', url_page=page, visitor_page=visitor_page) }}" class="{% if page == url_page %}active{% endif %}">{{ page }}</a>
-                                    {% endfor %}
-                                    {% if url_page < total_url_pages %}
-                                        <a href="{{ url_for('dashboard', url_page=url_page+1, visitor_page=visitor_page) }}">Next</a>
-                                    {% else %}
-                                        <a class=disabled>Next</a>
-                                    {% endif %}
-                                </div>
                             {% else %}
-                                <p class=text-gray-600>No URLs generated yet.</p>
+                                <p class="text-gray-600">No URLs generated yet.</p>
                             {% endif %}
                         </div>
                     </div>
-                    <div id=visitors-tab class="tab-content hidden">
+                    <div id="visitors-tab" class="tab-content hidden">
                         <div class="bg-white p-8 rounded-xl card">
                             <div class="flex justify-between items-center mb-4">
-                                <h2 class="text-2xl font-bold text-gray-900">Visitor Views ({{ total_visits }} Total)</h2>
-                                <button onclick=refreshDashboard() class="refresh-btn bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700">Refresh</button>
-                            </div>
-                            <div class="mb-4 p-4 bg-gray-100 rounded-lg">
-                                <p class="text-gray-800"><strong>Total Visitors:</strong> {{ total_visits }}</p>
-                                <p class="text-gray-800"><strong>Total Human Visitors:</strong> {{ total_human_visits }}</p>
-                                <p class="text-gray-800"><strong>Total Bot Visitors:</strong> {{ total_bot_visits }}</p>
+                                <h2 class="text-2xl font-bold text-gray-900">Visitor Views</h2>
+                                <button onclick="refreshDashboard()" class="refresh-btn bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700">Refresh</button>
                             </div>
                             {% if visitors %}
-                                <div class=table-container>
+                                <div class="table-container">
                                     <table>
                                         <thead>
-                                            <tr class=bg-gray-200>
-                                                <th>#</th>
+                                            <tr class="bg-gray-200">
                                                 <th>Timestamp</th>
                                                 <th>IP</th>
                                                 <th>Country</th>
@@ -1344,7 +1268,6 @@ def dashboard():
                                         <tbody>
                                             {% for visitor in visitors %}
                                                 <tr class="{% if visitor.bot_status != 'Human' %}bot{% endif %}">
-                                                    <td>{{ visitor.number }}</td>
                                                     <td>{{ visitor.timestamp }}</td>
                                                     <td>{{ visitor.ip }}</td>
                                                     <td>{{ visitor.country }}</td>
@@ -1372,119 +1295,99 @@ def dashboard():
                                         </tbody>
                                     </table>
                                 </div>
-                                <div class=pagination>
-                                    {% if visitor_page > 1 %}
-                                        <a href="{{ url_for('dashboard', url_page=url_page, visitor_page=visitor_page-1) }}">Previous</a>
-                                    {% else %}
-                                        <a class=disabled>Previous</a>
-                                    {% endif %}
-                                    {% for page in visitor_page_range %}
-                                        <a href="{{ url_for('dashboard', url_page=url_page, visitor_page=page) }}" class="{% if page == visitor_page %}active{% endif %}">{{ page }}</a>
-                                    {% endfor %}
-                                    {% if visitor_page < total_visitor_pages %}
-                                        <a href="{{ url_for('dashboard', url_page=url_page, visitor_page=visitor_page+1) }}">Next</a>
-                                    {% else %}
-                                        <a class=disabled>Next</a>
-                                    {% endif %}
-                                </div>
-                                <a href=/export_visitors class="mt-4 inline-block bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export Visitors as CSV</a>
+                                <a href="/export_visitors" class="mt-4 inline-block bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export Visitors as CSV</a>
                             {% else %}
-                                <p class=text-gray-600>No visitor data available.</p>
+                                <p class="text-gray-600">No visitor data available.</p>
                             {% endif %}
                         </div>
                     </div>
-                                               <div id=bot-logs-tab class="tab-content hidden">
-                                <div class="bg-white p-8 rounded-xl card">
-                                    <h2 class="text-2xl font-bold mb-6 text-gray-900">Bot Detection Logs</h2>
-                                    {% if bot_logs %}
-                                        <div class=table-container>
-                                            <table>
-                                                <thead>
-                                                    <tr class=bg-gray-200>
-                                                        <th>Timestamp</th>
-                                                        <th>IP</th>
-                                                        <th>Block Reason</th>
-                                                    </tr>
-                                                </thead>
-                                                <tbody>
-                                                    {% for log in bot_logs %}
-                                                        <tr class=bot>
-                                                            <td>{{ log.timestamp|datetime }}</td>
-                                                            <td>{{ log.ip }}</td>
-                                                            <td>{{ log.block_reason }}</td>
-                                                        </tr>
-                                                    {% endfor %}
-                                                </tbody>
-                                            </table>
-                                        </div>
-                                    {% else %}
-                                        <p class=text-gray-600>No bot detections logged.</p>
-                                    {% endif %}
+                    <div id="bot-logs-tab" class="tab-content hidden">
+                        <div class="bg-white p-8 rounded-xl card">
+                            <h2 class="text-2xl font-bold mb-6 text-gray-900">Bot Detection Logs</h2>
+                            {% if bot_logs %}
+                                <div class="table-container">
+                                    <table>
+                                        <thead>
+                                            <tr class="bg-gray-200">
+                                                <th>Timestamp</th>
+                                                <th>IP</th>
+                                                <th>Block Reason</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {% for log in bot_logs %}
+                                                <tr class="bot">
+                                                    <td>{{ log.timestamp|datetime }}</td>
+                                                    <td>{{ log.ip }}</td>
+                                                    <td>{{ log.block_reason }}</td>
+                                                </tr>
+                                            {% endfor %}
+                                        </tbody>
+                                    </table>
                                 </div>
-                            </div>
-                            <div id=analytics-tab class="tab-content hidden">
-                                <div class="bg-white p-8 rounded-xl card">
-                                    <h2 class="text-2xl font-bold mb-6 text-gray-900">Traffic Analytics</h2>
-                                    <div class="grid grid-cols-2 gap-6">
-                                        <div>
-                                            <h3 class="text-lg font-semibold mb-4">Traffic Sources</h3>
-                                            <canvas id=traffic-source-chart></canvas>
-                                            <script>
-                                                new Chart(document.getElementById('traffic-source-chart'), {
-                                                    type: 'pie',
-                                                    data: {
-                                                        labels: {{ traffic_sources_keys|safe }},
-                                                        datasets: [{
-                                                            data: {{ traffic_sources_values|safe }},
-                                                            backgroundColor: ['#4f46e5', '#7c3aed', '#3b82f6']
-                                                        }]
-                                                    },
-                                                    options: {
-                                                        responsive: true,
-                                                        plugins: {
-                                                            legend: { position: 'top' }
-                                                        }
-                                                    }
-                                                });
-                                            </script>
-                                        </div>
-                                        <div>
-                                            <h3 class="text-lg font-semibold mb-4">Bot vs Human Ratio</h3>
-                                            <canvas id=bot-ratio-chart></canvas>
-                                            <script>
-                                                new Chart(document.getElementById('bot-ratio-chart'), {
-                                                    type: 'doughnut',
-                                                    data: {
-                                                        labels: {{ bot_ratio_keys|safe }},
-                                                        datasets: [{
-                                                            data: {{ bot_ratio_values|safe }},
-                                                            backgroundColor: ['#10b981', '#ef4444']
-                                                        }]
-                                                    },
-                                                    options: {
-                                                        responsive: true,
-                                                        plugins: {
-                                                            legend: { position: 'top' }
-                                                        }
-                                                    }
-                                                });
-                                            </script>
-                                        </div>
-                                    </div>
+                            {% else %}
+                                <p class="text-gray-600">No bot detections logged.</p>
+                            {% endif %}
+                        </div>
+                    </div>
+                    <div id="analytics-tab" class="tab-content hidden">
+                        <div class="bg-white p-8 rounded-xl card">
+                            <h2 class="text-2xl font-bold mb-6 text-gray-900">Traffic Analytics</h2>
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <h3 class="text-lg font-semibold mb-4">Traffic Sources</h3>
+                                    <canvas id="traffic-source-chart"></canvas>
+                                    <script>
+                                        new Chart(document.getElementById('traffic-source-chart'), {
+                                            type: 'pie',
+                                            data: {
+                                                labels: {{ traffic_sources_keys|tojson }},
+                                                datasets: [{
+                                                    data: {{ traffic_sources_values|tojson }},
+                                                    backgroundColor: ['#4f46e5', '#7c3aed', '#3b82f6']
+                                                }]
+                                            },
+                                            options: {
+                                                responsive: true,
+                                                plugins: {
+                                                    legend: { position: 'top' }
+                                                }
+                                            }
+                                        });
+                                    </script>
+                                </div>
+                                <div>
+                                    <h3 class="text-lg font-semibold mb-4">Bot vs Human Ratio</h3>
+                                    <canvas id="bot-ratio-chart"></canvas>
+                                    <script>
+                                        new Chart(document.getElementById('bot-ratio-chart'), {
+                                            type: 'doughnut',
+                                            data: {
+                                                labels: {{ bot_ratio_keys|tojson }},
+                                                datasets: [{
+                                                    data: {{ bot_ratio_values|tojson }},
+                                                    backgroundColor: ['#10b981', '#ef4444']
+                                                }]
+                                            },
+                                            options: {
+                                                responsive: true,
+                                                plugins: {
+                                                    legend: { position: 'top' }
+                                                }
+                                            }
+                                        });
+                                    </script>
                                 </div>
                             </div>
                         </div>
-                    </body>
-                    </html>
-                """, username=username, form=form, urls=urls, visitors=visitors, bot_logs=bot_logs,
-                   traffic_sources_keys=traffic_sources_keys, traffic_sources_values=traffic_sources_values,
-                   bot_ratio_keys=bot_ratio_keys, bot_ratio_values=bot_ratio_values,
-                   primary_color=primary_color, error=error, valkey_error=valkey_error,
-                   total_urls=total_urls, total_url_pages=total_url_pages, url_page=url_page,
-                   url_page_range=url_page_range, total_visits=total_visits,
-                   total_bot_visits=total_bot_visits, total_human_visits=total_human_visits,
-                   total_visitor_pages=total_visitor_pages, visitor_page=visitor_page,
-                   visitor_page_range=visitor_page_range)
+                    </div>
+                </div>
+            </body>
+            </html>
+        """, username=username, form=form, urls=urls, visitors=visitors, bot_logs=bot_logs,
+           traffic_sources_keys=traffic_sources_keys, traffic_sources_values=traffic_sources_values,
+           bot_ratio_keys=bot_ratio_keys, bot_ratio_values=bot_ratio_values,
+           primary_color=primary_color, error=error, valkey_error=valkey_error)
     except Exception as e:
         logger.error(f"Dashboard error for user {username}: {str(e)}", exc_info=True)
         return render_template_string("""
@@ -1496,11 +1399,11 @@ def dashboard():
                 <title>Internal Server Error</title>
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
-            <body class=min-h-screen bg-gray-100 flex items-center justify-center p-4>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class=text-gray-600>Something went wrong: {{ error }}</p>
-                    <p class=text-gray-600>Please try again later or contact support.</p>
+                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
+                    <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
             </body>
             </html>
@@ -1562,10 +1465,10 @@ def clear_views(url_id):
                     <title>Error</title>
                     <script src="https://cdn.tailwindcss.com"></script>
                 </head>
-                <body class=min-h-screen bg-gray-100 flex items-center justify-center p-4>
-                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                         <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
-                        <p class=text-gray-600>Database unavailable. Unable to clear views.</p>
+                        <p class="text-gray-600">Database unavailable. Unable to clear views.</p>
                     </div>
                 </body>
                 </html>
@@ -1581,10 +1484,10 @@ def clear_views(url_id):
                 <title>Internal Server Error</title>
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
-            <body class=min-h-screen bg-gray-100 flex items-center justify-center p-4>
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
-                    <p class=text-gray-600>Something went wrong. Please try again later.</p>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
                 </div>
             </body>
             </html>
@@ -1615,10 +1518,10 @@ def delete_url(url_id):
                     <title>Error</title>
                     <script src="https://cdn.tailwindcss.com"></script>
                 </head>
-                <body class=min-h-screen bg-gray-100 flex items-center justify-center p-4>
-                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                         <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
-                        <p class=text-gray-600>Database unavailable. Unable to delete URL.</p>
+                        <p class="text-gray-600">Database unavailable. Unable to delete URL.</p>
                     </div>
                 </body>
                 </html>
@@ -1634,10 +1537,10 @@ def delete_url(url_id):
                 <title>Internal Server Error</title>
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
-            <body class=min-h-screen bg-gray-100 flex items-center justify-center p-4>
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
-                    <p class=text-gray-600>Something went wrong. Please try again later.</p>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
                 </div>
             </body>
             </html>
@@ -1662,14 +1565,13 @@ def export_visitors():
                 output = StringIO()
                 writer = csv.writer(output)
                 writer.writerow([
-                    'Number', 'Timestamp', 'IP', 'Country', 'Country Code', 'Region', 'Region Code',
+                    'Timestamp', 'IP', 'Country', 'Country Code', 'Region', 'Region Code',
                     'City', 'Zip', 'Latitude', 'Longitude', 'ISP', 'Organization',
                     'AS Number', 'Timezone', 'Device Type', 'Screen Type', 'Application',
                     'User Agent', 'Bot Status', 'Block Reason', 'Source', 'Session Duration (s)'
                 ])
-                for index, visitor in enumerate(visitor_data, start=1):
+                for visitor in visitor_data:
                     writer.writerow([
-                        index,
                         datetime.fromtimestamp(int(visitor.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor.get('timestamp') else 'Not Available',
                         visitor.get('ip', 'Not Available'),
                         visitor.get('country', 'Not Available'),
@@ -1711,10 +1613,10 @@ def export_visitors():
                         <title>Error</title>
                         <script src="https://cdn.tailwindcss.com"></script>
                     </head>
-                    <body class=min-h-screen bg-gray-100 flex items-center justify-center p-4>
-                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
+                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                             <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
-                            <p class=text-gray-600>Database unavailable. Unable to export data.</p>
+                            <p class="text-gray-600">Database unavailable. Unable to export data.</p>
                         </div>
                     </body>
                     </html>
@@ -1730,10 +1632,10 @@ def export_visitors():
                     <title>Error</title>
                     <script src="https://cdn.tailwindcss.com"></script>
                 </head>
-                <body class=min-h-screen bg-gray-100 flex items-center justify-center p-4>
-                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                         <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
-                        <p class=text-gray-600>Database unavailable. Unable to export data.</p>
+                        <p class="text-gray-600">Database unavailable. Unable to export data.</p>
                     </div>
                 </body>
                 </html>
@@ -1749,10 +1651,10 @@ def export_visitors():
                 <title>Internal Server Error</title>
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
-            <body class=min-h-screen bg-gray-100 flex items-center justify-center p-4>
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
-                    <p class=text-gray-600>Something went wrong. Please try again later.</p>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
                 </div>
             </body>
             </html>
@@ -1813,10 +1715,10 @@ def export(index):
                         <title>Error</title>
                         <script src="https://cdn.tailwindcss.com"></script>
                     </head>
-                    <body class=min-h-screen bg-gray-100 flex items-center justify-center p-4>
-                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
+                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                             <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
-                            <p class=text-gray-600>Database unavailable. Unable to export data.</p>
+                            <p class="text-gray-600">Database unavailable. Unable to export data.</p>
                         </div>
                     </body>
                     </html>
@@ -1832,10 +1734,10 @@ def export(index):
                     <title>Error</title>
                     <script src="https://cdn.tailwindcss.com"></script>
                 </head>
-                <body class=min-h-screen bg-gray-100 flex items-center justify-center p-4>
-                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                         <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
-                        <p class=text-gray-600>Database unavailable. Unable to export data.</p>
+                        <p class="text-gray-600">Database unavailable. Unable to export data.</p>
                     </div>
                 </body>
                 </html>
@@ -1851,10 +1753,10 @@ def export(index):
                 <title>Internal Server Error</title>
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
-            <body class=min-h-screen bg-gray-100 flex items-center justify-center p-4>
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
-                    <p class=text-gray-600>Something went wrong. Please try again later.</p>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
                 </div>
             </body>
             </html>
@@ -1908,6 +1810,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                      f"encrypted_payload={encrypted_payload[:20]}..., path_segment={path_segment}, "
                      f"IP={ip}, User-Agent={user_agent}, URL={request.url}")
 
+        # Bot detection
         is_bot_flag, bot_reason = is_bot(user_agent, headers, ip, request.path)
         asn_blocked = check_asn(ip)
         device_info = get_device_info(user_agent)
@@ -1968,7 +1871,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                         "location": location
                     }))
                     valkey_client.expire(f"user:{username}:url:{url_id}:visits", DATA_RETENTION_DAYS * 86400)
-                    logger.debug(f"Logged visit for URL ID: {url_id}, visitor: {visitor_id}, type: {visit_type}")
+                    logger.debug(f"Logged visit for URL ID: {url_id}, visitor: {visitor_id}")
             except Exception as e:
                 logger.error(f"Valkey error logging visit: {str(e)}", exc_info=True)
 
@@ -1976,6 +1879,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             logger.warning(f"Blocked redirect for IP {ip}: {bot_reason}")
             abort(403, f"Access denied: {bot_reason}")
 
+        # Decrypt payload
         try:
             encrypted_payload = urllib.parse.unquote(encrypted_payload)
             logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}...")
@@ -2039,11 +1943,11 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 <title>Internal Server Error</title>
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
-            <body class=min-h-screen bg-gray-100 flex items-center justify-center p-4>
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
-                    <p class=text-gray-600>Something went wrong: {{ error }}</p>
-                    <p class=text-gray-600>Please try again later or contact support.</p>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
+                    <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
             </body>
             </html>
@@ -2070,11 +1974,11 @@ def redirect_handler_no_subdomain(endpoint, encrypted_payload, path_segment):
                 <title>Internal Server Error</title>
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
-            <body class=min-h-screen bg-gray-100 flex items-center justify-center p-4>
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
-                    <p class=text-gray-600>Something went wrong: {{ error }}</p>
-                    <p class=text-gray-600>Please try again later or contact support.</p>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
+                    <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
             </body>
             </html>
@@ -2093,10 +1997,10 @@ def denied():
                 <title>Access Denied</title>
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
-            <body class=min-h-screen bg-gray-100 flex items-center justify-center p-4>
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Access Denied</h3>
-                    <p class=text-gray-600>Suspicious activity detected.</p>
+                    <p class="text-gray-600">Suspicious activity detected.</p>
                 </div>
             </body>
             </html>
@@ -2117,11 +2021,11 @@ def catch_all(path):
             <title>Not Found</title>
             <script src="https://cdn.tailwindcss.com"></script>
         </head>
-        <body class=min-h-screen bg-gray-100 flex items-center justify-center p-4>
-            <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
+        <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+            <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                 <h3 class="text-lg font-bold mb-4 text-red-600">Not Found</h3>
-                <p class=text-gray-600>The requested URL was not found on the server.</p>
-                <p class=text-gray-600>Please check your spelling and try again.</p>
+                <p class="text-gray-600">The requested URL was not found on the server.</p>
+                <p class="text-gray-600">Please check your spelling and try again.</p>
             </div>
         </body>
         </html>

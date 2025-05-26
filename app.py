@@ -1,4 +1,4 @@
-from flask import Flask, request, redirect, render_template_string, abort, url_for, session, jsonify, Response, send_from_directory
+from flask import Flask, request, redirect, render_template_string, abort, url_for, session, jsonify, Response
 from flask_wtf import FlaskForm, CSRFProtect
 from wtforms import StringField, SubmitField, SelectField, BooleanField, HiddenField
 from wtforms.validators import DataRequired, Length, Regexp, URL
@@ -24,8 +24,6 @@ from dotenv import load_dotenv
 import csv
 from io import StringIO
 import bleach
-from celery import Celery
-from redis import Redis
 
 app = Flask(__name__)
 load_dotenv()
@@ -41,7 +39,7 @@ logger.debug("Initializing Flask app")
 
 # Hardcoded configuration values (TODO: Move to environment variables for production)
 FLASK_SECRET_KEY = "b8f9a3c2d7e4f1a9b0c3d6e8f2a7b4c9"
-WTF_CSRF_SECRET_KEY = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
+WTF_CSRF_SECRET_KEY = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"  # Separate key for CSRF
 ENCRYPTION_KEY = secrets.token_bytes(32)
 HMAC_KEY = secrets.token_bytes(32)
 VALKEY_HOST = "valkey-137d99b9-reign.e.aivencloud.com"
@@ -66,24 +64,6 @@ except Exception as e:
 
 # CSRF protection
 csrf = CSRFProtect(app)
-
-# Celery configuration
-app.config['CELERY_BROKER_URL'] = f'redis://{VALKEY_USERNAME}:{VALKEY_PASSWORD}@{VALKEY_HOST}:{VALKEY_PORT}/0'
-app.config['CELERY_RESULT_BACKEND'] = f'redis://{VALKEY_USERNAME}:{VALKEY_PASSWORD}@{VALKEY_HOST}:{VALKEY_PORT}/0'
-celery = Celery(app.name, broker=app.config['CELERY_BROKER_URL'], backend=app.config['CELERY_RESULT_BACKEND'])
-celery.conf.update(
-    task_serializer='json',
-    accept_content=['json'],
-    result_serializer='json',
-    timezone='UTC',
-    enable_utc=True,
-    task_track_started=True,
-    task_time_limit=30,
-    task_soft_time_limit=25,
-    task_acks_late=True,
-    task_default_retry_delay=60,
-    task_max_retries=3
-)
 
 # WTForms for login and URL generation
 class LoginForm(FlaskForm):
@@ -146,177 +126,6 @@ except Exception as e:
     logger.error(f"Valkey connection failed: {str(e)}", exc_info=True)
     valkey_client = None
 
-# Celery tasks
-@celery.task(bind=True, max_retries=3)
-def async_get_geoip(self, ip):
-    try:
-        cached = valkey_client.get(f"geoip:{ip}") if valkey_client else None
-        if cached:
-            logger.debug(f"GeoIP cache hit for IP {ip}")
-            return json.loads(cached)
-        url = f"http://ip-api.com/json/{ip}?fields=66846719"
-        for attempt in range(2):
-            response = requests.get(url, timeout=5)
-            response.raise_for_status()
-            data = response.json()
-            if data.get('status') == 'success':
-                result = {
-                    "country": data.get('country', 'Not Available'),
-                    "country_code": data.get('countryCode', 'N/A'),
-                    "region": data.get('regionName', 'Not Available'),
-                    "region_code": data.get('region', 'N/A'),
-                    "city": data.get('city', 'Not Available'),
-                    "zip": data.get('zip', 'N/A'),
-                    "latitude": float(data.get('lat', 0.0)),
-                    "longitude": float(data.get('lon', 0.0)),
-                    "timezone": data.get('timezone', 'UTC'),
-                    "isp": data.get('isp', 'Not Available'),
-                    "organization": data.get('org', 'Not Available'),
-                    "as_number": data.get('as', 'N/A')
-                }
-                if valkey_client:
-                    try:
-                        valkey_client.setex(f"geoip:{ip}", 86400, json.dumps(result))
-                        logger.debug(f"Cached GeoIP for IP {ip}")
-                    except Exception as e:
-                        logger.error(f"Valkey error caching GeoIP: {str(e)}")
-                return result
-            logger.warning(f"ip-api.com attempt {attempt + 1} failed for IP {ip}: {data.get('message', 'No data')}")
-            time.sleep(1)
-        logger.info(f"Falling back to freegeoip.app for IP {ip}")
-        fallback_url = f"https://freegeoip.app/json/{ip}"
-        response = requests.get(fallback_url, timeout=5)
-        response.raise_for_status()
-        data = response.json()
-        if data.get('ip'):
-            result = {
-                "country": data.get('country_name', 'Not Available'),
-                "country_code": data.get('country_code', 'N/A'),
-                "region": data.get('region_name', 'Not Available'),
-                "region_code": data.get('region_code', 'N/A'),
-                "city": data.get('city', 'Not Available'),
-                "zip": data.get('zip_code', 'N/A'),
-                "latitude": float(data.get('latitude', 0.0)),
-                "longitude": float(data.get('longitude', 0.0)),
-                "timezone": data.get('time_zone', 'UTC'),
-                "isp": 'Not Available',
-                "organization": 'Not Available',
-                "as_number": 'N/A'
-            }
-            if valkey_client:
-                try:
-                    valkey_client.setex(f"geoip:{ip}", 86400, json.dumps(result))
-                    logger.debug(f"Cached GeoIP for IP {ip}")
-                except Exception as e:
-                    logger.error(f"Valkey error caching GeoIP: {str(e)}")
-            return result
-        logger.error(f"Both ip-api.com and freegeoip.app failed for IP {ip}")
-        return {
-            "country": "Not Available",
-            "country_code": "N/A",
-            "region": "Not Available",
-            "region_code": "N/A",
-            "city": "Not Available",
-            "zip": "N/A",
-            "latitude": 0.0,
-            "longitude": 0.0,
-            "timezone": "UTC",
-            "isp": "Not Available",
-            "organization": "Not Available",
-            "as_number": "N/A"
-        }
-    except Exception as e:
-        logger.error(f"GeoIP task failed for IP {ip}: {str(e)}")
-        try:
-            self.retry(countdown=60)
-        except self.MaxRetriesExceededError:
-            logger.error(f"Max retries exceeded for GeoIP task for IP {ip}")
-            return {
-                "country": "Not Available",
-                "country_code": "N/A",
-                "region": "Not Available",
-                "region_code": "N/A",
-                "city": "Not Available",
-                "zip": "N/A",
-                "latitude": 0.0,
-                "longitude": 0.0,
-                "timezone": "UTC",
-                "isp": "Not Available",
-                "organization": "Not Available",
-                "as_number": "N/A"
-            }
-
-@celery.task(bind=True, max_retries=3)
-def async_log_visitor(self, username, visitor_id, timestamp, ip, location, device_type, screen_type, app, user_agent, visit_type, bot_reason, referer, session_duration):
-    try:
-        if valkey_client:
-            pipeline = valkey_client.pipeline()
-            pipeline.hset(f"user:{username}:visitor:{visitor_id}", mapping={
-                "timestamp": timestamp,
-                "ip": ip,
-                "country": location['country'],
-                "country_code": location['country_code'],
-                "region": location['region'],
-                "region_code": location['region_code'],
-                "city": location['city'],
-                "zip": location['zip'],
-                "latitude": str(location['latitude']),
-                "longitude": str(location['longitude']),
-                "isp": location['isp'],
-                "organization": location['organization'],
-                "as_number": location['as_number'],
-                "timezone": location['timezone'],
-                "device_type": device_type,
-                "screen_type": screen_type,
-                "application": app,
-                "user_agent": user_agent,
-                "bot_status": visit_type,
-                "block_reason": bot_reason,
-                "referer": referer,
-                "source": 'referral' if referer else 'direct',
-                "session_duration": session_duration
-            })
-            pipeline.zadd(f"user:{username}:visitor_log", {visitor_id: timestamp})
-            pipeline.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
-            pipeline.zremrangebyrank(f"user:{username}:visitor_log", 0, -1001)
-            pipeline.execute()
-            logger.debug(f"Logged visitor: {visitor_id} for user: {username} via Celery")
-        else:
-            logger.warning("Valkey unavailable, skipping visitor logging")
-    except Exception as e:
-        logger.error(f"Visitor logging task failed for visitor {visitor_id}: {str(e)}")
-        try:
-            self.retry(countdown=60)
-        except self.MaxRetriesExceededError:
-            logger.error(f"Max retries exceeded for visitor logging task for visitor {visitor_id}")
-
-@celery.task(bind=True, max_retries=3)
-def async_log_url_visit(self, username, url_id, visitor_id, timestamp, ip, device_type, screen_type, app, visit_type, location):
-    try:
-        if valkey_client:
-            pipeline = valkey_client.pipeline()
-            pipeline.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
-            pipeline.lpush(f"user:{username}:url:{url_id}:visits", json.dumps({
-                "timestamp": timestamp,
-                "ip": ip,
-                "device_type": device_type,
-                "screen_type": screen_type,
-                "app": app,
-                "type": visit_type,
-                "location": location
-            }))
-            pipeline.expire(f"user:{username}:url:{url_id}:visits", DATA_RETENTION_DAYS * 86400)
-            pipeline.execute()
-            logger.debug(f"Logged URL visit for URL ID: {url_id}, visitor: {visitor_id} via Celery")
-        else:
-            logger.warning("Valkey unavailable, skipping URL visit logging")
-    except Exception as e:
-        logger.error(f"URL visit logging task failed for URL {url_id}: {str(e)}")
-        try:
-            self.retry(countdown=60)
-        except self.MaxRetriesExceededError:
-            logger.error(f"Max retries exceeded for URL visit logging task for URL {url_id}")
-
 # Custom Jinja2 filter for datetime
 def datetime_filter(timestamp):
     try:
@@ -351,14 +160,13 @@ def is_bot(user_agent, headers, ip, endpoint):
             return True, "Headless browser"
         if valkey_client:
             try:
-                pipeline = valkey_client.pipeline()
-                pipeline.get(f"bot_check:{ip}")
-                pipeline.incr(f"bot_check:{ip}")
-                pipeline.expire(f"bot_check:{ip}", 60)
-                count, _, _ = pipeline.execute()
+                key = f"bot_check:{ip}"
+                count = valkey_client.get(key)
                 if count and int(count) > 10:
                     logger.warning(f"Blocked IP {ip}: Rapid requests")
                     return True, "Rapid requests"
+                valkey_client.incr(key)
+                valkey_client.expire(key, 60)
             except Exception as e:
                 logger.error(f"Valkey error in bot check: {str(e)}", exc_info=True)
         if ip.startswith(('162.249.', '5.62.', '84.39.')):
@@ -382,6 +190,83 @@ def check_asn(ip):
     except Exception as e:
         logger.error(f"ASN check failed for IP {ip}: {str(e)}", exc_info=True)
         return False
+
+def get_geoip(ip):
+    try:
+        url = f"http://ip-api.com/json/{ip}?fields=66846719"
+        for attempt in range(2):
+            response = requests.get(url, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            if data.get('status') == 'success':
+                logger.debug(f"ip-api.com success for IP {ip}")
+                return {
+                    "country": data.get('country', 'Not Available'),
+                    "country_code": data.get('countryCode', 'N/A'),
+                    "region": data.get('regionName', 'Not Available'),
+                    "region_code": data.get('region', 'N/A'),
+                    "city": data.get('city', 'Not Available'),
+                    "zip": data.get('zip', 'N/A'),
+                    "latitude": float(data.get('lat', 0.0)),
+                    "longitude": float(data.get('lon', 0.0)),
+                    "timezone": data.get('timezone', 'UTC'),
+                    "isp": data.get('isp', 'Not Available'),
+                    "organization": data.get('org', 'Not Available'),
+                    "as_number": data.get('as', 'N/A')
+                }
+            logger.warning(f"ip-api.com attempt {attempt + 1} failed for IP {ip}: {data.get('message', 'No data')}")
+            time.sleep(1)
+        logger.info(f"Falling back to freegeoip.app for IP {ip}")
+        fallback_url = f"https://freegeoip.app/json/{ip}"
+        response = requests.get(fallback_url, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        if data.get('ip'):
+            return {
+                "country": data.get('country_name', 'Not Available'),
+                "country_code": data.get('country_code', 'N/A'),
+                "region": data.get('region_name', 'Not Available'),
+                "region_code": data.get('region_code', 'N/A'),
+                "city": data.get('city', 'Not Available'),
+                "zip": data.get('zip_code', 'N/A'),
+                "latitude": float(data.get('latitude', 0.0)),
+                "longitude": float(data.get('longitude', 0.0)),
+                "timezone": data.get('time_zone', 'UTC'),
+                "isp": 'Not Available',
+                "organization": 'Not Available',
+                "as_number": 'N/A'
+            }
+        logger.error(f"Both ip-api.com and freegeoip.app failed for IP {ip}")
+        return {
+            "country": "Not Available",
+            "country_code": "N/A",
+            "region": "Not Available",
+            "region_code": "N/A",
+            "city": "Not Available",
+            "zip": "N/A",
+            "latitude": 0.0,
+            "longitude": 0.0,
+            "timezone": "UTC",
+            "isp": "Not Available",
+            "organization": "Not Available",
+            "as_number": "N/A"
+        }
+    except Exception as e:
+        logger.error(f"GeoIP lookup failed for IP {ip}: {str(e)}", exc_info=True)
+        return {
+            "country": "Not Available",
+            "country_code": "N/A",
+            "region": "Not Available",
+            "region_code": "N/A",
+            "city": "Not Available",
+            "zip": "N/A",
+            "latitude": 0.0,
+            "longitude": 0.0,
+            "timezone": "UTC",
+            "isp": "Not Available",
+            "organization": "Not Available",
+            "as_number": "N/A"
+        }
 
 def get_device_info(user_agent_string):
     try:
@@ -435,17 +320,15 @@ def rate_limit(limit=5, per=60):
                     logger.warning("Valkey unavailable, skipping rate limit")
                     return f(*args, **kwargs)
                 key = f"rate_limit:{ip}:{f.__name__}"
-                pipeline = valkey_client.pipeline()
-                pipeline.get(key)
-                pipeline.incr(key)
-                pipeline.expire(key, per)
-                current, _, _ = pipeline.execute()
+                current = valkey_client.get(key)
                 if current is None:
+                    valkey_client.setex(key, per, 1)
                     logger.debug(f"Rate limit set for {ip}: 1/{limit}")
                 elif int(current) >= limit:
                     logger.warning(f"Rate limit exceeded for IP: {ip}")
                     abort(429, "Too Many Requests")
                 else:
+                    valkey_client.incr(key)
                     logger.debug(f"Rate limit incremented for {ip}: {int(current)+1}/{limit}")
                 return f(*args, **kwargs)
             except Exception as e:
@@ -621,8 +504,8 @@ def get_valid_usernames():
         usernames = [bleach.clean(line.strip()) for line in response.text.splitlines() if line.strip()]
         if valkey_client:
             try:
-                valkey_client.setex("usernames", 86400, json.dumps(usernames))  # Cache for 24 hours
-                logger.debug("Cached usernames in Valkey for 24 hours")
+                valkey_client.setex("usernames", 3600, json.dumps(usernames))
+                logger.debug("Cached usernames in Valkey")
             except Exception as e:
                 logger.error(f"Valkey error caching usernames: {str(e)}")
         logger.debug(f"Fetched {len(usernames)} usernames from GitHub")
@@ -645,6 +528,7 @@ def login_required(f):
             return redirect(url_for('login'))
     return decorated_function
 
+# Dynamic domain handling
 def get_base_domain():
     try:
         host = request.host
@@ -668,7 +552,7 @@ def block_ohio_subdomain():
 @app.before_request
 def log_visitor():
     try:
-        if request.path.startswith(('/static', '/challenge', '/fingerprint', '/denied', '/favicon.ico')):
+        if request.path.startswith(('/static', '/challenge', '/fingerprint', '/denied')):
             return
         username = session.get('username', 'default')
         user_agent = request.headers.get("User-Agent", "")
@@ -690,41 +574,46 @@ def log_visitor():
         elif app != "Not Available" and app != device_info['application']:
             visit_type = "App"
 
-        # Asynchronous GeoIP lookup
-        location = async_get_geoip.apply_async(args=[ip]).get(timeout=5) if not is_bot_flag else {
-            "country": "Not Available",
-            "country_code": "N/A",
-            "region": "Not Available",
-            "region_code": "N/A",
-            "city": "Not Available",
-            "zip": "N/A",
-            "latitude": 0.0,
-            "longitude": 0.0,
-            "timezone": "UTC",
-            "isp": "Not Available",
-            "organization": "Not Available",
-            "as_number": "N/A"
-        }
-
+        location = get_geoip(ip)
         session_duration = int(time.time()) - session_start
         timestamp = int(time.time())
         visitor_id = hashlib.sha256(f"{ip}{timestamp}".encode()).hexdigest()
 
-        # Asynchronous visitor logging
-        async_log_visitor.apply_async(args=[
-            username, visitor_id, timestamp, ip, location, device_type, screen_type, app,
-            user_agent, visit_type, bot_reason if is_bot_flag else "N/A", referer, session_duration
-        ])
+        if valkey_client:
+            try:
+                valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
+                    "timestamp": timestamp,
+                    "ip": ip,
+                    "country": location['country'],
+                    "country_code": location['country_code'],
+                    "region": location['region'],
+                    "region_code": location['region_code'],
+                    "city": location['city'],
+                    "zip": location['zip'],
+                    "latitude": str(location['latitude']),
+                    "longitude": str(location['longitude']),
+                    "isp": location['isp'],
+                    "organization": location['organization'],
+                    "as_number": location['as_number'],
+                    "timezone": location['timezone'],
+                    "device_type": device_type,
+                    "screen_type": screen_type,
+                    "application": app,
+                    "user_agent": user_agent,
+                    "bot_status": visit_type,
+                    "block_reason": bot_reason if is_bot_flag else "N/A",
+                    "referer": referer,
+                    "source": 'referral' if referer else 'direct',
+                    "session_duration": session_duration
+                })
+                valkey_client.zadd(f"user:{username}:visitor_log", {visitor_id: timestamp})
+                valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
+                valkey_client.zremrangebyrank(f"user:{username}:visitor_log", 0, -1001)
+                logger.debug(f"Logged visitor: {visitor_id} for user: {username} at timestamp: {timestamp}")
+            except Exception as e:
+                logger.error(f"Valkey error logging visitor: {str(e)}", exc_info=True)
     except Exception as e:
         logger.error(f"Error in log_visitor: {str(e)}", exc_info=True)
-
-@app.route("/favicon.ico")
-def favicon():
-    try:
-        return send_from_directory(os.path.join(app.root_path, 'static'), 'favicon.ico', mimetype='image/vnd.microsoft.icon')
-    except Exception as e:
-        logger.error(f"Error serving favicon: {str(e)}")
-        return "", 404
 
 @app.route("/login", methods=["GET", "POST"])
 @rate_limit(limit=5, per=60)
@@ -896,6 +785,7 @@ def dashboard():
             analytics_enabled = form.analytics_enabled.data
             expiry = int(form.expiry.data)
 
+            # Additional URL validation
             parsed_url = urllib.parse.urlparse(destination_link)
             if not parsed_url.scheme in ('http', 'https') or not parsed_url.netloc:
                 error = "Invalid URL: Must be a valid http:// or https:// URL"
@@ -1108,7 +998,9 @@ def dashboard():
                     @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
                     .card { transition: all 0.3s; box-shadow: 0 10px 15px rgba(0,0,0,0.1); }
                     .card:hover { transform: translateY(-5px); }
-                    canvas { max-height: 200px !important; }
+                    canvas { max-height: 200px; }
+                    .tab { cursor: pointer; transition: all 0.3s; }
+                    .tab.active { background-color: #4f46e5; color: white; }
                     .table-container { max-height: 400px; overflow-y: auto; }
                     table { width: 100%; border-collapse: collapse; }
                     th, td { padding: 12px; text-align: left; }
@@ -1463,29 +1355,28 @@ def dashboard():
                                             }
                                         });
                                     </script>
-                                                                   </div>
-                                    <div>
-                                        <h3 class="text-lg font-semibold mb-4">Bot vs Human Ratio</h3>
-                                        <canvas id="bot-ratio-chart"></canvas>
-                                        <script>
-                                            new Chart(document.getElementById('bot-ratio-chart'), {
-                                                type: 'doughnut',
-                                                data: {
-                                                    labels: {{ bot_ratio_keys|tojson }},
-                                                    datasets: [{
-                                                        data: {{ bot_ratio_values|tojson }},
-                                                        backgroundColor: ['#10b981', '#ef4444']
-                                                    }]
-                                                },
-                                                options: {
-                                                    responsive: true,
-                                                    plugins: {
-                                                        legend: { position: 'top' }
-                                                    }
+                                </div>
+                                <div>
+                                    <h3 class="text-lg font-semibold mb-4">Bot vs Human Ratio</h3>
+                                    <canvas id="bot-ratio-chart"></canvas>
+                                    <script>
+                                        new Chart(document.getElementById('bot-ratio-chart'), {
+                                            type: 'doughnut',
+                                            data: {
+                                                labels: {{ bot_ratio_keys|tojson }},
+                                                datasets: [{
+                                                    data: {{ bot_ratio_values|tojson }},
+                                                    backgroundColor: ['#10b981', '#ef4444']
+                                                }]
+                                            },
+                                            options: {
+                                                responsive: true,
+                                                plugins: {
+                                                    legend: { position: 'top' }
                                                 }
-                                            });
-                                        </script>
-                                    </div>
+                                            }
+                                        });
+                                    </script>
                                 </div>
                             </div>
                         </div>
@@ -1575,7 +1466,7 @@ def clear_views(url_id):
                     <script src="https://cdn.tailwindcss.com"></script>
                 </head>
                 <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                         <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
                         <p class="text-gray-600">Database unavailable. Unable to clear views.</p>
                     </div>
@@ -1594,8 +1485,8 @@ def clear_views(url_id):
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
                     <p class="text-gray-600">Something went wrong. Please try again later.</p>
                 </div>
             </body>
@@ -1628,7 +1519,7 @@ def delete_url(url_id):
                     <script src="https://cdn.tailwindcss.com"></script>
                 </head>
                 <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                         <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
                         <p class="text-gray-600">Database unavailable. Unable to delete URL.</p>
                     </div>
@@ -1647,8 +1538,8 @@ def delete_url(url_id):
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
                     <p class="text-gray-600">Something went wrong. Please try again later.</p>
                 </div>
             </body>
@@ -1723,7 +1614,7 @@ def export_visitors():
                         <script src="https://cdn.tailwindcss.com"></script>
                     </head>
                     <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
+                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                             <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
                             <p class="text-gray-600">Database unavailable. Unable to export data.</p>
                         </div>
@@ -1742,7 +1633,7 @@ def export_visitors():
                     <script src="https://cdn.tailwindcss.com"></script>
                 </head>
                 <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                         <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
                         <p class="text-gray-600">Database unavailable. Unable to export data.</p>
                     </div>
@@ -1761,8 +1652,8 @@ def export_visitors():
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
                     <p class="text-gray-600">Something went wrong. Please try again later.</p>
                 </div>
             </body>
@@ -1825,7 +1716,7 @@ def export(index):
                         <script src="https://cdn.tailwindcss.com"></script>
                     </head>
                     <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
+                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                             <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
                             <p class="text-gray-600">Database unavailable. Unable to export data.</p>
                         </div>
@@ -1844,7 +1735,7 @@ def export(index):
                     <script src="https://cdn.tailwindcss.com"></script>
                 </head>
                 <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                         <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
                         <p class="text-gray-600">Database unavailable. Unable to export data.</p>
                     </div>
@@ -1863,8 +1754,8 @@ def export(index):
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
                     <p class="text-gray-600">Something went wrong. Please try again later.</p>
                 </div>
             </body>
@@ -1932,36 +1823,57 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         elif app != "Not Available" and app != device_info['application']:
             visit_type = "App"
 
-        # Asynchronous GeoIP lookup
-        location = async_get_geoip.apply_async(args=[ip]).get(timeout=5) if not is_bot_flag else {
-            "country": "Not Available",
-            "country_code": "N/A",
-            "region": "Not Available",
-            "region_code": "N/A",
-            "city": "Not Available",
-            "zip": "N/A",
-            "latitude": 0.0,
-            "longitude": 0.0,
-            "timezone": "UTC",
-            "isp": "Not Available",
-            "organization": "Not Available",
-            "as_number": "N/A"
-        }
-
+        location = get_geoip(ip)
         session_duration = int(time.time()) - session_start
         timestamp = int(time.time())
         visitor_id = hashlib.sha256(f"{ip}{timestamp}".encode()).hexdigest()
 
         url_id = hashlib.sha256(request.url.encode()).hexdigest()
-        if valkey_client and not is_bot_flag:
+        if valkey_client:
             try:
                 analytics_enabled = valkey_client.hget(f"user:{username}:url:{url_id}", "analytics_enabled") == "1"
                 if analytics_enabled:
-                    async_log_url_visit.apply_async(args=[
-                        username, url_id, visitor_id, timestamp, ip, device_type, screen_type, app, visit_type, location
-                    ])
+                    valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
+                        "timestamp": timestamp,
+                        "ip": ip,
+                        "country": location['country'],
+                        "country_code": location['country_code'],
+                        "region": location['region'],
+                        "region_code": location['region_code'],
+                        "city": location['city'],
+                        "zip": location['zip'],
+                        "latitude": str(location['latitude']),
+                        "longitude": str(location['longitude']),
+                        "isp": location['isp'],
+                        "organization": location['organization'],
+                        "as_number": location['as_number'],
+                        "timezone": location['timezone'],
+                        "device_type": device_type,
+                        "screen_type": screen_type,
+                        "application": app,
+                        "user_agent": user_agent,
+                        "bot_status": visit_type,
+                        "block_reason": bot_reason if is_bot_flag or asn_blocked else "N/A",
+                        "referer": referer,
+                        "source": 'referral' if referer else 'direct',
+                        "session_duration": session_duration
+                    })
+                    valkey_client.zadd(f"user:{username}:visitor_log", {visitor_id: timestamp})
+                    valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
+                    valkey_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
+                    valkey_client.lpush(f"user:{username}:url:{url_id}:visits", json.dumps({
+                        "timestamp": timestamp,
+                        "ip": ip,
+                        "device_type": device_type,
+                        "screen_type": screen_type,
+                        "app": app,
+                        "type": visit_type,
+                        "location": location
+                    }))
+                    valkey_client.expire(f"user:{username}:url:{url_id}:visits", DATA_RETENTION_DAYS * 86400)
+                    logger.debug(f"Logged visit for URL ID: {url_id}, visitor: {visitor_id}")
             except Exception as e:
-                logger.error(f"Valkey error in redirect_handler: {str(e)}", exc_info=True)
+                logger.error(f"Valkey error logging visit: {str(e)}", exc_info=True)
 
         if is_bot_flag or asn_blocked:
             logger.warning(f"Blocked redirect for IP {ip}: {bot_reason}")
@@ -2032,8 +1944,8 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
                     <p class="text-gray-600">Something went wrong: {{ error }}</p>
                     <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
@@ -2063,8 +1975,8 @@ def redirect_handler_no_subdomain(endpoint, encrypted_payload, path_segment):
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
                     <p class="text-gray-600">Something went wrong: {{ error }}</p>
                     <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
@@ -2086,7 +1998,7 @@ def denied():
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Access Denied</h3>
                     <p class="text-gray-600">Suspicious activity detected.</p>
                 </div>
@@ -2110,7 +2022,7 @@ def catch_all(path):
             <script src="https://cdn.tailwindcss.com"></script>
         </head>
         <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-            <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
+            <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                 <h3 class="text-lg font-bold mb-4 text-red-600">Not Found</h3>
                 <p class="text-gray-600">The requested URL was not found on the server.</p>
                 <p class="text-gray-600">Please check your spelling and try again.</p>

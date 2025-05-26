@@ -745,11 +745,12 @@ def login():
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
+                    <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
             </body>
             </html>
-        """), 500
+        """, error=str(e)), 500
 
 @app.route("/", methods=["GET"])
 @rate_limit(limit=5, per=60)
@@ -775,21 +776,22 @@ def index():
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
+                    <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
             </body>
             </html>
-        """), 500
+        """, error=str(e)), 500
 
 @app.route("/dashboard", methods=["GET", "POST"])
 @login_required
 @rate_limit(limit=5, per=60)
 def dashboard():
     try:
-        if 'username' not in session:
-            logger.error("Session missing username, redirecting to login")
+        username = session.get('username')
+        if not username:
+            logger.error("No username in session, redirecting to login")
             return redirect(url_for('login'))
-        username = session['username']
         logger.debug(f"Accessing dashboard for user: {username}, session: {session}")
 
         base_domain = get_base_domain()
@@ -1399,7 +1401,7 @@ def dashboard():
                             {% endif %}
                         </div>
                     </div>
-                    <div id="visitors-tab" class="tab-content hidden">
+                                       <div id="visitors-tab" class="tab-content hidden">
                         <div class="bg-white p-8 rounded-xl card">
                             <div class="flex justify-between items-center mb-4">
                                 <h2 class="text-2xl font-bold text-gray-900">Visitor Views</h2>
@@ -1516,10 +1518,7 @@ def dashboard():
                                                     backgroundColor: ['#4f46e5', '#7c3aed', '#3b82f6']
                                                 }]
                                             },
-                                            options: {
-                                                responsive: true,
-                                                plugins: { legend: { position: 'top' } }
-                                            }
+                                            options: { responsive: true, plugins: { legend: { position: 'top' } } }
                                         });
                                     </script>
                                 </div>
@@ -1536,10 +1535,7 @@ def dashboard():
                                                     backgroundColor: ['#10b981', '#ef4444']
                                                 }]
                                             },
-                                            options: {
-                                                responsive: true,
-                                                plugins: { legend: { position: 'top' } }
-                                            }
+                                            options: { responsive: true, plugins: { legend: { position: 'top' } } }
                                         });
                                     </script>
                                 </div>
@@ -1558,10 +1554,7 @@ def dashboard():
                                                     backgroundColor: ['#f59e0b', '#10b981', '#3b82f6', '#ef4444']
                                                 }]
                                             },
-                                            options: {
-                                                responsive: true,
-                                                plugins: { legend: { position: 'top' } }
-                                            }
+                                            options: { responsive: true, plugins: { legend: { position: 'top' } } }
                                         });
                                     </script>
                                 </div>
@@ -1578,10 +1571,7 @@ def dashboard():
                                                     backgroundColor: ['#8b5cf6', '#ec4899', '#ef4444']
                                                 }]
                                             },
-                                            options: {
-                                                responsive: true,
-                                                plugins: { legend: { position: 'top' } }
-                                            }
+                                            options: { responsive: true, plugins: { legend: { position: 'top' } } }
                                         });
                                     </script>
                                 </div>
@@ -1629,7 +1619,7 @@ def dashboard():
 @login_required
 def poll_clicks():
     try:
-        username = session['username']
+        username = session.get('username')
         last_timestamp = float(request.args.get('last_timestamp', 0))
         if valkey_client:
             try:
@@ -1663,7 +1653,7 @@ def poll_clicks():
 @login_required
 def toggle_analytics(url_id):
     try:
-        username = session['username']
+        username = session.get('username')
         if valkey_client:
             key = f"user:{username}:url:{url_id}"
             if not valkey_client.exists(key):
@@ -1685,7 +1675,7 @@ def toggle_analytics(url_id):
 @login_required
 def clear_views(url_id):
     try:
-        username = session['username']
+        username = session.get('username')
         if valkey_client:
             key = f"user:{username}:url:{url_id}"
             if not valkey_client.exists(key):
@@ -1738,7 +1728,7 @@ def clear_views(url_id):
 @login_required
 def delete_url(url_id):
     try:
-        username = session['username']
+        username = session.get('username')
         if valkey_client:
             key = f"user:{username}:url:{url_id}"
             if not valkey_client.exists(key):
@@ -1791,7 +1781,7 @@ def delete_url(url_id):
 @login_required
 def export_visitors():
     try:
-        username = session['username']
+        username = session.get('username')
         logger.debug(f"Exporting visitor data for user: {username}, session: {session}")
         if valkey_client:
             try:
@@ -1895,21 +1885,21 @@ def export_visitors():
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
+                    <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
             </body>
             </html>
-        """), 500
+        """, error=str(e)), 500
 
 @app.route("/export/<int:index>", methods=["GET"])
 @login_required
 def export(index):
     try:
-        username = session['username']
+        username = session.get('username')
         logger.debug(f"Exporting data for user: {username}, session: {session}")
         if valkey_client:
             try:
-                logger.debug(f"Fetching URL keys for export, user: {username}")
                 url_keys = valkey_client.keys(f"user:{username}:url:*")
                 if index <= 0 or index > len(url_keys):
                     logger.warning(f"Invalid export index {index} for user {username}")
@@ -1997,11 +1987,12 @@ def export(index):
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
+                    <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
             </body>
             </html>
-        """), 500
+        """, error=str(e)), 500
 
 @app.route("/challenge", methods=["POST"])
 def challenge():

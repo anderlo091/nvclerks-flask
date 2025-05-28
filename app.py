@@ -137,7 +137,7 @@ def datetime_filter(timestamp):
 app.jinja_env.filters['datetime'] = datetime_filter
 
 # Bot detection patterns
-BOT_PATTERNS = ["googlebot", "bingbot", "yandex", "duckduckbot peninsula", "curl/", "wget/", "headless"]
+BOT_PATTERNS = ["googlebot", "bingbot", "yandex", "duckduckbot", "curl/", "wget/", "headless"]
 
 def is_bot(user_agent, headers, ip, endpoint):
     try:
@@ -291,8 +291,18 @@ def get_device_info(user_agent_string):
         if "Outlook" in user_agent_string:
             app = "Outlook"
         return {
-            "device_type": deviceсил
-}
+            "device_type": device_type,
+            "screen_type": screen_type,
+            "application": app
+        }
+    except Exception as e:
+        logger.error(f"Device info parsing failed for UA {user_agent_string}: {str(e)}")
+        return {
+            "device_type": "Not Available",
+            "screen_type": "Not Available",
+            "application": "Not Available"
+        }
+
 def rate_limit(limit=5, per=60):
     def decorator(f):
         @wraps(f)
@@ -528,7 +538,6 @@ def login_required(f):
             return redirect(url_for('login'))
     return decorated_function
 
-# Dynamic domain handling
 def get_base_domain():
     try:
         host = request.host
@@ -1230,7 +1239,7 @@ def dashboard():
                         </div>
                     </div>
                     <div id="visitors-tab" class="tab-content hidden">
-                        <div class="bg-white p-8 rounded-xl card">
+                        <div class="visitors-tab hidden">
                             <div class="flex justify-between items-center mb-4">
                                 <h2 class="text-2xl font-bold text-gray-900">Visitor Views</h2>
                                 <button onclick="refreshDashboard()" class="refresh-btn bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700">Refresh</button>
@@ -1250,13 +1259,13 @@ def dashboard():
                                                 <th>Zip</th>
                                                 <th>Latitude</th>
                                                 <th>Longitude</th>
-                                                <th>ISP</th>
-                                                <th>Organization</th>
-                                                <th>AS Number</th>
-                                                <th>Timezone</th>
-                                                <th>Device Type</th>
-                                                <th>Screen Type</th>
-                                                <th>Application</th>
+                                                <th>IAdmin</th>
+                                                <th>SOrganization</th>
+                                                <th>S Number</th>
+                                                    <th>Timezone</th>
+                                                    <th>Device Type</th>
+<th>Screen Type</th>
+<th>Application</th>
                                                 <th>User Agent</th>
                                                 <th>Bot Status</th>
                                                 <th>Block Reason</th>
@@ -1265,10 +1274,10 @@ def dashboard():
                                             </tr>
                                         </thead>
                                         <tbody>
-                                            {% for visitor in visitors %}
+                                            {% for visitor in visits %}
                                                 <tr class="{% if visitor.bot_status != 'Human' %}bot{% endif %}">
                                                     <td>{{ visitor.timestamp }}</td>
-                                                    <td>{{ visitor.ip }}</td>
+                                                    <td>{{ visitor.id }}</td>
                                                     <td>{{ visitor.country }}</td>
                                                     <td>{{ visitor.country_code }}</td>
                                                     <td>{{ visitor.region }}</td>
@@ -1419,7 +1428,7 @@ def toggle_analytics(url_id):
             logger.warning(f"Missing CSRF token for toggle_analytics: {url_id}")
             return jsonify({"status": "error", "message": "CSRF token required"}), 403
         form = GenerateURLForm(csrf_token=data['csrf_token'])
-        if not form.validate_csrf_token(form.csrf_token):
+        if not form.validate_csrf_token():
             logger.warning(f"Invalid CSRF token for toggle_analytics: {url_id}")
             return jsonify({"status": "error", "message": "Invalid CSRF token"}), 403
         if valkey_client:
@@ -1473,7 +1482,7 @@ def clear_views(url_id):
                 </html>
             """), 500
     except Exception as e:
-        logger.error(f"Error in clear_views: {str(e)}", exc_info=True)
+        logger.error(f"Error in clear_views: {str(e)})", exc_info=True)
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -1483,7 +1492,7 @@ def clear_views(url_id):
                 <title>Internal Server Error</title>
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
-            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+            <class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
                     <p class="text-gray-600">Something went wrong. Please try again later.</p>
@@ -1492,58 +1501,59 @@ def clear_views(url_id):
             </html>
         """), 500
 
-@app.route("/delete_url/<url_id>", methods=["GET"])
-@login_required
-def delete_url(url_id):
-    try:
-        username = session['username']
-        if valkey_client:
-            key = f"user:{username}:url:{url_id}"
-            if not valkey_client.exists(key):
-                logger.warning(f"URL {url_id} not found for user {username}")
-                abort(404, "URL not found")
-            valkey_client.delete(key)
-            valkey_client.delete(f"user:{username}:url:{url_id}:visits")
-            logger.debug(f"Deleted URL {url_id}")
-            return redirect(url_for('dashboard'))
-        else:
-            logger.warning("Valkey unavailable for delete_url")
+    @app.route("/delete_url/<url_id>", methods=["GET"])
+    @login_required
+    def delete_url(url_id):
+        try:
+            username = session['username']
+            if valkey_client:
+                key = f"user:{username}:url/{url_id}"
+                if not valkey_client.exists(key):
+                    logger.warning(f"URL {url_id} not found for user {username}")
+                    abort(404, "URL not found")
+                valkey_client.delete(key)
+                valkey_client.delete(f"user:{username}:url:{url_id}:visits")
+                logger.debug(f"Deleted URL {url_id}")
+                return redirect(url_for('dashboard'))
+            else:
+                logger.warning("Valkey unavailable for delete_url")
+                return render_template_string(
+                    """
+                   <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Error</title>
+                        <script src="https://cdn.tailwindcss.com"></script>
+                    </head>
+                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                            <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                            <p class="text-gray-600">Database unavailable. Unable to delete URL.</p>
+                        </div>
+                    </body>
+                    </html>
+                """), 500
+        except Exception as e:
+            logger.error(f"Error in delete_url: {str(e)}", exc_info=True)
             return render_template_string("""
                 <!DOCTYPE html>
                 <html lang="en">
                 <head>
                     <meta charset="UTF-8">
                     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <title>Error</title>
+                    <title>Internal Server Error</title>
                     <script src="https://cdn.tailwindcss.com"></script>
                 </head>
                 <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                     <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                        <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
-                        <p class="text-gray-600">Database unavailable. Unable to delete URL.</p>
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                        <p class="text-gray-600">Something went wrong. Please try again later.</p>
                     </div>
                 </body>
                 </html>
             """), 500
-    except Exception as e:
-        logger.error(f"Error in delete_url: {str(e)}", exc_info=True)
-        return render_template_string("""
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Internal Server Error</title>
-                <script src="https://cdn.tailwindcss.com"></script>
-            </head>
-            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
-                </div>
-            </body>
-            </html>
-        """), 500
 
 @app.route("/export_visitors", methods=["GET"])
 @login_required
@@ -1809,7 +1819,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                      f"encrypted_payload={encrypted_payload[:20]}..., path_segment={path_segment}, "
                      f"IP={ip}, User-Agent={user_agent}, URL={request.url}")
 
-        # Bot detection
         is_bot_flag, bot_reason = is_bot(user_agent, headers, ip, request.path)
         asn_blocked = check_asn(ip)
         device_info = get_device_info(user_agent)
@@ -1878,7 +1887,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             logger.warning(f"Blocked redirect for IP {ip}: {bot_reason}")
             abort(403, f"Access denied: {bot_reason}")
 
-        # Decrypt payload
         try:
             encrypted_payload = urllib.parse.unquote(encrypted_payload)
             logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}...")
@@ -1887,7 +1895,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             abort(400, "Invalid payload format")
 
         payload = None
-        # Prioritize slugstorm to handle flexible slugs
         methods = ['slugstorm', 'heap_x3', 'pow', 'signed_token']
         for method in methods:
             try:

@@ -292,7 +292,7 @@ def get_device_info(user_agent_string):
             app = "Outlook"
         return {
             "device_type": deviceсил
-
+}
 def rate_limit(limit=5, per=60):
     def decorator(f):
         @wraps(f)

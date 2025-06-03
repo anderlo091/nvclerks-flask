@@ -123,15 +123,15 @@ try:
     valkey_client.ping()
     logger.debug("Valkey connection established successfully")
 except Exception as e:
-    logger.error(f"Error syncing Valkey connection failed: {str(e)}"): {e}, exc_info=True)
+    logger.error(f"Valkey connection failed: {str(e)}", exc_info=True)
     valkey_client = None
 
 # Custom Jinja2 filter for datetime
 def datetime_filter(timestamp):
     try:
         return datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
-    except Exception as e:
-        logger.error(f"Error formatting timestamp: {str(e)}"")
+    except (TypeError, ValueError) as e:
+        logger.error(f"Error formatting timestamp: {str(e)}")
         return "Not Available"
 
 app.jinja_env.filters['datetime'] = datetime_filter
@@ -620,7 +620,7 @@ def login():
                 logger.debug(f"Redirecting to {next_url}")
                 return redirect(next_url)
             logger.warning(f"Invalid login attempt: {username}")
-            form.username.errors.append("Invalid username. Please try again.")
+            form.username.errors.append("Invalid username")
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -641,16 +641,16 @@ def login():
                         for (let i = 0; i < 1000; i++) challenge += Math.random();
                         fetch('/challenge', {
                             method: 'POST',
-                            headers={'Content-Type': 'application/json' },
+                            headers: {'Content-Type': 'application/json'},
                             body: JSON.stringify({ challenge })
                         }).then(response => {
                             if (!response.ok) {
                                 console.error('Challenge failed:', response.status);
-                                setTimeout(sendChallenge, 1000);
+                            setTimeout(() => sendChallenge(), 1000);
                             }
                         }).catch(error => {
                             console.error('Challenge error:', error);
-                            setTimeout(sendChallenge, 1000);
+                            setTimeout(() => sendChallenge(), 1000);
                         });
                     }
                     function getCanvasFingerprint() {
@@ -665,7 +665,7 @@ def login():
                         sendChallenge();
                         fetch('/fingerprint', {
                             method: 'POST',
-                            headers={'Content-Type': 'application/json' },
+                            headers: {'Content-Type': 'application/json'},
                             body: JSON.stringify({ fingerprint: getCanvasFingerprint() })
                         }).catch(error => console.error('Fingerprint error:', error));
                     };
@@ -678,7 +678,7 @@ def login():
                         <p class="text-red-600 mb-4 text-center">
                             {% for field, errors in form.errors.items() %}
                                 {% for error in errors %}
-                                    {{ error }}<br>
+                                    {{ error }}<br/>
                                 {% endfor %}
                             {% endfor %}
                         </p>
@@ -716,7 +716,7 @@ def login():
             </html>
         """), 500
 
-@app.route("/", methods=["GET'])
+@app.route("/", methods=["GET"])
 @rate_limit(limit=5, per=60)
 def index():
     try:
@@ -738,7 +738,7 @@ def index():
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
                     <p class="text-gray-600">Something went wrong. Please try again later.</p>
                 </div>
@@ -896,8 +896,8 @@ def dashboard():
         if valkey_client:
             try:
                 logger.debug(f"Fetching visitor keys for user: {username}")
-                visitor_ids = valkey_client.zrevrange(f"{user}:{username}:visitor_log", 0, -1)
-                logger.debug(f"{Found } {len(visitor_ids)} visitor IDs")
+                visitor_ids = valkey_client.zrevrange(f"user:{username}:visitor_log", 0, -1)
+                logger.debug(f"Found {len(visitor_ids)} visitor IDs")
                 if not visitor_ids:
                     logger.warning(f"No visitor IDs found for user: {username}")
                 for visitor_id in visitor_ids:
@@ -916,25 +916,25 @@ def dashboard():
                             "region_code": visitor_data.get('region_code', 'N/A'),
                             "city": visitor_data.get('city', 'Not Available'),
                             "zip": visitor_data.get('zip', 'N/A'),
-                            "latitude": float(visitor_data.get('latitude', 0))),
-                            "longitude": float(visitor_data.get('longitude', 0))),
-                            "isp": visitor_data.get('isp', 'N/A'),
+                            "latitude": float(visitor_data.get('latitude', 0.0)),
+                            "longitude": float(visitor_data.get('longitude', 0.0)),
+                            "isp": visitor_data.get('isp', 'Not Available'),
                             "organization": visitor_data.get('organization', 'Not Available'),
                             "as_number": visitor_data.get('as_number', 'N/A'),
                             "timezone": visitor_data.get('timezone', 'UTC'),
-                            "device_type": visitor_data.get('device_type', 'N/A'),
-                            "screen_type": visitor_data.get('screen_type', 'N/A'),
-                            "application": visitor_data.get('application', 'N/A'),
-                            "user_agent": visitor_data.get('user_agent', 'N/A'),
-                            "bot_status": visitor_data.get('bot_status', 'N/A'),
+                            "device_type": visitor_data.get('device_type', 'Not Available'),
+                            "screen_type": visitor_data.get('screen_type', 'Not Available'),
+                            "application": visitor_data.get('application', 'Not Available'),
+                            "user_agent": visitor_data.get('user_agent', 'Not Available'),
+                            "bot_status": visitor_data.get('bot_status', 'Not Available'),
                             "block_reason": visitor_data.get('block_reason', 'N/A'),
                             "source": source,
-                            "session_duration": int(visitor_data.get('session_duration', 0)))
+                            "session_duration": int(visitor_data.get('session_duration', 0))
                         }
                         visitors.append(visitor_entry)
                         if visitor_data.get('bot_status') != 'Human':
                             bot_logs.append({
-                                "timestamp": visitor_data.get('timestamp', 'N/A'),
+                                "timestamp": visitor_data.get('timestamp', 'Not Available'),
                                 "ip": visitor_data.get('ip', 'Not Available'),
                                 "block_reason": visitor_data.get('block_reason', 'N/A')
                             })
@@ -943,9 +943,9 @@ def dashboard():
                             bot_ratio['human'] += 1
                         traffic_sources[source] = traffic_sources.get(source, 0) + 1
                     except Exception as e:
-                        logger.error(f"Error processing visitor ID {visitor_id}: {str(e)}", exc_info=True)
+                        logger.error(f"Error processing visitor ID {visitor_id}: {str(e)}")
             except Exception as e:
-                logger.error(f"Valkey error fetching visitors: {str(e)}", exc_info=True)
+                logger.error(f"Valkey error fetching visitors: {str(e)}")
                 valkey_error = "Unable to fetch visitor data due to database error"
         else:
             logger.warning("Valkey unavailable, cannot fetch visitors")
@@ -958,7 +958,7 @@ def dashboard():
             bot_ratio_values = list(bot_ratio.values())
             logger.debug(f"Traffic sources: {traffic_sources}, Bot ratio: {bot_ratio}")
         except Exception as e:
-            logger.error(f"Error preparing chart data: {str(e)}", exc_info=True)
+            logger.error(f"Error preparing chart data: {str(e)}")
             traffic_sources_keys = ["direct", "referral", "organic"]
             traffic_sources_values = [0, 0, 0]
             bot_ratio_keys = ["human", "bot"]
@@ -1032,7 +1032,7 @@ def dashboard():
                     function toggleAnalyticsSwitch(urlId, index) {
                         fetch('/toggle_analytics/' + urlId, {
                             method: 'POST',
-                            headers: {'Content-Type': 'application/json' },
+                            headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ csrf_token: "{{ form.csrf_token._value() }}" })
                         }).then(response => {
                             if (response.ok) {
@@ -1055,8 +1055,8 @@ def dashboard():
                         <p class="error p-4 mb-4 text-center rounded-lg">
                             {% for field, errors in form.errors.items() %}
                                 {% for error in errors %}
-                                    {{ error }}<br>
-                                {% endfor %}
+                                {{ error }}<br>
+                            {% endfor %}
                             {% endfor %}
                         </p>
                     {% endif %}
@@ -1082,7 +1082,7 @@ def dashboard():
                                     {{ form.subdomain(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
                                 </div>
                                 <div>
-                                    <label class="block text-sm font-medium text-gray-700">Randomstring1</label>
+                                    <label class="block text-sm font-medium text-gray-700">Name</label>
                                     {{ form.randomstring1(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
                                 </div>
                                 <div>
@@ -1131,7 +1131,7 @@ def dashboard():
                                         <div class="mt-2 flex space-x-2">
                                             <button onclick="toggleAnalytics('{{ loop.index }}')" class="bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700">Toggle Analytics</button>
                                             <a href="/clear_views/{{ url.url_id }}" class="bg-yellow-600 text-white px-4 py-2 rounded-lg hover:bg-yellow-700" onclick="return confirm('Are you sure you want to clear all views for this URL?')">Clear Views</a>
-                                            <a href="/delete_url/{{ url.url_id }}" class="bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700">Delete URL</a>
+                                            <a href="/delete_url/{{ url.url_id }}" class="bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700" onclick="return confirm('Are you sure you want to delete this URL?')">Delete URL</a>
                                         </div>
                                         <div id="analytics-{{ loop.index }}" class="hidden mt-4">
                                             <h4 class="text-lg font-semibold text-gray-900">Visitor Analytics</h4>
@@ -1286,7 +1286,7 @@ def dashboard():
                                 <p class="text-gray-600">No visitor data available.</p>
                             {% endif %}
                         </div>
-</div>
+                    </div>
                     <div id="bot-logs-tab" class="tab-content hidden">
                         <div class="bg-white p-8 rounded-xl card">
                             <h2 class="text-2xl font-bold mb-6 text-gray-900">Bot Detection Logs</h2>
@@ -1920,7 +1920,23 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
 
         if not payload:
             logger.error(f"All decryption methods failed for payload: {encrypted_payload[:50]}...")
-            abort(400, "Invalid payload")
+            return render_template_string("""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Invalid Link</title>
+                    <script src="https://cdn.tailwindcss.com"></script>
+                </head>
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Invalid Link</h3>
+                        <p class="text-gray-600">The link is invalid or has expired. Please contact support.</p>
+                    </div>
+                </body>
+                </html>
+            """), 400
 
         try:
             data = json.loads(payload)

@@ -123,15 +123,15 @@ try:
     valkey_client.ping()
     logger.debug("Valkey connection established successfully")
 except Exception as e:
-    logger.error(f"Valkey connection failed: {str(e)}", exc_info=True)
+    logger.error(f"Error syncing Valkey connection failed: {str(e)}"): {e}, exc_info=True)
     valkey_client = None
 
 # Custom Jinja2 filter for datetime
 def datetime_filter(timestamp):
     try:
         return datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
-    except (TypeError, ValueError) as e:
-        logger.error(f"Error formatting timestamp: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error formatting timestamp: {str(e)}"")
         return "Not Available"
 
 app.jinja_env.filters['datetime'] = datetime_filter
@@ -448,34 +448,6 @@ def decrypt_slugstorm(encrypted):
         logger.error(f"SlugStorm decryption error: {str(e)}", exc_info=True)
         raise ValueError("Invalid payload")
 
-def encrypt_pow(payload):
-    try:
-        iv = secrets.token_bytes(16)
-        cipher = Cipher(algorithms.ChaCha20(ENCRYPTION_KEY, iv), backend=default_backend())
-        encryptor = cipher.encryptor()
-        data = payload.encode()
-        ciphertext = encryptor.update(data) + encryptor.finalize()
-        result = base64.urlsafe_b64encode(iv + ciphertext).decode()
-        logger.debug(f"PoW encrypted payload: {result[:20]}...")
-        return result
-    except Exception as e:
-        logger.error(f"PoW encryption error: {str(e)}", exc_info=True)
-        raise ValueError("Encryption failed")
-
-def decrypt_pow(encrypted):
-    try:
-        encrypted = base64.urlsafe_b64decode(encrypted)
-        iv = encrypted[:16]
-        ciphertext = encrypted[16:]
-        cipher = Cipher(algorithms.ChaCha20(ENCRYPTION_KEY, iv), backend=default_backend())
-        decryptor = cipher.decryptor()
-        result = (decryptor.update(ciphertext) + decryptor.finalize()).decode()
-        logger.debug(f"PoW decrypted payload: {result[:50]}...")
-        return result
-    except Exception as e:
-        logger.error(f"PoW decryption error: {str(e)}", exc_info=True)
-        raise ValueError("Invalid payload")
-
 def encrypt_signed_token(payload):
     try:
         data = payload.encode()
@@ -669,7 +641,7 @@ def login():
                         for (let i = 0; i < 1000; i++) challenge += Math.random();
                         fetch('/challenge', {
                             method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
+                            headers={'Content-Type': 'application/json' },
                             body: JSON.stringify({ challenge })
                         }).then(response => {
                             if (!response.ok) {
@@ -693,7 +665,7 @@ def login():
                         sendChallenge();
                         fetch('/fingerprint', {
                             method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
+                            headers={'Content-Type': 'application/json' },
                             body: JSON.stringify({ fingerprint: getCanvasFingerprint() })
                         }).catch(error => console.error('Fingerprint error:', error));
                     };
@@ -744,7 +716,7 @@ def login():
             </html>
         """), 500
 
-@app.route("/", methods=["GET"])
+@app.route("/", methods=["GET'])
 @rate_limit(limit=5, per=60)
 def index():
     try:
@@ -766,7 +738,7 @@ def index():
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-md w-full text-center">
                     <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
                     <p class="text-gray-600">Something went wrong. Please try again later.</p>
                 </div>
@@ -808,7 +780,7 @@ def dashboard():
                 base64_email = base64email
                 path_segment = f"{randomstring1}{base64_email}{randomstring2}"
                 endpoint = generate_random_string(8)
-                encryption_methods = ['heap_x3', 'slugstorm', 'pow', 'signed_token']
+                encryption_methods = ['heap_x3', 'slugstorm', 'signed_token']
                 method = secrets.choice(encryption_methods)
                 fingerprint = generate_fingerprint()
                 expiry_timestamp = int(time.time()) + expiry
@@ -825,8 +797,6 @@ def dashboard():
                         encrypted_payload = encrypt_heap_x3(payload, fingerprint)
                     elif method == 'slugstorm':
                         encrypted_payload = encrypt_slugstorm(payload)
-                    elif method == 'pow':
-                        encrypted_payload = encrypt_pow(payload)
                     else:
                         encrypted_payload = encrypt_signed_token(payload)
                 except Exception as e:
@@ -901,7 +871,7 @@ def dashboard():
                             "path_segment": url_data.get('path_segment', ''),
                             "created": datetime.fromtimestamp(int(url_data.get('created', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('created') else 'Not Available',
                             "expiry": datetime.fromtimestamp(int(url_data.get('expiry', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('expiry') else 'Not Available',
-                            "clicks": int(url_data.get('clicks', 0)) if url_data.get('clicks') else 0,
+                            "clicks": int(url_data.get('clicks', 0)),
                             "analytics_enabled": url_data.get('analytics_enabled', '0') == '1',
                             "visits": visit_data,
                             "human_visits": human_visits,
@@ -926,8 +896,8 @@ def dashboard():
         if valkey_client:
             try:
                 logger.debug(f"Fetching visitor keys for user: {username}")
-                visitor_ids = valkey_client.zrevrange(f"user:{username}:visitor_log", 0, -1)
-                logger.debug(f"Found {len(visitor_ids)} visitor IDs")
+                visitor_ids = valkey_client.zrevrange(f"{user}:{username}:visitor_log", 0, -1)
+                logger.debug(f"{Found } {len(visitor_ids)} visitor IDs")
                 if not visitor_ids:
                     logger.warning(f"No visitor IDs found for user: {username}")
                 for visitor_id in visitor_ids:
@@ -946,25 +916,25 @@ def dashboard():
                             "region_code": visitor_data.get('region_code', 'N/A'),
                             "city": visitor_data.get('city', 'Not Available'),
                             "zip": visitor_data.get('zip', 'N/A'),
-                            "latitude": float(visitor_data.get('latitude', 0.0)),
-                            "longitude": float(visitor_data.get('longitude', 0.0)),
-                            "isp": visitor_data.get('isp', 'Not Available'),
+                            "latitude": float(visitor_data.get('latitude', 0))),
+                            "longitude": float(visitor_data.get('longitude', 0))),
+                            "isp": visitor_data.get('isp', 'N/A'),
                             "organization": visitor_data.get('organization', 'Not Available'),
                             "as_number": visitor_data.get('as_number', 'N/A'),
                             "timezone": visitor_data.get('timezone', 'UTC'),
-                            "device_type": visitor_data.get('device_type', 'Not Available'),
-                            "screen_type": visitor_data.get('screen_type', 'Not Available'),
-                            "application": visitor_data.get('application', 'Not Available'),
-                            "user_agent": visitor_data.get('user_agent', 'Not Available'),
-                            "bot_status": visitor_data.get('bot_status', 'Not Available'),
+                            "device_type": visitor_data.get('device_type', 'N/A'),
+                            "screen_type": visitor_data.get('screen_type', 'N/A'),
+                            "application": visitor_data.get('application', 'N/A'),
+                            "user_agent": visitor_data.get('user_agent', 'N/A'),
+                            "bot_status": visitor_data.get('bot_status', 'N/A'),
                             "block_reason": visitor_data.get('block_reason', 'N/A'),
                             "source": source,
-                            "session_duration": int(visitor_data.get('session_duration', 0))
+                            "session_duration": int(visitor_data.get('session_duration', 0)))
                         }
                         visitors.append(visitor_entry)
                         if visitor_data.get('bot_status') != 'Human':
                             bot_logs.append({
-                                "timestamp": visitor_data.get('timestamp', 'Not Available'),
+                                "timestamp": visitor_data.get('timestamp', 'N/A'),
                                 "ip": visitor_data.get('ip', 'Not Available'),
                                 "block_reason": visitor_data.get('block_reason', 'N/A')
                             })
@@ -1062,7 +1032,7 @@ def dashboard():
                     function toggleAnalyticsSwitch(urlId, index) {
                         fetch('/toggle_analytics/' + urlId, {
                             method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
+                            headers: {'Content-Type': 'application/json' },
                             body: JSON.stringify({ csrf_token: "{{ form.csrf_token._value() }}" })
                         }).then(response => {
                             if (response.ok) {
@@ -1116,7 +1086,7 @@ def dashboard():
                                     {{ form.randomstring1(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
                                 </div>
                                 <div>
-                                    <label class="block text-sm font-medium text-gray-700">Base64emailInput</label>
+                                    <label class="block text-sm font-medium text-gray-700">Base64email</label>
                                     {{ form.base64email(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
                                 </div>
                                 <div>
@@ -1161,7 +1131,7 @@ def dashboard():
                                         <div class="mt-2 flex space-x-2">
                                             <button onclick="toggleAnalytics('{{ loop.index }}')" class="bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700">Toggle Analytics</button>
                                             <a href="/clear_views/{{ url.url_id }}" class="bg-yellow-600 text-white px-4 py-2 rounded-lg hover:bg-yellow-700" onclick="return confirm('Are you sure you want to clear all views for this URL?')">Clear Views</a>
-                                            <a href="/delete_url/{{ url.url_id }}" class="bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700" onclick="return confirm('Are you sure you want to delete this URL?')">Delete URL</a>
+                                            <a href="/delete_url/{{ url.url_id }}" class="bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700">Delete URL</a>
                                         </div>
                                         <div id="analytics-{{ loop.index }}" class="hidden mt-4">
                                             <h4 class="text-lg font-semibold text-gray-900">Visitor Analytics</h4>
@@ -1316,7 +1286,7 @@ def dashboard():
                                 <p class="text-gray-600">No visitor data available.</p>
                             {% endif %}
                         </div>
-                    </div>
+</div>
                     <div id="bot-logs-tab" class="tab-content hidden">
                         <div class="bg-white p-8 rounded-xl card">
                             <h2 class="text-2xl font-bold mb-6 text-gray-900">Bot Detection Logs</h2>
@@ -1488,7 +1458,7 @@ def clear_views(url_id):
                     </div>
                 </body>
                 </html>
-                      """), 500
+            """), 500
     except Exception as e:
         logger.error(f"Error in clear_views: {str(e)}", exc_info=True)
         return render_template_string("""
@@ -1521,7 +1491,7 @@ def delete_url(url_id):
                 abort(404, "URL not found")
             valkey_client.delete(key)
             valkey_client.delete(f"user:{username}:url:{url_id}:visits")
-            valkey_client.delete(f"url_payload:{url_id}")  # Clear cached payload
+            valkey_client.delete(f"url_payload:{url_id}")
             logger.debug(f"Deleted URL {url_id}")
             return redirect(url_for('dashboard'))
         else:
@@ -1914,7 +1884,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 logger.error(f"Valkey error checking cached payload: {str(e)}", exc_info=True)
 
         if not payload:
-            methods = ['slugstorm', 'heap_x3', 'pow', 'signed_token']
+            methods = ['slugstorm', 'heap_x3', 'signed_token']
             for method in methods:
                 try:
                     logger.debug(f"Trying decryption method: {method}")
@@ -1924,8 +1894,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                     elif method == 'slugstorm':
                         data = decrypt_slugstorm(encrypted_payload)
                         payload = data['payload']
-                    elif method == 'pow':
-                        payload = decrypt_pow(encrypted_payload)
                     else:
                         payload = decrypt_signed_token(encrypted_payload)
                     logger.debug(f"Decryption successful with {method}")
@@ -1941,10 +1909,17 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                     break
                 except Exception as e:
                     logger.debug(f"Decryption failed with {method}: {str(e)}")
+                    # Enhanced logging for debugging
+                    if method == 'slugstorm' and 'InvalidSignature' in str(e):
+                        logger.debug(f"Slugstorm signature mismatch: payload={encrypted_payload[:50]}...")
+                    elif method == 'heap_x3' and 'InvalidTag' in str(e):
+                        logger.debug(f"Heap_x3 tag mismatch: payload={encrypted_payload[:50]}...")
+                    elif method == 'signed_token' and 'InvalidSignature' in str(e):
+                        logger.debug(f"Signed_token signature mismatch: payload={encrypted_payload[:50]}...")
                     continue
 
         if not payload:
-            logger.error("All decryption methods failed")
+            logger.error(f"All decryption methods failed for payload: {encrypted_payload[:50]}...")
             abort(400, "Invalid payload")
 
         try:

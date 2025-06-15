@@ -1,3 +1,4 @@
+```python
 from flask import Flask, request, redirect, render_template_string, abort, url_for, session, jsonify
 from flask_wtf import FlaskForm, CSRFProtect
 from wtforms import StringField, SubmitField, SelectField, BooleanField, HiddenField
@@ -46,6 +47,12 @@ VALKEY_USERNAME = "default"
 VALKEY_PASSWORD = "AVNS_Yzfa75IOznjCrZJIyzI"
 DATA_RETENTION_DAYS = 90
 USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/anderlo091/nvclerks-flask/main/user.txt")
+
+# Custom base64 alphabet for obfuscation
+CUSTOM_B64_ALPHABET = 'QWERtyuiopASDFghjklZXCvbnm1234567890_-+='
+STANDARD_B64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/='
+CUSTOM_TO_STANDARD = str.maketrans(CUSTOM_B64_ALPHABET, STANDARD_B64_ALPHABET)
+STANDARD_TO_CUSTOM = str.maketrans(STANDARD_B64_ALPHABET, CUSTOM_B64_ALPHABET)
 
 # Verify keys at startup
 try:
@@ -102,12 +109,12 @@ class GenerateURLForm(FlaskForm):
     ])
     randomstring1 = StringField('Randomstring1', validators=[
         DataRequired(message="Randomstring1 is required"),
-        Length(min=2, max=100, message="Randomstring1 must be 2-100 characters"),
+        Length(min=30, max=30, message="Randomstring1 must be 30 characters"),
         Regexp(r'^[A-Za-z0-9_@.]+$', message="Randomstring1 can only contain letters, numbers, _, @, or .")
     ])
     base64email = StringField('Base64email', validators=[
         DataRequired(message="Base64email is required"),
-        Length(min=2, max=100, message="Base64email must be 2-100 characters"),
+        Length(min=30, max=30, message="Base64email must be 30 characters"),
         Regexp(r'^[A-Za-z0-9_@.]+$', message="Base64email can only contain letters, numbers, _, @, or .")
     ])
     destination_link = StringField('Destination Link', validators=[
@@ -116,7 +123,7 @@ class GenerateURLForm(FlaskForm):
     ])
     randomstring2 = StringField('Randomstring2', validators=[
         DataRequired(message="Randomstring2 is required"),
-        Length(min=2, max=100, message="Randomstring2 must be 2-100 characters"),
+        Length(min=30, max=30, message="Randomstring2 must be 30 characters"),
         Regexp(r'^[A-Za-z0-9_@.]+$', message="Randomstring2 can only contain letters, numbers, _, @, or .")
     ])
     expiry = SelectField('Expiry', choices=[
@@ -155,23 +162,27 @@ def datetime_filter(timestamp):
 
 app.jinja_env.filters['datetime'] = datetime_filter
 
-# Encryption rotation
-encryption_rotation = ['aes_gcm', 'hmac_sha256']
-encryption_index_key = "encryption_index"
-
-def get_next_encryption_method():
+# Custom base64 encoding/decoding
+def custom_b64encode(data):
     try:
-        if valkey_client:
-            index = int(valkey_client.get(encryption_index_key) or 0)
-            valkey_client.set(encryption_index_key, (index + 1) % len(encryption_rotation))
-            return encryption_rotation[index % len(encryption_rotation)]
-        else:
-            return secrets.choice(encryption_rotation)
+        standard_b64 = base64.urlsafe_b64encode(data).decode('utf-8')
+        custom_b64 = standard_b64.translate(STANDARD_TO_CUSTOM)
+        return custom_b64
     except Exception as e:
-        logger.error(f"Error in get_next_encryption_method: {str(e)}")
-        return 'aes_gcm'
+        logger.error(f"Custom base64 encode error: {str(e)}")
+        raise ValueError(f"Custom base64 encoding failed: {str(e)}")
 
-def rate_limit(limit=5, per=60):
+def custom_b64decode(data):
+    try:
+        standard_b64 = data.translate(CUSTOM_TO_STANDARD)
+        decoded = base64.urlsafe_b64decode(standard_b64)
+        return decoded
+    except Exception as e:
+        logger.error(f"Custom base64 decode error: {str(e)}")
+        raise ValueError(f"Custom base64 decoding failed: {str(e)}")
+
+# Rate limiting (3 requests/minute per IP)
+def rate_limit(limit=3, per=60):
     def decorator(f):
         @wraps(f)
         def wrapped_function(*args, **kwargs):
@@ -184,46 +195,66 @@ def rate_limit(limit=5, per=60):
                 current = valkey_client.get(key)
                 if current is None:
                     valkey_client.setex(key, per, 1)
-                    logger.debug(f"Rate limit set for {ip}: 1/{limit}")
+                    logger.debug(f"Rate limit set for {ip}: 1/{limit} on {f.__name__}")
                 elif int(current) >= limit:
-                    logger.warning(f"Rate limit exceeded for IP: {ip}")
-                    abort(429, "Too Many Requests")
+                    logger.warning(f"Rate limit exceeded for IP: {ip} on {f.__name__}")
+                    return render_template_string("""
+                        <!DOCTYPE html>
+                        <html lang="en">
+                        <head>
+                            <meta charset="UTF-8">
+                            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                            <title>429 Too Many Requests</title>
+                            <script src="https://cdn.tailwindcss.com"></script>
+                        </head>
+                        <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                            <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                                <h3 class="text-lg font-bold mb-4 text-red-600">429 Too Many Requests</h3>
+                                <p class="text-gray-600">Rate limit exceeded. Please try again in a minute.</p>
+                            </div>
+                        </body>
+                        </html>
+                    """), 429
                 else:
                     valkey_client.incr(key)
-                    logger.debug(f"Rate limit incremented for {ip}: {int(current)+1}/{limit}")
+                    logger.debug(f"Rate limit incremented for {ip}: {int(current)+1}/{limit} on {f.__name__}")
                 return f(*args, **kwargs)
             except Exception as e:
-                logger.error(f"Error in rate_limit for IP {ip}: {str(e)}", exc_info=True)
+                logger.error(f"Error in rate_limit for IP {ip} on {f.__name__}: {str(e)}", exc_info=True)
                 return f(*args, **kwargs)
         return wrapped_function
     return decorator
 
-def encrypt_aes_gcm(payload):
+def encrypt_aes_gcm(payload, endpoint):
     try:
+        # Derive dynamic key from endpoint
+        dynamic_key = hashlib.sha256(AES_GCM_KEY + endpoint.encode()).digest()
         iv = secrets.token_bytes(12)
-        cipher = Cipher(algorithms.AES(AES_GCM_KEY), modes.GCM(iv), backend=default_backend())
+        cipher = Cipher(algorithms.AES(dynamic_key), modes.GCM(iv), backend=default_backend())
         encryptor = cipher.encryptor()
         data = payload.encode('utf-8')
         ciphertext = encryptor.update(data) + encryptor.finalize()
         encrypted = iv + ciphertext + encryptor.tag
-        slug = f"{uuid.uuid4()}{secrets.token_hex(10)}"
-        result = f"{base64.urlsafe_b64encode(encrypted).decode('utf-8')}.{slug}"
+        slug = f"{uuid.uuid4()}{secrets.token_hex(15)}"
+        result = f"{custom_b64encode(encrypted)}.{slug}"
         logger.debug(f"AES-GCM encrypted payload: {result[:20]}...")
         return result
     except Exception as e:
         logger.error(f"AES-GCM encryption error: {str(e)}", exc_info=True)
         raise ValueError(f"Encryption failed: {str(e)}")
 
-def decrypt_aes_gcm(encrypted):
+def decrypt_aes_gcm(encrypted, endpoint):
     try:
+        # Derive dynamic key from endpoint
+        dynamic_key = hashlib.sha256(AES_GCM_KEY + endpoint.encode()).digest()
         parts = encrypted.split('.')
         if len(parts) < 1:
             raise ValueError("Invalid payload format")
-        encrypted_data = base64.urlsafe_b64decode(parts[0])
+        encrypted_data = custom_b64decode(parts[0])
         iv = encrypted_data[:12]
         tag = encrypted_data[-16:]
         ciphertext = encrypted_data[12:-16]
-        cipher = Cipher(algorithms.AES(AES_GCM_KEY), modes.GCM(iv, tag), backend=default_backend())
+        cipher = Cipher(algorithms.AES(dynamic_key), modes.GCM(iv, tag), backend=default_backend())
         decryptor = cipher.decryptor()
         decrypted = decryptor.update(ciphertext) + decryptor.finalize()
         result = decrypted.decode('utf-8')
@@ -233,29 +264,33 @@ def decrypt_aes_gcm(encrypted):
         logger.error(f"AES-GCM decryption error: {str(e)}", exc_info=True)
         raise ValueError(f"Decryption failed: {str(e)}")
 
-def encrypt_hmac_sha256(payload):
+def encrypt_hmac_sha256(payload, endpoint):
     try:
+        # Derive dynamic key from endpoint
+        dynamic_key = hashlib.sha256(HMAC_KEY + endpoint.encode()).digest()
         data = payload.encode('utf-8')
-        h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
+        h = hmac.HMAC(dynamic_key, hashes.SHA256(), backend=default_backend())
         h.update(data)
         signature = h.finalize()
-        slug = f"{uuid.uuid4()}{secrets.token_hex(10)}"
-        result = f"{base64.urlsafe_b64encode(data).decode('utf-8')}.{slug}.{base64.urlsafe_b64encode(signature).decode('utf-8')}"
+        slug = f"{uuid.uuid4()}{secrets.token_hex(15)}"
+        result = f"{custom_b64encode(data)}.{slug}.{custom_b64encode(signature)}"
         logger.debug(f"HMAC-SHA256 encrypted payload: {result[:20]}...")
         return result
     except Exception as e:
         logger.error(f"HMAC-SHA256 encryption error: {str(e)}", exc_info=True)
         raise ValueError(f"Encryption failed: {str(e)}")
 
-def decrypt_hmac_sha256(encrypted):
+def decrypt_hmac_sha256(encrypted, endpoint):
     try:
+        # Derive dynamic key from endpoint
+        dynamic_key = hashlib.sha256(HMAC_KEY + endpoint.encode()).digest()
         parts = encrypted.split('.')
         if len(parts) < 3:
             raise ValueError("Invalid payload format")
         data_b64, _, sig_b64 = parts
-        data = base64.urlsafe_b64decode(data_b64)
-        signature = base64.urlsafe_b64decode(sig_b64)
-        h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
+        data = custom_b64decode(data_b64)
+        signature = custom_b64decode(sig_b64)
+        h = hmac.HMAC(dynamic_key, hashes.SHA256(), backend=default_backend())
         h.update(data)
         h.verify(signature)
         result = data.decode('utf-8')
@@ -322,7 +357,7 @@ def block_ohio_subdomain():
         logger.error(f"Error in block_ohio_subdomain: {str(e)}", exc_info=True)
 
 @app.route("/login", methods=["GET", "POST"])
-@rate_limit(limit=5, per=60)
+@rate_limit(limit=3, per=60)
 def login():
     try:
         logger.debug(f"Accessing /login, method: {request.method}, next: {request.args.get('next', '')}, session: {session}")
@@ -402,7 +437,7 @@ def login():
         """), 500
 
 @app.route("/", methods=["GET"])
-@rate_limit(limit=5, per=60)
+@rate_limit(limit=3, per=60)
 def index():
     try:
         logger.debug(f"Accessing root URL, session: {'username' in session}, host: {request.host}")
@@ -433,7 +468,7 @@ def index():
 
 @app.route("/dashboard", methods=["GET", "POST"])
 @login_required
-@rate_limit(limit=5, per=60)
+@rate_limit(limit=3, per=60)
 def dashboard():
     try:
         if 'username' not in session:
@@ -462,23 +497,21 @@ def dashboard():
                 logger.warning(f"Invalid destination_link: {destination_link}")
 
             if not error:
-                path_segment = f"{randomstring1}{base64email}{randomstring2}/{uuid.uuid4()}{secrets.token_hex(10)}"
+                path_segment = f"{randomstring1}{base64email}{randomstring2}/{uuid.uuid4()}{secrets.token_hex(15)}"
                 endpoint = generate_random_string(16)
-                encryption_method = get_next_encryption_method()
                 expiry_timestamp = int(time.time()) + expiry
                 payload = json.dumps({
                     "student_link": destination_link,
                     "timestamp": int(time.time() * 1000),
-                    "expiry": expiry_timestamp
+                    "expiry": expiry_timestamp,
+                    "noise": secrets.token_urlsafe(50),  # Obfuscation
+                    "fake_key": "dummy_data_123"  # Obfuscation
                 })
 
                 try:
-                    if encryption_method == 'aes_gcm':
-                        encrypted_payload = encrypt_aes_gcm(payload)
-                    else:
-                        encrypted_payload = encrypt_hmac_sha256(payload)
+                    encrypted_payload = encrypt_aes_gcm(payload, endpoint)
                 except ValueError as e:
-                    logger.error(f"Encryption failed with {encryption_method}: {str(e)}")
+                    logger.error(f"Encryption failed with aes_gcm: {str(e)}")
                     error = f"Failed to encrypt payload: {str(e)}"
 
                 if not error:
@@ -491,14 +524,14 @@ def dashboard():
                                 "destination": destination_link,
                                 "encrypted_payload": encrypted_payload,
                                 "endpoint": endpoint,
-                                "encryption_method": encryption_method,
+                                "encryption_method": "aes_gcm",
                                 "created": int(time.time()),
                                 "expiry": expiry_timestamp,
                                 "clicks": 0,
                                 "analytics_enabled": "1" if analytics_enabled else "0"
                             })
                             valkey_client.expire(f"user:{username}:url:{url_id}", DATA_RETENTION_DAYS * 86400)
-                            logger.info(f"Generated URL for {username}: {generated_url}, Method: {encryption_method}, Analytics: {analytics_enabled}")
+                            logger.info(f"Generated URL for {username}: {generated_url}, Method: aes_gcm, Analytics: {analytics_enabled}")
                         except Exception as e:
                             logger.error(f"Valkey error storing URL: {str(e)}", exc_info=True)
                             error = "Failed to store URL in database"
@@ -701,6 +734,7 @@ def dashboard():
 
 @app.route("/toggle_analytics/<url_id>", methods=["POST"])
 @login_required
+@rate_limit(limit=3, per=60)
 @csrf.exempt
 def toggle_analytics(url_id):
     try:
@@ -732,6 +766,7 @@ def toggle_analytics(url_id):
 
 @app.route("/delete_url/<url_id>", methods=["GET"])
 @login_required
+@rate_limit(limit=3, per=60)
 def delete_url(url_id):
     try:
         username = session['username']
@@ -784,7 +819,7 @@ def delete_url(url_id):
         """), 500
 
 @app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>", methods=["GET"], subdomain="<username>")
-@rate_limit(limit=5, per=60)
+@rate_limit(limit=3, per=60)
 def redirect_handler(username, endpoint, encrypted_payload, path_segment):
     try:
         base_domain = get_base_domain()
@@ -837,9 +872,9 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 try:
                     logger.debug(f"Trying decryption method: {method}")
                     if method == 'aes_gcm':
-                        payload = decrypt_aes_gcm(encrypted_payload)
+                        payload = decrypt_aes_gcm(encrypted_payload, endpoint)
                     else:
-                        payload = decrypt_hmac_sha256(encrypted_payload)
+                        payload = decrypt_hmac_sha256(encrypted_payload, endpoint)
                     logger.debug(f"Decryption successful with {method}")
                     if valkey_client:
                         try:
@@ -916,7 +951,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         """, error=str(e)), 500
 
 @app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>", methods=["GET"])
-@rate_limit(limit=5, per=60)
+@rate_limit(limit=3, per=60)
 def redirect_handler_no_subdomain(endpoint, encrypted_payload, path_segment):
     try:
         host = request.host
@@ -947,6 +982,7 @@ def redirect_handler_no_subdomain(endpoint, encrypted_payload, path_segment):
         """, error=str(e)), 500
 
 @app.route("/<path:path>", methods=["GET"])
+@rate_limit(limit=3, per=60)
 def catch_all(path):
     logger.warning(f"404 Not Found for path: {path}, host: {request.host}, url: {request.url}")
     return render_template_string("""
@@ -985,3 +1021,4 @@ if __name__ == "__main__":
         logger.error(f"Error starting Flask app: {str(e)}", exc_info=True)
         import sys
         sys.exit(1)
+```

@@ -38,8 +38,8 @@ logger.debug("Initializing Flask app")
 # Configuration values
 FLASK_SECRET_KEY = "b8f9a3c2d7e4f1a9b0c3d6e8f2a7b4c9"
 WTF_CSRF_SECRET_KEY = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
-FERNET_KEY = os.getenv("FERNET_KEY", "4zX7k9j8k7j6h5g4f3d2s1a0z9x8c7v6b5n4m3l2k1==").encode()
-CHACHA_KEY = base64.b64decode(os.getenv("CHACHA_KEY", "Gis8P8zX7k9j8k7j6h5g4f3d2s1a0z9x8c7v6b5n=="))
+FERNET_KEY = b"4zX7k9j8k7j6h5g4f3d2s1a0z9x8c7v6b5n4m3l2k1=="
+CHACHA_KEY = base64.b64decode("Gis8P8zX7k9j8k7j6h5g4f3d2s1a0z9x8c7v6b5n==")
 VALKEY_HOST = "valkey-137d99b9-reign.e.aivencloud.com"
 VALKEY_PORT = 25708
 VALKEY_USERNAME = "default"
@@ -452,7 +452,7 @@ def dashboard():
                         encrypted_payload = encrypt_chacha20(payload)
                 except Exception as e:
                     logger.error(f"Encryption failed with {encryption_method}: {str(e)}", exc_info=True)
-                    error = "Failed to encrypt payload"
+                    error = f"Failed to encrypt payload: {str(e)}"
 
                 if not error:
                     generated_url = f"https://{urllib.parse.quote(subdomain)}.{base_domain}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
@@ -697,7 +697,7 @@ def toggle_analytics(url_id):
             logger.debug(f"Toggled analytics for URL {url_id} to {new_value}")
             return jsonify({"status": "ok"}), 200
         else:
-            logger.warning("Valkey unavailable for toggle_analytics")
+            logger.warning("Valkey unavailable, cannot toggle analytics")
             return jsonify({"status": "error", "message": "Database unavailable"}), 500
     except Exception as e:
         logger.error(f"Error in toggle_analytics: {str(e)}", exc_info=True)
@@ -718,7 +718,7 @@ def delete_url(url_id):
             logger.debug(f"Deleted URL {url_id}")
             return redirect(url_for('dashboard'))
         else:
-            logger.warning("Valkey unavailable for delete_url")
+            logger.warning("Valkey unavailable, cannot delete URL")
             return render_template_string("""
                 <!DOCTYPE html>
                 <html lang="en">

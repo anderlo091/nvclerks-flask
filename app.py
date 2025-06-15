@@ -35,11 +35,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.debug("Initializing Flask app")
 
-# Configuration values (move to environment variables in production)
+# Configuration values
 FLASK_SECRET_KEY = "b8f9a3c2d7e4f1a9b0c3d6e8f2a7b4c9"
 WTF_CSRF_SECRET_KEY = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
-FERNET_KEY = Fernet.generate_key()
-CHACHA_KEY = secrets.token_bytes(32)
+FERNET_KEY = os.getenv("FERNET_KEY", "4zX7k9j8k7j6h5g4f3d2s1a0z9x8c7v6b5n4m3l2k1==").encode()
+CHACHA_KEY = base64.b64decode(os.getenv("CHACHA_KEY", "Gis8P8zX7k9j8k7j6h5g4f3d2s1a0z9x8c7v6b5n=="))
 VALKEY_HOST = "valkey-137d99b9-reign.e.aivencloud.com"
 VALKEY_PORT = 25708
 VALKEY_USERNAME = "default"
@@ -765,6 +765,8 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                      f"encrypted_payload={encrypted_payload[:20]}..., path_segment={path_segment}, "
                      f"IP={request.remote_addr}, URL={request.url}")
 
+        url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode()).hexdigest()
+
         # Referrer Check
         referrer = request.headers.get("Referer", "")
         allowed_referrers = [
@@ -781,7 +783,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         time.sleep(delay)
         logger.debug(f"Applied random delay of {delay:.3f} seconds")
 
-        url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode()).hexdigest()
         if valkey_client:
             try:
                 analytics_enabled = valkey_client.hget(f"user:{username}:url:{url_id}", "analytics_enabled") == "1"

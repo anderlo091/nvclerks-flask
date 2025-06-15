@@ -85,8 +85,8 @@ try:
     app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=1)
     logger.debug("Flask configuration set successfully")
 except Exception as e:
-    logger.error(f"Error setting Flask config: {str(e)}", exc_info=True)
-    raise
+    logger.error(f"Error setting Flask config: {str(e)}")
+    raise ValueError(f"Flask configuration failed: {str(e)}")
 
 # CSRF protection
 csrf = CSRFProtect(app)
@@ -144,12 +144,14 @@ try:
         username=VALKEY_USERNAME,
         password=VALKEY_PASSWORD,
         decode_responses=True,
-        ssl=True
+        ssl=True,
+        socket_timeout=3,
+        socket_connect_timeout=3
     )
     valkey_client.ping()
     logger.debug("Valkey connection established successfully")
 except Exception as e:
-    logger.error(f"Valkey connection failed: {str(e)}", exc_info=True)
+    logger.error(f"Valkey connection failed: {str(e)}")
     valkey_client = None
 
 # Custom Jinja2 filter for datetime
@@ -165,21 +167,22 @@ app.jinja_env.filters['datetime'] = datetime_filter
 # Custom base64 encoding/decoding
 def custom_b64encode(data):
     try:
-        standard_b64 = base64.urlsafe_b64encode(data).decode('utf-8')
+        standard_b64 = base64.urlsafe_b64encode(data).decode('utf-8').rstrip('=')
         custom_b64 = standard_b64.translate(STANDARD_TO_CUSTOM)
         return custom_b64
     except Exception as e:
         logger.error(f"Custom base64 encode error: {str(e)}")
-        raise ValueError(f"Custom base64 encoding failed: {str(e)}")
+        return None
 
 def custom_b64decode(data):
     try:
+        data = data + '=' * (-len(data) % 4)
         standard_b64 = data.translate(CUSTOM_TO_STANDARD)
         decoded = base64.urlsafe_b64decode(standard_b64)
         return decoded
     except Exception as e:
         logger.error(f"Custom base64 decode error: {str(e)}")
-        raise ValueError(f"Custom base64 decoding failed: {str(e)}")
+        return None
 
 # Rate limiting (3 requests/minute per IP)
 def rate_limit(limit=3, per=60):
@@ -187,7 +190,7 @@ def rate_limit(limit=3, per=60):
         @wraps(f)
         def wrapped_function(*args, **kwargs):
             try:
-                ip = request.remote_addr
+                ip = request.remote_addr or 'unknown_ip'
                 if not valkey_client:
                     logger.warning("Valkey unavailable, skipping rate limit")
                     return f(*args, **kwargs)
@@ -221,14 +224,13 @@ def rate_limit(limit=3, per=60):
                     logger.debug(f"Rate limit incremented for {ip}: {int(current)+1}/{limit} on {f.__name__}")
                 return f(*args, **kwargs)
             except Exception as e:
-                logger.error(f"Error in rate_limit for IP {ip} on {f.__name__}: {str(e)}", exc_info=True)
+                logger.error(f"Error in rate_limit for IP {ip} on {f.__name__}: {str(e)}")
                 return f(*args, **kwargs)
         return wrapped_function
     return decorator
 
 def encrypt_aes_gcm(payload, endpoint):
     try:
-        # Derive dynamic key from endpoint
         dynamic_key = hashlib.sha256(AES_GCM_KEY + endpoint.encode('utf-8')).digest()
         iv = secrets.token_bytes(12)
         cipher = Cipher(algorithms.AES(dynamic_key), modes.GCM(iv), backend=default_backend())
@@ -237,21 +239,25 @@ def encrypt_aes_gcm(payload, endpoint):
         ciphertext = encryptor.update(data) + encryptor.finalize()
         encrypted = iv + ciphertext + encryptor.tag
         slug = f"{uuid.uuid4()}{secrets.token_hex(15)}"
-        result = f"{custom_b64encode(encrypted)}.{slug}"
+        encoded = custom_b64encode(encrypted)
+        if encoded is None:
+            raise ValueError("Base64 encoding failed")
+        result = f"{encoded}.{slug}"
         logger.debug(f"AES-GCM encrypted payload: {result[:20]}...")
         return result
     except Exception as e:
-        logger.error(f"AES-GCM encryption error: {str(e)}", exc_info=True)
+        logger.error(f"AES-GCM encryption error: {str(e)}")
         raise ValueError(f"Encryption failed: {str(e)}")
 
 def decrypt_aes_gcm(encrypted, endpoint):
     try:
-        # Derive dynamic key from endpoint
         dynamic_key = hashlib.sha256(AES_GCM_KEY + endpoint.encode('utf-8')).digest()
         parts = encrypted.split('.')
         if len(parts) < 1:
             raise ValueError("Invalid payload format")
         encrypted_data = custom_b64decode(parts[0])
+        if encrypted_data is None:
+            raise ValueError("Base64 decoding failed")
         iv = encrypted_data[:12]
         tag = encrypted_data[-16:]
         ciphertext = encrypted_data[12:-16]
@@ -262,28 +268,30 @@ def decrypt_aes_gcm(encrypted, endpoint):
         logger.debug(f"AES-GCM decrypted payload: {result[:50]}...")
         return result
     except Exception as e:
-        logger.error(f"AES-GCM decryption error: {str(e)}", exc_info=True)
+        logger.error(f"AES-GCM decryption error: {str(e)}")
         raise ValueError(f"Decryption failed: {str(e)}")
 
 def encrypt_hmac_sha256(payload, endpoint):
     try:
-        # Derive dynamic key from endpoint
         dynamic_key = hashlib.sha256(HMAC_KEY + endpoint.encode('utf-8')).digest()
         data = payload.encode('utf-8')
         h = hmac.HMAC(dynamic_key, hashes.SHA256(), backend=default_backend())
         h.update(data)
         signature = h.finalize()
         slug = f"{uuid.uuid4()}{secrets.token_hex(15)}"
-        result = f"{custom_b64encode(data)}.{slug}.{custom_b64encode(signature)}"
+        data_b64 = custom_b64encode(data)
+        sig_b64 = custom_b64encode(signature)
+        if data_b64 is None or sig_b64 is None:
+            raise ValueError("Base64 encoding failed")
+        result = f"{data_b64}.{slug}.{sig_b64}"
         logger.debug(f"HMAC-SHA256 encrypted payload: {result[:20]}...")
         return result
     except Exception as e:
-        logger.error(f"HMAC-SHA256 encryption error: {str(e)}", exc_info=True)
+        logger.error(f"HMAC-SHA256 encryption error: {str(e)}")
         raise ValueError(f"Encryption failed: {str(e)}")
 
 def decrypt_hmac_sha256(encrypted, endpoint):
     try:
-        # Derive dynamic key from endpoint
         dynamic_key = hashlib.sha256(HMAC_KEY + endpoint.encode('utf-8')).digest()
         parts = encrypted.split('.')
         if len(parts) < 3:
@@ -291,6 +299,8 @@ def decrypt_hmac_sha256(encrypted, endpoint):
         data_b64, _, sig_b64 = parts
         data = custom_b64decode(data_b64)
         signature = custom_b64decode(sig_b64)
+        if data is None or signature is None:
+            raise ValueError("Base64 decoding failed")
         h = hmac.HMAC(dynamic_key, hashes.SHA256(), backend=default_backend())
         h.update(data)
         h.verify(signature)
@@ -298,16 +308,19 @@ def decrypt_hmac_sha256(encrypted, endpoint):
         logger.debug(f"HMAC-SHA256 decrypted payload: {result[:50]}...")
         return result
     except Exception as e:
-        logger.error(f"HMAC-SHA256 decryption error: {str(e)}", exc_info=True)
+        logger.error(f"HMAC-SHA256 decryption error: {str(e)}")
         raise ValueError(f"Decryption failed: {str(e)}")
 
 def get_valid_usernames():
     try:
         if valkey_client:
-            cached = valkey_client.get("usernames")
-            if cached:
-                logger.debug("Retrieved usernames from Valkey cache")
-                return json.loads(cached)
+            try:
+                cached = valkey_client.get("usernames")
+                if cached:
+                    logger.debug("Retrieved usernames from Valkey cache")
+                    return json.loads(cached)
+            except Exception as e:
+                logger.error(f"Valkey error fetching usernames: {str(e)}")
         response = requests.get(USER_TXT_URL, timeout=5)
         response.raise_for_status()
         usernames = [bleach.clean(line.strip()) for line in response.text.splitlines() if line.strip()]
@@ -317,10 +330,10 @@ def get_valid_usernames():
                 logger.debug("Cached usernames in Valkey")
             except Exception as e:
                 logger.error(f"Valkey error caching usernames: {str(e)}")
-        logger.debug(f"Fetched {len(usernames)} usernames from GitHub")
+        logger.debug(f"Fetched {len(usernames)} usernames")
         return usernames
     except Exception as e:
-        logger.error(f"Error fetching user.txt: {str(e)}", exc_info=True)
+        logger.error(f"Error fetching user.txt: {str(e)}")
         return []
 
 def login_required(f):
@@ -333,7 +346,7 @@ def login_required(f):
             logger.debug(f"Authenticated user: {session['username']}, session: {session}")
             return f(*args, **kwargs)
         except Exception as e:
-            logger.error(f"Error in login_required: {str(e)}", exc_info=True)
+            logger.error(f"Error in login_required: {str(e)}")
             return redirect(url_for('login'))
     return decorated_function
 
@@ -355,7 +368,7 @@ def block_ohio_subdomain():
             logger.debug(f"Redirecting request to {request.host} to https://google.com")
             return redirect("https://google.com", code=302)
     except Exception as e:
-        logger.error(f"Error in block_ohio_subdomain: {str(e)}", exc_info=True)
+        logger.error(f"Error in block_ohio_subdomain: {str(e)}")
 
 @app.route("/login", methods=["GET", "POST"])
 @rate_limit(limit=3, per=60)
@@ -419,7 +432,7 @@ def login():
             </html>
         """, form=form, favicon_url=FAVICON_URL)
     except Exception as e:
-        logger.error(f"Error in login: {str(e)}", exc_info=True)
+        logger.error(f"Error in login: {str(e)}")
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -450,7 +463,7 @@ def index():
         logger.debug("No user session, redirecting to login")
         return redirect(url_for('login'))
     except Exception as e:
-        logger.error(f"Error in index: {str(e)}", exc_info=True)
+        logger.error(f"Error in index: {str(e)}")
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -508,8 +521,8 @@ def dashboard():
                     "student_link": destination_link,
                     "timestamp": int(time.time() * 1000),
                     "expiry": expiry_timestamp,
-                    "noise": secrets.token_urlsafe(50),  # Obfuscation
-                    "fake_key": "dummy_data_123"  # Obfuscation
+                    "noise": secrets.token_urlsafe(50),
+                    "fake_key": "dummy_data_123"
                 })
 
                 try:
@@ -535,9 +548,9 @@ def dashboard():
                                 "analytics_enabled": "1" if analytics_enabled else "0"
                             })
                             valkey_client.expire(f"user:{username}:url:{url_id}", DATA_RETENTION_DAYS * 86400)
-                            logger.info(f"Generated URL for {username}: {generated_url}, Method: aes_gcm, Analytics: {analytics_enabled}")
+                            logger.info(f"Generated URL for {username}: {generated_url[:50]}..., Method: aes_gcm, Analytics: {analytics_enabled}")
                         except Exception as e:
-                            logger.error(f"Valkey error storing URL: {str(e)}", exc_info=True)
+                            logger.error(f"Valkey error storing URL: {str(e)}")
                             error = "Failed to store URL in database"
                     else:
                         logger.warning("Valkey unavailable, cannot store URL")
@@ -717,7 +730,7 @@ def dashboard():
             </html>
         """, username=username, form=form, urls=urls, primary_color=primary_color, error=error, valkey_error=valkey_error, favicon_url=FAVICON_URL)
     except Exception as e:
-        logger.error(f"Dashboard error for user {username}: {str(e)}", exc_info=True)
+        logger.error(f"Dashboard error for user {username}: {str(e)}")
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -744,9 +757,9 @@ def dashboard():
 @csrf.exempt
 def toggle_analytics(url_id):
     try:
-        username = session['username']
-        data = request.get_json()
-        if not data or 'csrf_token' not in data:
+        username = session.get('username', 'unknown')
+        data = request.get_json() or {}
+        if 'csrf_token' not in data:
             logger.warning(f"Missing CSRF token for toggle_analytics: {url_id}")
             return jsonify({"status": "error", "message": "CSRF token required"}), 403
         form = GenerateURLForm(csrf_token=data['csrf_token'])
@@ -767,7 +780,7 @@ def toggle_analytics(url_id):
             logger.warning("Valkey unavailable, cannot toggle analytics")
             return jsonify({"status": "error", "message": "Database unavailable"}), 500
     except Exception as e:
-        logger.error(f"Error in toggle_analytics: {str(e)}", exc_info=True)
+        logger.error(f"Error in toggle_analytics: {str(e)}")
         return jsonify({"status": "error", "message": "Internal server error"}), 500
 
 @app.route("/delete_url/<url_id>", methods=["GET"])
@@ -775,12 +788,29 @@ def toggle_analytics(url_id):
 @rate_limit(limit=3, per=60)
 def delete_url(url_id):
     try:
-        username = session['username']
+        username = session.get('username', 'unknown')
         if valkey_client:
             key = f"user:{username}:url:{url_id}"
             if not valkey_client.exists(key):
                 logger.warning(f"URL {url_id} not found for user {username}")
-                abort(404, "URL not found")
+                return render_template_string("""
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Not Found</title>
+                        <link rel="icon" href="{{ favicon_url }}">
+                        <script src="https://cdn.tailwindcss.com"></script>
+                    </head>
+                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                            <h3 class="text-lg font-bold mb-4 text-red-600">Not Found</h3>
+                            <p class="text-gray-600">URL not found.</p>
+                        </div>
+                    </body>
+                    </html>
+                """, favicon_url=FAVICON_URL), 404
             valkey_client.delete(key)
             valkey_client.delete(f"url_payload:{url_id}")
             logger.debug(f"Deleted URL {url_id}")
@@ -806,7 +836,7 @@ def delete_url(url_id):
                 </html>
             """, favicon_url=FAVICON_URL), 500
     except Exception as e:
-        logger.error(f"Error in delete_url: {str(e)}", exc_info=True)
+        logger.error(f"Error in delete_url: {str(e)}")
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -837,7 +867,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
 
         url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode('utf-8')).hexdigest()
 
-        # Randomized Redirect Delay
         delay = random.uniform(0.1, 0.5)
         time.sleep(delay)
         logger.debug(f"Applied random delay of {delay:.3f} seconds")
@@ -850,13 +879,13 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                     valkey_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
                     logger.debug(f"Incremented clicks for URL ID: {url_id}")
             except Exception as e:
-                logger.error(f"Valkey error logging click: {str(e)}", exc_info=True)
+                logger.error(f"Valkey error logging click: {str(e)}")
 
         try:
             encrypted_payload = urllib.parse.unquote(encrypted_payload)
             logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}...")
         except Exception as e:
-            logger.error(f"Error decoding encrypted_payload: {str(e)}", exc_info=True)
+            logger.error(f"Error decoding encrypted_payload: {str(e)}")
             return render_template_string("""
                 <!DOCTYPE html>
                 <html lang="en">
@@ -876,7 +905,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 </html>
             """, favicon_url=FAVICON_URL), 400
 
-        # Clean path_segment by removing UUID suffix
         uuid_suffix_pattern = r'(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[0-9a-f]+)?$'
         cleaned_path_segment = re.sub(uuid_suffix_pattern, '', path_segment)
         logger.debug(f"Cleaned path_segment: {cleaned_path_segment}")
@@ -889,7 +917,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                     payload = cached_payload
                     logger.debug(f"Using cached payload for URL ID: {url_id}")
             except Exception as e:
-                logger.error(f"Valkey error checking cached payload: {str(e)}", exc_info=True)
+                logger.error(f"Valkey error checking cached payload: {str(e)}")
 
         if not payload:
             methods = [encryption_method] if encryption_method else ['aes_gcm', 'hmac_sha256']
@@ -908,7 +936,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                             valkey_client.setex(f"url_payload:{url_id}", ttl, payload)
                             logger.debug(f"Cached payload for URL ID: {url_id} with TTL {ttl}s")
                         except Exception as e:
-                            logger.error(f"Valkey error caching payload: {str(e)}", exc_info=True)
+                            logger.error(f"Valkey error caching payload: {str(e)}")
                     break
                 except ValueError as e:
                     logger.debug(f"Decryption failed with {method}: {str(e)}")
@@ -962,7 +990,10 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             if time.time() > expiry:
                 logger.warning("URL expired")
                 if valkey_client:
-                    valkey_client.delete(f"url_payload:{url_id}")
+                    try:
+                        valkey_client.delete(f"url_payload:{url_id}")
+                    except Exception as e:
+                        logger.error(f"Valkey error deleting expired payload: {str(e)}")
                 return render_template_string("""
                     <!DOCTYPE html>
                     <html lang="en">
@@ -983,7 +1014,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 """, favicon_url=FAVICON_URL), 410
             logger.debug(f"Parsed payload: redirect_url={redirect_url}")
         except Exception as e:
-            logger.error(f"Payload parsing error: {str(e)}", exc_info=True)
+            logger.error(f"Payload parsing error: {str(e)}")
             return render_template_string("""
                 <!DOCTYPE html>
                 <html lang="en">
@@ -1007,7 +1038,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         logger.info(f"Redirecting to {final_url}")
         return redirect(final_url, code=302)
     except Exception as e:
-        logger.error(f"Error in redirect_handler: {str(e)}", exc_info=True)
+        logger.error(f"Error in redirect_handler: {str(e)}")
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -1039,7 +1070,7 @@ def redirect_handler_no_subdomain(endpoint, encrypted_payload, path_segment):
                      f"URL={request.url}")
         return redirect_handler(username, endpoint, encrypted_payload, path_segment)
     except Exception as e:
-        logger.error(f"Error in redirect_handler_no_subdomain: {str(e)}", exc_info=True)
+        logger.error(f"Error in redirect_handler_no_subdomain: {str(e)}")
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -1085,7 +1116,7 @@ def catch_all(path):
             </html>
         """, favicon_url=FAVICON_URL), 404
     except Exception as e:
-        logger.error(f"Error in catch_all: {str(e)}", exc_info=True)
+        logger.error(f"Error in catch_all: {str(e)}")
         return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
@@ -1113,13 +1144,13 @@ def generate_random_string(length):
         logger.debug(f"Generated random string: {result[:10]}...")
         return result
     except Exception as e:
-        logger.error(f"Error generating random string: {str(e)}", exc_info=True)
+        logger.error(f"Error generating random string: {str(e)}")
         return secrets.token_hex(length // 2)
 
 if __name__ == "__main__":
     try:
         app.run(host="0.0.0.0", port=5000, debug=False)
     except Exception as e:
-        logger.error(f"Error starting Flask app: {str(e)}", exc_info=True)
+        logger.error(f"Error starting Flask app: {str(e)}")
         import sys
         sys.exit(1)

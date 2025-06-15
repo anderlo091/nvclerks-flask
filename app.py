@@ -845,6 +845,11 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             logger.error(f"Error decoding encrypted_payload: {str(e)}", exc_info=True)
             abort(400, "Invalid payload format")
 
+        # Clean path_segment by removing UUID suffix
+        uuid_suffix_pattern = r'(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[0-9a-f]+)?$'
+        cleaned_path_segment = re.sub(uuid_suffix_pattern, '', path_segment)
+        logger.debug(f"Cleaned path_segment: {cleaned_path_segment}")
+
         payload = None
         if valkey_client:
             try:
@@ -919,7 +924,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             logger.error(f"Payload parsing error: {str(e)}", exc_info=True)
             abort(400, "Invalid payload")
 
-        final_url = f"{redirect_url.rstrip('/')}/{path_segment}"
+        final_url = f"{redirect_url.rstrip('/')}/{cleaned_path_segment.lstrip('/')}"
         logger.info(f"Redirecting to {final_url}")
         return redirect(final_url, code=302)
     except Exception as e:

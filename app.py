@@ -39,13 +39,41 @@ logger.debug("Initializing Flask app")
 # Configuration values (move to environment variables in production)
 FLASK_SECRET_KEY = "b8f9a3c2d7e4f1a9b0c3d6e8f2a7b4c9"
 WTF_CSRF_SECRET_KEY = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
-HMAC_KEY = secrets.token_bytes(32)
+HMAC_KEY_FILE = "hmac_key.bin"
 VALKEY_HOST = "valkey-137d99b9-reign.e.aivencloud.com"
 VALKEY_PORT = 25708
 VALKEY_USERNAME = "default"
 VALKEY_PASSWORD = "AVNS_Yzfa75IOznjCrZJIyzI"
 DATA_RETENTION_DAYS = 90
 USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/anderlo091/nvclerks-flask/main/user.txt")
+
+# Load or generate HMAC_KEY
+def load_or_generate_hmac_key():
+    try:
+        # Try to load from environment variable first
+        key = os.getenv("HMAC_KEY")
+        if key:
+            logger.debug("Loaded HMAC_KEY from environment variable")
+            return base64.b64decode(key)
+        # Fallback to file
+        if os.path.exists(HMAC_KEY_FILE):
+            with open(HMAC_KEY_FILE, "rb") as f:
+                key = f.read()
+                logger.debug("Loaded HMAC_KEY from file")
+                return key
+        # Generate new key and save to file
+        key = secrets.token_bytes(32)
+        with open(HMAC_KEY_FILE, "wb") as f:
+            f.write(key)
+        logger.debug("Generated and saved new HMAC_KEY")
+        # Also store in environment for subsequent runs
+        os.environ["HMAC_KEY"] = base64.b64encode(key).decode()
+        return key
+    except Exception as e:
+        logger.error(f"Error loading/generating HMAC_KEY: {str(e)}", exc_info=True)
+        raise
+
+HMAC_KEY = load_or_generate_hmac_key()
 
 # Flask configuration
 try:
@@ -374,9 +402,9 @@ def encrypt_slugstorm(payload):
         data = json.dumps({"payload": payload, "expires": expiry})
         uuid_chain = f"{uuid.uuid4()}{secrets.token_hex(20)}"
         h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
-        h.update(data.encode())
+        h.update(data.encode('utf-8'))
         signature = h.finalize()
-        result = f"{base64.urlsafe_b64encode(data.encode()).decode()}.{uuid_chain}.{base64.urlsafe_b64encode(signature).decode()}"
+        result = f"{base64.urlsafe_b64encode(data.encode('utf-8')).decode()}.{uuid_chain}.{base64.urlsafe_b64encode(signature).decode()}"
         logger.debug(f"SlugStorm encrypted payload: {result[:20]}...")
         return result
     except Exception as e:
@@ -386,29 +414,38 @@ def encrypt_slugstorm(payload):
 def decrypt_slugstorm(encrypted):
     try:
         parts = encrypted.split('.')
-        if len(parts) < 2:
-            logger.warning(f"SlugStorm: Expected at least 2 parts, got {len(parts)}")
+        if len(parts) != 3:
+            logger.warning(f"SlugStorm: Expected 3 parts, got {len(parts)}")
             raise ValueError("Invalid payload format")
-        data_b64 = parts[0]
-        sig_b64 = parts[-1]
+        data_b64, uuid_chain, sig_b64 = parts
         try:
             data = base64.urlsafe_b64decode(data_b64).decode('utf-8')
         except UnicodeDecodeError as e:
             logger.warning(f"UTF-8 decode failed: {str(e)}, trying latin1")
             data = base64.urlsafe_b64decode(data_b64).decode('latin1', errors='ignore')
-        logger.debug(f"SlugStorm raw decoded data: {data[:50]}...")
-        signature = base64.urlsafe_b64decode(sig_b64)
+        try:
+            signature = base64.urlsafe_b64decode(sig_b64)
+        except Exception as e:
+            logger.error(f"Signature decode failed: {str(e)}")
+            raise ValueError("Invalid signature format")
         h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
         h.update(data.encode('utf-8'))
-        h.verify(signature)
+        try:
+            h.verify(signature)
+        except cryptography.exceptions.InvalidSignature as e:
+            logger.error(f"HMAC verification failed: {str(e)}")
+            raise ValueError("Signature verification failed")
         data = json.loads(data)
         if data['expires'] < int(time.time() * 1000):
             logger.warning("SlugStorm payload expired")
             raise ValueError("Payload expired")
         logger.debug(f"SlugStorm decrypted payload: {json.dumps(data)[:50]}...")
         return data
-    except Exception as e:
+    except ValueError as e:
         logger.error(f"SlugStorm decryption error: {str(e)}", exc_info=True)
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected SlugStorm decryption error: {str(e)}", exc_info=True)
         raise ValueError("Invalid payload")
 
 def get_valid_usernames():
@@ -1705,7 +1742,7 @@ def fingerprint():
         logger.error(f"Error in fingerprint: {str(e)}", exc_info=True)
         return {"status": "error"}, 500
 
-@app.route("/<endpoint>/<path:encrypted_payload>/<path_segment>/<random_suffix>", methods=["GET"], subdomain="<username>")
+@app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>/<random_suffix>", methods=["GET"], subdomain="<username>")
 @rate_limit(limit=5, per=60)
 def redirect_handler(username, endpoint, encrypted_payload, path_segment, random_suffix):
     try:

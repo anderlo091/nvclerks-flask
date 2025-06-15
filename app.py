@@ -2,9 +2,7 @@ from flask import Flask, request, redirect, render_template_string, abort, url_f
 from flask_wtf import FlaskForm, CSRFProtect
 from wtforms import StringField, SubmitField, SelectField, BooleanField, HiddenField
 from wtforms.validators import DataRequired, Length, Regexp, URL
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.backends import default_backend
+from cryptography.fernet import Fernet, InvalidToken
 import os
 import base64
 import json
@@ -38,8 +36,7 @@ logger.debug("Initializing Flask app")
 # Configuration values
 FLASK_SECRET_KEY = "b8f9a3c2d7e4f1a9b0c3d6e8f2a7b4c9"
 WTF_CSRF_SECRET_KEY = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
-FERNET_KEY = b"4zX7k9j8k7j6h5g4f3d2s1a0z9x8c7v6b5n4m3l2k1=="
-CHACHA_KEY = base64.b64decode("Gis8P8zX7k9j8k7j6h5g4f3d2s1a0z9x8c7v6b5n==")
+FERNET_KEY = b"Z3X4Y5Z6A7B8C9D0E1F2G3H4I5J6K7L8M9N0O1P2=="
 VALKEY_HOST = "valkey-137d99b9-reign.e.aivencloud.com"
 VALKEY_PORT = 25708
 VALKEY_USERNAME = "default"
@@ -134,22 +131,6 @@ def datetime_filter(timestamp):
 
 app.jinja_env.filters['datetime'] = datetime_filter
 
-# Encryption rotation
-encryption_rotation = ['fernet', 'chacha20']
-encryption_index_key = "encryption_index"
-
-def get_next_encryption_method():
-    try:
-        if valkey_client:
-            index = int(valkey_client.get(encryption_index_key) or 0)
-            valkey_client.set(encryption_index_key, (index + 1) % len(encryption_rotation))
-            return encryption_rotation[index % len(encryption_rotation)]
-        else:
-            return secrets.choice(encryption_rotation)
-    except Exception as e:
-        logger.error(f"Error in get_next_encryption_method: {str(e)}")
-        return 'fernet'
-
 def rate_limit(limit=5, per=60):
     def decorator(f):
         @wraps(f)
@@ -180,15 +161,15 @@ def rate_limit(limit=5, per=60):
 def encrypt_fernet(payload):
     try:
         fernet = Fernet(FERNET_KEY)
-        data = payload.encode()
+        data = payload.encode('utf-8')
         encrypted = fernet.encrypt(data)
         slug = f"{uuid.uuid4()}{secrets.token_hex(10)}"
-        result = f"{base64.urlsafe_b64encode(encrypted).decode()}.{slug}"
+        result = f"{base64.urlsafe_b64encode(encrypted).decode('utf-8')}.{slug}"
         logger.debug(f"Fernet encrypted payload: {result[:20]}...")
         return result
     except Exception as e:
         logger.error(f"Fernet encryption error: {str(e)}", exc_info=True)
-        raise ValueError("Encryption failed")
+        raise ValueError(f"Encryption failed: {str(e)}")
 
 def decrypt_fernet(encrypted):
     try:
@@ -198,45 +179,15 @@ def decrypt_fernet(encrypted):
         encrypted_data = base64.urlsafe_b64decode(parts[0])
         fernet = Fernet(FERNET_KEY)
         decrypted = fernet.decrypt(encrypted_data)
-        result = decrypted.decode()
+        result = decrypted.decode('utf-8')
         logger.debug(f"Fernet decrypted payload: {result[:50]}...")
         return result
+    except InvalidToken as e:
+        logger.error(f"Fernet decryption error: Invalid token - {str(e)}")
+        raise ValueError(f"Invalid payload: {str(e)}")
     except Exception as e:
         logger.error(f"Fernet decryption error: {str(e)}", exc_info=True)
-        raise ValueError("Invalid payload")
-
-def encrypt_chacha20(payload):
-    try:
-        nonce = secrets.token_bytes(12)
-        cipher = Cipher(algorithms.ChaCha20(CHACHA_KEY, nonce), modes.NoPadding(), backend=default_backend())
-        encryptor = cipher.encryptor()
-        data = payload.encode()
-        ciphertext = encryptor.update(data) + encryptor.finalize()
-        slug = f"{uuid.uuid4()}{secrets.token_hex(10)}"
-        result = f"{base64.urlsafe_b64encode(nonce + ciphertext).decode()}.{slug}"
-        logger.debug(f"ChaCha20 encrypted payload: {result[:20]}...")
-        return result
-    except Exception as e:
-        logger.error(f"ChaCha20 encryption error: {str(e)}", exc_info=True)
-        raise ValueError("Encryption failed")
-
-def decrypt_chacha20(encrypted):
-    try:
-        parts = encrypted.split('.')
-        if len(parts) < 1:
-            raise ValueError("Invalid payload format")
-        encrypted_data = base64.urlsafe_b64decode(parts[0])
-        nonce = encrypted_data[:12]
-        ciphertext = encrypted_data[12:]
-        cipher = Cipher(algorithms.ChaCha20(CHACHA_KEY, nonce), modes.NoPadding(), backend=default_backend())
-        decryptor = cipher.decryptor()
-        decrypted = decryptor.update(ciphertext) + decryptor.finalize()
-        result = decrypted.decode()
-        logger.debug(f"ChaCha20 decrypted payload: {result[:50]}...")
-        return result
-    except Exception as e:
-        logger.error(f"ChaCha20 decryption error: {str(e)}", exc_info=True)
-        raise ValueError("Invalid payload")
+        raise ValueError(f"Decryption failed: {str(e)}")
 
 def get_valid_usernames():
     try:
@@ -437,7 +388,6 @@ def dashboard():
             if not error:
                 path_segment = f"{randomstring1}{base64email}{randomstring2}/{uuid.uuid4()}{secrets.token_hex(10)}"
                 endpoint = generate_random_string(16)
-                encryption_method = get_next_encryption_method()
                 expiry_timestamp = int(time.time()) + expiry
                 payload = json.dumps({
                     "student_link": destination_link,
@@ -446,12 +396,9 @@ def dashboard():
                 })
 
                 try:
-                    if encryption_method == 'fernet':
-                        encrypted_payload = encrypt_fernet(payload)
-                    else:
-                        encrypted_payload = encrypt_chacha20(payload)
-                except Exception as e:
-                    logger.error(f"Encryption failed with {encryption_method}: {str(e)}", exc_info=True)
+                    encrypted_payload = encrypt_fernet(payload)
+                except ValueError as e:
+                    logger.error(f"Encryption failed: {str(e)}")
                     error = f"Failed to encrypt payload: {str(e)}"
 
                 if not error:
@@ -464,14 +411,14 @@ def dashboard():
                                 "destination": destination_link,
                                 "encrypted_payload": encrypted_payload,
                                 "endpoint": endpoint,
-                                "encryption_method": encryption_method,
+                                "encryption_method": "fernet",
                                 "created": int(time.time()),
                                 "expiry": expiry_timestamp,
                                 "clicks": 0,
                                 "analytics_enabled": "1" if analytics_enabled else "0"
                             })
                             valkey_client.expire(f"user:{username}:url:{url_id}", DATA_RETENTION_DAYS * 86400)
-                            logger.info(f"Generated URL for {username}: {generated_url}, Method: {encryption_method}, Analytics: {analytics_enabled}")
+                            logger.info(f"Generated URL for {username}: {generated_url}, Method: fernet, Analytics: {analytics_enabled}")
                         except Exception as e:
                             logger.error(f"Valkey error storing URL: {str(e)}", exc_info=True)
                             error = "Failed to store URL in database"
@@ -786,7 +733,6 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         if valkey_client:
             try:
                 analytics_enabled = valkey_client.hget(f"user:{username}:url:{url_id}", "analytics_enabled") == "1"
-                encryption_method = valkey_client.hget(f"user:{username}:url:{url_id}", "encryption_method")
                 if analytics_enabled:
                     valkey_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
                     logger.debug(f"Incremented clicks for URL ID: {url_id}")
@@ -816,47 +762,36 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 logger.error(f"Valkey error checking cached payload: {str(e)}", exc_info=True)
 
         if not payload:
-            methods = [encryption_method] if encryption_method else ['fernet', 'chacha20']
-            for method in methods:
-                try:
-                    logger.debug(f"Trying decryption method: {method}")
-                    if method == 'fernet':
-                        payload = decrypt_fernet(encrypted_payload)
-                    else:
-                        payload = decrypt_chacha20(encrypted_payload)
-                    logger.debug(f"Decryption successful with {method}")
-                    if valkey_client:
-                        try:
-                            expiry = json.loads(payload).get('expiry', int(time.time()) + 86400)
-                            ttl = max(1, int(expiry - time.time()))
-                            valkey_client.setex(f"url_payload:{url_id}", ttl, payload)
-                            logger.debug(f"Cached payload for URL ID: {url_id} with TTL {ttl}s")
-                        except Exception as e:
-                            logger.error(f"Valkey error caching payload: {str(e)}", exc_info=True)
-                    break
-                except Exception as e:
-                    logger.debug(f"Decryption failed with {method}: {str(e)}")
-                    continue
-
-        if not payload:
-            logger.error(f"All decryption methods failed for payload: {encrypted_payload[:50]}...")
-            return render_template_string("""
-                <!DOCTYPE html>
-                <html lang="en">
-                <head>
-                    <meta charset="UTF-8">
-                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <title>Invalid Link</title>
-                    <script src="https://cdn.tailwindcss.com"></script>
-                </head>
-                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                        <h3 class="text-lg font-bold mb-4 text-red-600">Invalid Link</h3>
-                        <p class="text-gray-600">The link is invalid or has expired. Please contact support.</p>
-                    </div>
-                </body>
-                </html>
-            """), 400
+            try:
+                payload = decrypt_fernet(encrypted_payload)
+                logger.debug("Decryption successful with fernet")
+                if valkey_client:
+                    try:
+                        expiry = json.loads(payload).get('expiry', int(time.time()) + 86400)
+                        ttl = max(1, int(expiry - time.time()))
+                        valkey_client.setex(f"url_payload:{url_id}", ttl, payload)
+                        logger.debug(f"Cached payload for URL ID: {url_id} with TTL {ttl}s")
+                    except Exception as e:
+                        logger.error(f"Valkey error caching payload: {str(e)}", exc_info=True)
+            except ValueError as e:
+                logger.error(f"Decryption failed: {str(e)}")
+                return render_template_string("""
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Invalid Link</title>
+                        <script src="https://cdn.tailwindcss.com"></script>
+                    </head>
+                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                            <h3 class="text-lg font-bold mb-4 text-red-600">Invalid Link</h3>
+                            <p class="text-gray-600">The link is invalid or has expired. Please contact support.</p>
+                        </div>
+                    </body>
+                    </html>
+                """), 400
 
         try:
             data = json.loads(payload)

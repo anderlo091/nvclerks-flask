@@ -1,9 +1,9 @@
-from flask import Flask, request, redirect, render_template_string, abort, url_for, session, jsonify, Response
+from flask import Flask, request, redirect, render_template_string, abort, url_for, session, jsonify
 from flask_wtf import FlaskForm, CSRFProtect
 from wtforms import StringField, SubmitField, SelectField, BooleanField, HiddenField
 from wtforms.validators import DataRequired, Length, Regexp, URL
+from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.backends import default_backend
 import os
 import base64
@@ -13,6 +13,7 @@ import urllib.parse
 import secrets
 import logging
 import time
+import random
 from datetime import datetime, timedelta
 import uuid
 import hashlib
@@ -34,11 +35,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.debug("Initializing Flask app")
 
-# Hardcoded configuration values (move to environment variables in production)
+# Configuration values (move to environment variables in production)
 FLASK_SECRET_KEY = "b8f9a3c2d7e4f1a9b0c3d6e8f2a7b4c9"
 WTF_CSRF_SECRET_KEY = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
-ENCRYPTION_KEY = secrets.token_bytes(32)
-HMAC_KEY = secrets.token_bytes(32)
+FERNET_KEY = Fernet.generate_key()
+CHACHA_KEY = secrets.token_bytes(32)
 VALKEY_HOST = "valkey-137d99b9-reign.e.aivencloud.com"
 VALKEY_PORT = 25708
 VALKEY_USERNAME = "default"
@@ -133,8 +134,8 @@ def datetime_filter(timestamp):
 
 app.jinja_env.filters['datetime'] = datetime_filter
 
-# Track encryption method rotation
-encryption_rotation = ['heap_x3', 'slugstorm', 'signed_token']
+# Encryption rotation
+encryption_rotation = ['fernet', 'chacha20']
 encryption_index_key = "encryption_index"
 
 def get_next_encryption_method():
@@ -147,7 +148,7 @@ def get_next_encryption_method():
             return secrets.choice(encryption_rotation)
     except Exception as e:
         logger.error(f"Error in get_next_encryption_method: {str(e)}")
-        return 'signed_token'
+        return 'fernet'
 
 def rate_limit(limit=5, per=60):
     def decorator(f):
@@ -176,125 +177,65 @@ def rate_limit(limit=5, per=60):
         return wrapped_function
     return decorator
 
-def generate_fingerprint():
+def encrypt_fernet(payload):
     try:
-        ip = request.remote_addr
-        raw = f"{ip}{time.time()}{secrets.token_hex(8)}"
-        fingerprint = hashlib.sha256(raw.encode()).hexdigest()[:16]
-        logger.debug(f"Generated fingerprint: {fingerprint}...")
-        return fingerprint
-    except Exception as e:
-        logger.error(f"Error in generate_fingerprint: {str(e)}", exc_info=True)
-        return hashlib.sha256(str(time.time()).encode()).hexdigest()[:16]
-
-def encrypt_heap_x3(payload, fingerprint):
-    try:
-        iv = secrets.token_bytes(12)
-        cipher = Cipher(algorithms.AES(ENCRYPTION_KEY), modes.GCM(iv), backend=default_backend())
-        encryptor = cipher.encryptor()
-        data = json.dumps({"payload": payload, "fingerprint": fingerprint}).encode()
-        ciphertext = encryptor.update(data) + encryptor.finalize()
-        encrypted = iv + ciphertext + encryptor.tag
+        fernet = Fernet(FERNET_KEY)
+        data = payload.encode()
+        encrypted = fernet.encrypt(data)
         slug = f"{uuid.uuid4()}{secrets.token_hex(10)}"
         result = f"{base64.urlsafe_b64encode(encrypted).decode()}.{slug}"
-        logger.debug(f"HEAP X3 encrypted payload: {result[:20]}...")
+        logger.debug(f"Fernet encrypted payload: {result[:20]}...")
         return result
     except Exception as e:
-        logger.error(f"HEAP X3 encryption error: {str(e)}", exc_info=True)
+        logger.error(f"Fernet encryption error: {str(e)}", exc_info=True)
         raise ValueError("Encryption failed")
 
-def decrypt_heap_x3(encrypted):
+def decrypt_fernet(encrypted):
     try:
         parts = encrypted.split('.')
         if len(parts) < 1:
             raise ValueError("Invalid payload format")
-        encrypted = base64.urlsafe_b64decode(parts[0])
-        iv = encrypted[:12]
-        tag = encrypted[-16:]
-        ciphertext = encrypted[12:-16]
-        cipher = Cipher(algorithms.AES(ENCRYPTION_KEY), modes.GCM(iv, tag), backend=default_backend())
+        encrypted_data = base64.urlsafe_b64decode(parts[0])
+        fernet = Fernet(FERNET_KEY)
+        decrypted = fernet.decrypt(encrypted_data)
+        result = decrypted.decode()
+        logger.debug(f"Fernet decrypted payload: {result[:50]}...")
+        return result
+    except Exception as e:
+        logger.error(f"Fernet decryption error: {str(e)}", exc_info=True)
+        raise ValueError("Invalid payload")
+
+def encrypt_chacha20(payload):
+    try:
+        nonce = secrets.token_bytes(12)
+        cipher = Cipher(algorithms.ChaCha20(CHACHA_KEY, nonce), modes.NoPadding(), backend=default_backend())
+        encryptor = cipher.encryptor()
+        data = payload.encode()
+        ciphertext = encryptor.update(data) + encryptor.finalize()
+        slug = f"{uuid.uuid4()}{secrets.token_hex(10)}"
+        result = f"{base64.urlsafe_b64encode(nonce + ciphertext).decode()}.{slug}"
+        logger.debug(f"ChaCha20 encrypted payload: {result[:20]}...")
+        return result
+    except Exception as e:
+        logger.error(f"ChaCha20 encryption error: {str(e)}", exc_info=True)
+        raise ValueError("Encryption failed")
+
+def decrypt_chacha20(encrypted):
+    try:
+        parts = encrypted.split('.')
+        if len(parts) < 1:
+            raise ValueError("Invalid payload format")
+        encrypted_data = base64.urlsafe_b64decode(parts[0])
+        nonce = encrypted_data[:12]
+        ciphertext = encrypted_data[12:]
+        cipher = Cipher(algorithms.ChaCha20(CHACHA_KEY, nonce), modes.NoPadding(), backend=default_backend())
         decryptor = cipher.decryptor()
         decrypted = decryptor.update(ciphertext) + decryptor.finalize()
-        result = json.loads(decrypted.decode())
-        logger.debug(f"HEAP X3 decrypted payload: {json.dumps(result)[:50]}...")
+        result = decrypted.decode()
+        logger.debug(f"ChaCha20 decrypted payload: {result[:50]}...")
         return result
     except Exception as e:
-        logger.error(f"HEAP X3 decryption error: {str(e)}", exc_info=True)
-        raise ValueError("Invalid payload")
-
-def encrypt_slugstorm(payload):
-    try:
-        expiry = (datetime.utcnow() + timedelta(hours=24)).timestamp() * 1000
-        data = json.dumps({"payload": payload, "expires": expiry})
-        uuid_chain = f"{uuid.uuid4()}{secrets.token_hex(10)}"
-        h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
-        h.update(data.encode())
-        signature = h.finalize()
-        result = f"{base64.urlsafe_b64encode(data.encode()).decode()}.{uuid_chain}.{base64.urlsafe_b64encode(signature).decode()}"
-        logger.debug(f"SlugStorm encrypted payload: {result[:20]}...")
-        return result
-    except Exception as e:
-        logger.error(f"SlugStorm encryption error: {str(e)}", exc_info=True)
-        raise ValueError("Encryption failed")
-
-def decrypt_slugstorm(encrypted):
-    try:
-        parts = encrypted.split('.')
-        if len(parts) < 2:
-            logger.warning(f"SlugStorm: Expected at least 2 parts, got {len(parts)}")
-            raise ValueError("Invalid payload format")
-        data_b64 = parts[0]
-        sig_b64 = parts[-1]
-        try:
-            data = base64.urlsafe_b64decode(data_b64).decode('utf-8')
-        except UnicodeDecodeError as e:
-            logger.warning(f"UTF-8 decode failed: {str(e)}, trying latin1")
-            data = base64.urlsafe_b64decode(data_b64).decode('latin1', errors='ignore')
-        logger.debug(f"SlugStorm raw decoded data: {data[:50]}...")
-        signature = base64.urlsafe_b64decode(sig_b64)
-        h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
-        h.update(data.encode('utf-8'))
-        h.verify(signature)
-        data = json.loads(data)
-        if data['expires'] < int(time.time() * 1000):
-            logger.warning("SlugStorm payload expired")
-            raise ValueError("Payload expired")
-        logger.debug(f"SlugStorm decrypted payload: {json.dumps(data)[:50]}...")
-        return data
-    except Exception as e:
-        logger.error(f"SlugStorm decryption error: {str(e)}", exc_info=True)
-        raise ValueError("Invalid payload")
-
-def encrypt_signed_token(payload):
-    try:
-        data = payload.encode()
-        h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
-        h.update(data)
-        signature = h.finalize()
-        uuid_chain = f"{uuid.uuid4()}{secrets.token_hex(10)}"
-        result = f"{base64.urlsafe_b64encode(data).decode()}.{uuid_chain}.{base64.urlsafe_b64encode(signature).decode()}"
-        logger.debug(f"Signed Token encrypted payload: {result[:20]}...")
-        return result
-    except Exception as e:
-        logger.error(f"Signed Token encryption error: {str(e)}", exc_info=True)
-        raise ValueError("Encryption failed")
-
-def decrypt_signed_token(encrypted):
-    try:
-        parts = encrypted.split('.')
-        if len(parts) != 3:
-            raise ValueError("Invalid signed token format")
-        data_b64, _, sig_b64 = parts
-        data = base64.urlsafe_b64decode(data_b64)
-        signature = base64.urlsafe_b64decode(sig_b64)
-        h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
-        h.update(data)
-        h.verify(signature)
-        result = data.decode()
-        logger.debug(f"Signed Token decrypted payload: {result[:50]}...")
-        return result
-    except Exception as e:
-        logger.error(f"Signed Token decryption error: {str(e)}", exc_info=True)
+        logger.error(f"ChaCha20 decryption error: {str(e)}", exc_info=True)
         raise ValueError("Invalid payload")
 
 def get_valid_usernames():
@@ -497,7 +438,6 @@ def dashboard():
                 path_segment = f"{randomstring1}{base64email}{randomstring2}/{uuid.uuid4()}{secrets.token_hex(10)}"
                 endpoint = generate_random_string(16)
                 encryption_method = get_next_encryption_method()
-                fingerprint = generate_fingerprint()
                 expiry_timestamp = int(time.time()) + expiry
                 payload = json.dumps({
                     "student_link": destination_link,
@@ -506,12 +446,10 @@ def dashboard():
                 })
 
                 try:
-                    if encryption_method == 'heap_x3':
-                        encrypted_payload = encrypt_heap_x3(payload, fingerprint)
-                    elif encryption_method == 'slugstorm':
-                        encrypted_payload = encrypt_slugstorm(payload)
+                    if encryption_method == 'fernet':
+                        encrypted_payload = encrypt_fernet(payload)
                     else:
-                        encrypted_payload = encrypt_signed_token(payload)
+                        encrypted_payload = encrypt_chacha20(payload)
                 except Exception as e:
                     logger.error(f"Encryption failed with {encryption_method}: {str(e)}", exc_info=True)
                     error = "Failed to encrypt payload"
@@ -827,6 +765,22 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                      f"encrypted_payload={encrypted_payload[:20]}..., path_segment={path_segment}, "
                      f"IP={request.remote_addr}, URL={request.url}")
 
+        # Referrer Check
+        referrer = request.headers.get("Referer", "")
+        allowed_referrers = [
+            f"https://{base_domain}", f"http://{base_domain}",
+            "https://mail.google.com", "https://outlook.live.com",
+            "https://twitter.com", "https://facebook.com"
+        ]
+        if not any(referrer.startswith(allowed) for allowed in allowed_referrers):
+            logger.warning(f"Invalid referrer: {referrer} for URL ID: {url_id}")
+            abort(403, "Invalid referrer")
+
+        # Randomized Redirect Delay
+        delay = random.uniform(0.1, 0.5)
+        time.sleep(delay)
+        logger.debug(f"Applied random delay of {delay:.3f} seconds")
+
         url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode()).hexdigest()
         if valkey_client:
             try:
@@ -861,18 +815,14 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 logger.error(f"Valkey error checking cached payload: {str(e)}", exc_info=True)
 
         if not payload:
-            methods = [encryption_method] if encryption_method else ['heap_x3', 'slugstorm', 'signed_token']
+            methods = [encryption_method] if encryption_method else ['fernet', 'chacha20']
             for method in methods:
                 try:
                     logger.debug(f"Trying decryption method: {method}")
-                    if method == 'heap_x3':
-                        data = decrypt_heap_x3(encrypted_payload)
-                        payload = data['payload']
-                    elif method == 'slugstorm':
-                        data = decrypt_slugstorm(encrypted_payload)
-                        payload = data['payload']
+                    if method == 'fernet':
+                        payload = decrypt_fernet(encrypted_payload)
                     else:
-                        payload = decrypt_signed_token(encrypted_payload)
+                        payload = decrypt_chacha20(encrypted_payload)
                     logger.debug(f"Decryption successful with {method}")
                     if valkey_client:
                         try:

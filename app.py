@@ -145,8 +145,8 @@ BOT_PATTERNS = ["googlebot", "bingbot", "yandex", "duckduckbot", "curl/", "wget/
 def is_bot(user_agent, headers, ip, endpoint):
     if 'username' in session:
         return False, "Authenticated user"
-    if endpoint.startswith("/") and endpoint != "/login":
-        return False, "Generated link access"
+    if endpoint == "/login" and user_agent and 'Mozilla' in user_agent and headers.get('Referer'):
+        return False, "Likely human login attempt"
     if not user_agent:
         return True, "Missing User-Agent"
     user_agent_lower = user_agent.lower()
@@ -167,8 +167,6 @@ def is_bot(user_agent, headers, ip, endpoint):
             pass
     if ip.startswith(('162.249.', '5.62.', '84.39.')):
         return True, "Data center IP"
-    if endpoint == "/login" and headers.get('Referer') and 'Mozilla' in user_agent:
-        return False, "Likely human"
     if 'js_verified' not in session:
         return True, "Missing JS verification"
     return False, "Human"
@@ -223,6 +221,7 @@ def rate_limit(limit=5, per=60):
             endpoint = request.path
             is_bot_flag, bot_reason = is_bot(user_agent, headers, ip, endpoint)
             if is_bot_flag:
+                logger.warning(f"Blocked request: {bot_reason}, IP: {ip}, Endpoint: {endpoint}")
                 abort(403, f"Access denied: {bot_reason}")
             if not valkey_client:
                 return f(*args, **kwargs)
@@ -267,9 +266,8 @@ def verify_browser():
 
 def encrypt_slugstorm(payload):
     try:
-        expiry = (datetime.utcnow() + timedelta(hours=24)).timestamp() * 1000
-        data = json.dumps({"payload": payload, "expires": expiry})
-        uuid_chain = f"{uuid.uuid4()}{secrets.token_hex(20)}"
+        data = json.dumps({"payload": payload})
+        uuid_chain = secrets.token_hex(16)
         h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
         h.update(data.encode('utf-8'))
         signature = h.finalize()
@@ -292,10 +290,7 @@ def decrypt_slugstorm(encrypted):
         h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
         h.update(data.encode('utf-8'))
         h.verify(signature)
-        data = json.loads(data)
-        if data['expires'] < int(time.time() * 1000):
-            raise ValueError("Payload expired")
-        return data
+        return json.loads(data)
     except ValueError as e:
         logger.error(f"SlugStorm decryption error: {str(e)}")
         raise
@@ -338,7 +333,7 @@ def block_ohio_subdomain():
 
 @app.before_request
 def log_visitor():
-    if request.path.startswith(('/static', '/challenge', '/fingerprint', '/denied')):
+    if request.path.startswith(('/static', '/challenge', '/fingerprint', '/denied', '/favicon.ico')):
         return
     username = session.get('username', 'default')
     user_agent = request.headers.get("User-Agent", "")
@@ -382,6 +377,10 @@ def log_visitor():
         except:
             pass
 
+@app.route("/favicon.ico", methods=["GET"])
+def favicon():
+    return "", 204
+
 @app.route("/login", methods=["GET", "POST"])
 @rate_limit(limit=5, per=60)
 def login():
@@ -413,8 +412,11 @@ def login():
                 <script>
                     function sendChallenge() {
                         let challenge = Math.random() * 1000;
-                        fetch('/challenge', { method: 'POST', headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({ challenge }) });
+                        fetch('/challenge', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ challenge: challenge })
+                        }).catch(() => {});
                     }
                     function getCanvasFingerprint() {
                         const canvas = document.createElement('canvas');
@@ -424,8 +426,14 @@ def login():
                         ctx.fillText('Fingerprint', 2, 2);
                         return canvas.toDataURL();
                     }
-                    window.onload = function() { sendChallenge(); fetch('/fingerprint', { method: 'POST',
-                        headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ fingerprint: getCanvasFingerprint() }) }); };
+                    window.onload = function() {
+                        sendChallenge();
+                        fetch('/fingerprint', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ fingerprint: getCanvasFingerprint() })
+                        }).catch(() => {});
+                    };
                 </script>
             </head>
             <body class="min-h-screen flex items-center justify-center p-4">
@@ -1495,7 +1503,7 @@ def denied():
 
 @app.route("/<path:path>", methods=["GET"])
 def catch_all(path):
-    logger.warning(f"404 Not Found: {path}")
+    logger.warning(f"404 Not Found: path={path}, host={request.host}, url={request.url}")
     return render_template_string("""
         <!DOCTYPE html>
         <html lang="en">
@@ -1514,11 +1522,16 @@ def catch_all(path):
         </html>
     """), 404
 
+@app.route("/favicon.ico", methods=["GET"])
+def favicon():
+    return "", 204
+
 def generate_random_string(length):
     try:
         characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
         return "".join(secrets.choice(characters) for _ in range(length))
-    except:
+    except Exception as e:
+        logger.error(f"Error generating random string: {str(e)}")
         return secrets.token_hex(length // 2)
 
 if __name__ == "__main__":

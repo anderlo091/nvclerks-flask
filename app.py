@@ -794,16 +794,36 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
 
         url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode()).hexdigest()
 
-        # Referrer Check
+        # Referrer Check (Updated)
         referrer = request.headers.get("Referer", "")
         allowed_referrers = [
             f"https://{base_domain}", f"http://{base_domain}",
+            f"https://*.{base_domain}", f"http://*.{base_domain}",  # Allow all subdomains
             "https://mail.google.com", "https://outlook.live.com",
-            "https://twitter.com", "https://facebook.com"
+            "https://mail.yahoo.com", "https://proton.me",  # Additional email clients
+            "https://twitter.com", "https://facebook.com",
+            "https://linkedin.com", "https://instagram.com"  # Additional social media
         ]
-        if not any(referrer.startswith(allowed) for allowed in allowed_referrers):
+        if referrer and not any(referrer.startswith(allowed) for allowed in allowed_referrers):
             logger.warning(f"Invalid referrer: {referrer} for URL ID: {url_id}")
-            abort(403, "Invalid referrer")
+            return render_template_string("""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>403 Forbidden</title>
+                    <script src="https://cdn.tailwindcss.com"></script>
+                </head>
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">403 Forbidden</h3>
+                        <p class="text-gray-600">Invalid referrer. Please access this link from an authorized source.</p>
+                    </div>
+                </body>
+                </html>
+            """), 403
+        logger.debug(f"Referrer check passed: {referrer} for URL ID: {url_id}")
 
         # Randomized Redirect Delay
         delay = random.uniform(0.1, 0.5)

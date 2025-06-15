@@ -36,13 +36,21 @@ logger.debug("Initializing Flask app")
 # Configuration values
 FLASK_SECRET_KEY = "b8f9a3c2d7e4f1a9b0c3d6e8f2a7b4c9"
 WTF_CSRF_SECRET_KEY = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
-FERNET_KEY = b"Z3X4Y5Z6A7B8C9D0E1F2G3H4I5J6K7L8M9N0O1P2=="
+FERNET_KEY = b"eXg2M3p4N2E4YTVjN2Q4ZTZmM2c0aTVqN2s4bTVuN3A4cTVyN3Q4dTV2=="
 VALKEY_HOST = "valkey-137d99b9-reign.e.aivencloud.com"
 VALKEY_PORT = 25708
 VALKEY_USERNAME = "default"
 VALKEY_PASSWORD = "AVNS_Yzfa75IOznjCrZJIyzI"
 DATA_RETENTION_DAYS = 90
 USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/anderlo091/nvclerks-flask/main/user.txt")
+
+# Verify Fernet key at startup
+try:
+    Fernet(FERNET_KEY)
+    logger.debug("Fernet key validated successfully")
+except Exception as e:
+    logger.error(f"Invalid Fernet key at startup: {str(e)}")
+    raise ValueError(f"Fernet key initialization failed: {str(e)}")
 
 # Flask configuration
 try:

@@ -2,7 +2,9 @@ from flask import Flask, request, redirect, render_template_string, abort, url_f
 from flask_wtf import FlaskForm, CSRFProtect
 from wtforms import StringField, SubmitField, SelectField, BooleanField, HiddenField
 from wtforms.validators import DataRequired, Length, Regexp, URL
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import hashes, hmac
+from cryptography.hazmat.backends import default_backend
 import os
 import base64
 import json
@@ -36,7 +38,8 @@ logger.debug("Initializing Flask app")
 # Configuration values
 FLASK_SECRET_KEY = "b8f9a3c2d7e4f1a9b0c3d6e8f2a7b4c9"
 WTF_CSRF_SECRET_KEY = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
-FERNET_KEY = b"2H4sQz8wN2k4YTVjN2Q4ZTZmM2c0aTVqN2s4bTVuN3A4cTVyN3Q4dTV2=="
+AES_GCM_KEY = b'\x1a\x2b\x3c\x4d\x5e\x6f\x70\x81\x92\xa3\xb4\xc5\xd6\xe7\xf8\x09\x1a\x2b\x3c\x4d\x5e\x6f\x70\x81\x92\xa3\xb4\xc5\xd6\xe7\xf8\x09'
+HMAC_KEY = b'\x0a\x1b\x2c\x3d\x4e\x5f\x60\x71\x82\x93\xa4\xb5\xc6\xd7\xe8\xf9\x0a\x1b\x2c\x3d\x4e\x5f\x60\x71\x82\x93\xa4\xb5\xc6\xd7\xe8\xf9'
 VALKEY_HOST = "valkey-137d99b9-reign.e.aivencloud.com"
 VALKEY_PORT = 25708
 VALKEY_USERNAME = "default"
@@ -44,14 +47,26 @@ VALKEY_PASSWORD = "AVNS_Yzfa75IOznjCrZJIyzI"
 DATA_RETENTION_DAYS = 90
 USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/anderlo091/nvclerks-flask/main/user.txt")
 
-# Verify Fernet key at startup
+# Verify keys at startup
 try:
-    Fernet(FERNET_KEY)
-    logger.debug("Fernet key validated successfully")
+    if len(AES_GCM_KEY) != 32:
+        raise ValueError("AES-GCM key must be 32 bytes")
+    Cipher(algorithms.AES(AES_GCM_KEY), modes.GCM(secrets.token_bytes(12)), backend=default_backend())
+    logger.debug("AES-GCM key validated successfully")
 except Exception as e:
-    logger.error(f"Invalid Fernet key at startup: {str(e)}")
-    logger.error(f"Key: {FERNET_KEY}, Length: {len(FERNET_KEY)}, Decoded Length: {len(base64.urlsafe_b64decode(FERNET_KEY)) if FERNET_KEY else 'N/A'}")
-    raise ValueError(f"Fernet key initialization failed: {str(e)}")
+    logger.error(f"Invalid AES-GCM key at startup: {str(e)}")
+    raise ValueError(f"AES-GCM key initialization failed: {str(e)}")
+
+try:
+    if len(HMAC_KEY) != 32:
+        raise ValueError("HMAC key must be 32 bytes")
+    h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
+    h.update(b"test")
+    h.finalize()
+    logger.debug("HMAC key validated successfully")
+except Exception as e:
+    logger.error(f"Invalid HMAC key at startup: {str(e)}")
+    raise ValueError(f"HMAC key initialization failed: {str(e)}")
 
 # Flask configuration
 try:
@@ -140,6 +155,22 @@ def datetime_filter(timestamp):
 
 app.jinja_env.filters['datetime'] = datetime_filter
 
+# Encryption rotation
+encryption_rotation = ['aes_gcm', 'hmac_sha256']
+encryption_index_key = "encryption_index"
+
+def get_next_encryption_method():
+    try:
+        if valkey_client:
+            index = int(valkey_client.get(encryption_index_key) or 0)
+            valkey_client.set(encryption_index_key, (index + 1) % len(encryption_rotation))
+            return encryption_rotation[index % len(encryption_rotation)]
+        else:
+            return secrets.choice(encryption_rotation)
+    except Exception as e:
+        logger.error(f"Error in get_next_encryption_method: {str(e)}")
+        return 'aes_gcm'
+
 def rate_limit(limit=5, per=60):
     def decorator(f):
         @wraps(f)
@@ -167,35 +198,71 @@ def rate_limit(limit=5, per=60):
         return wrapped_function
     return decorator
 
-def encrypt_fernet(payload):
+def encrypt_aes_gcm(payload):
     try:
-        fernet = Fernet(FERNET_KEY)
+        iv = secrets.token_bytes(12)
+        cipher = Cipher(algorithms.AES(AES_GCM_KEY), modes.GCM(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
         data = payload.encode('utf-8')
-        encrypted = fernet.encrypt(data)
+        ciphertext = encryptor.update(data) + encryptor.finalize()
+        encrypted = iv + ciphertext + encryptor.tag
         slug = f"{uuid.uuid4()}{secrets.token_hex(10)}"
         result = f"{base64.urlsafe_b64encode(encrypted).decode('utf-8')}.{slug}"
-        logger.debug(f"Fernet encrypted payload: {result[:20]}...")
+        logger.debug(f"AES-GCM encrypted payload: {result[:20]}...")
         return result
     except Exception as e:
-        logger.error(f"Fernet encryption error: {str(e)}", exc_info=True)
+        logger.error(f"AES-GCM encryption error: {str(e)}", exc_info=True)
         raise ValueError(f"Encryption failed: {str(e)}")
 
-def decrypt_fernet(encrypted):
+def decrypt_aes_gcm(encrypted):
     try:
         parts = encrypted.split('.')
         if len(parts) < 1:
             raise ValueError("Invalid payload format")
         encrypted_data = base64.urlsafe_b64decode(parts[0])
-        fernet = Fernet(FERNET_KEY)
-        decrypted = fernet.decrypt(encrypted_data)
+        iv = encrypted_data[:12]
+        tag = encrypted_data[-16:]
+        ciphertext = encrypted_data[12:-16]
+        cipher = Cipher(algorithms.AES(AES_GCM_KEY), modes.GCM(iv, tag), backend=default_backend())
+        decryptor = cipher.decryptor()
+        decrypted = decryptor.update(ciphertext) + decryptor.finalize()
         result = decrypted.decode('utf-8')
-        logger.debug(f"Fernet decrypted payload: {result[:50]}...")
+        logger.debug(f"AES-GCM decrypted payload: {result[:50]}...")
         return result
-    except InvalidToken as e:
-        logger.error(f"Fernet decryption error: Invalid token - {str(e)}")
-        raise ValueError(f"Invalid payload: {str(e)}")
     except Exception as e:
-        logger.error(f"Fernet decryption error: {str(e)}", exc_info=True)
+        logger.error(f"AES-GCM decryption error: {str(e)}", exc_info=True)
+        raise ValueError(f"Decryption failed: {str(e)}")
+
+def encrypt_hmac_sha256(payload):
+    try:
+        data = payload.encode('utf-8')
+        h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
+        h.update(data)
+        signature = h.finalize()
+        slug = f"{uuid.uuid4()}{secrets.token_hex(10)}"
+        result = f"{base64.urlsafe_b64encode(data).decode('utf-8')}.{slug}.{base64.urlsafe_b64encode(signature).decode('utf-8')}"
+        logger.debug(f"HMAC-SHA256 encrypted payload: {result[:20]}...")
+        return result
+    except Exception as e:
+        logger.error(f"HMAC-SHA256 encryption error: {str(e)}", exc_info=True)
+        raise ValueError(f"Encryption failed: {str(e)}")
+
+def decrypt_hmac_sha256(encrypted):
+    try:
+        parts = encrypted.split('.')
+        if len(parts) < 3:
+            raise ValueError("Invalid payload format")
+        data_b64, _, sig_b64 = parts
+        data = base64.urlsafe_b64decode(data_b64)
+        signature = base64.urlsafe_b64decode(sig_b64)
+        h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
+        h.update(data)
+        h.verify(signature)
+        result = data.decode('utf-8')
+        logger.debug(f"HMAC-SHA256 decrypted payload: {result[:50]}...")
+        return result
+    except Exception as e:
+        logger.error(f"HMAC-SHA256 decryption error: {str(e)}", exc_info=True)
         raise ValueError(f"Decryption failed: {str(e)}")
 
 def get_valid_usernames():
@@ -397,6 +464,7 @@ def dashboard():
             if not error:
                 path_segment = f"{randomstring1}{base64email}{randomstring2}/{uuid.uuid4()}{secrets.token_hex(10)}"
                 endpoint = generate_random_string(16)
+                encryption_method = get_next_encryption_method()
                 expiry_timestamp = int(time.time()) + expiry
                 payload = json.dumps({
                     "student_link": destination_link,
@@ -405,9 +473,12 @@ def dashboard():
                 })
 
                 try:
-                    encrypted_payload = encrypt_fernet(payload)
+                    if encryption_method == 'aes_gcm':
+                        encrypted_payload = encrypt_aes_gcm(payload)
+                    else:
+                        encrypted_payload = encrypt_hmac_sha256(payload)
                 except ValueError as e:
-                    logger.error(f"Encryption failed: {str(e)}")
+                    logger.error(f"Encryption failed with {encryption_method}: {str(e)}")
                     error = f"Failed to encrypt payload: {str(e)}"
 
                 if not error:
@@ -420,14 +491,14 @@ def dashboard():
                                 "destination": destination_link,
                                 "encrypted_payload": encrypted_payload,
                                 "endpoint": endpoint,
-                                "encryption_method": "fernet",
+                                "encryption_method": encryption_method,
                                 "created": int(time.time()),
                                 "expiry": expiry_timestamp,
                                 "clicks": 0,
                                 "analytics_enabled": "1" if analytics_enabled else "0"
                             })
                             valkey_client.expire(f"user:{username}:url:{url_id}", DATA_RETENTION_DAYS * 86400)
-                            logger.info(f"Generated URL for {username}: {generated_url}, Method: fernet, Analytics: {analytics_enabled}")
+                            logger.info(f"Generated URL for {username}: {generated_url}, Method: {encryption_method}, Analytics: {analytics_enabled}")
                         except Exception as e:
                             logger.error(f"Valkey error storing URL: {str(e)}", exc_info=True)
                             error = "Failed to store URL in database"
@@ -742,6 +813,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
         if valkey_client:
             try:
                 analytics_enabled = valkey_client.hget(f"user:{username}:url:{url_id}", "analytics_enabled") == "1"
+                encryption_method = valkey_client.hget(f"user:{username}:url:{url_id}", "encryption_method")
                 if analytics_enabled:
                     valkey_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
                     logger.debug(f"Incremented clicks for URL ID: {url_id}")
@@ -771,36 +843,47 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment):
                 logger.error(f"Valkey error checking cached payload: {str(e)}", exc_info=True)
 
         if not payload:
-            try:
-                payload = decrypt_fernet(encrypted_payload)
-                logger.debug("Decryption successful with fernet")
-                if valkey_client:
-                    try:
-                        expiry = json.loads(payload).get('expiry', int(time.time()) + 86400)
-                        ttl = max(1, int(expiry - time.time()))
-                        valkey_client.setex(f"url_payload:{url_id}", ttl, payload)
-                        logger.debug(f"Cached payload for URL ID: {url_id} with TTL {ttl}s")
-                    except Exception as e:
-                        logger.error(f"Valkey error caching payload: {str(e)}", exc_info=True)
-            except ValueError as e:
-                logger.error(f"Decryption failed: {str(e)}")
-                return render_template_string("""
-                    <!DOCTYPE html>
-                    <html lang="en">
-                    <head>
-                        <meta charset="UTF-8">
-                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                        <title>Invalid Link</title>
-                        <script src="https://cdn.tailwindcss.com"></script>
-                    </head>
-                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                            <h3 class="text-lg font-bold mb-4 text-red-600">Invalid Link</h3>
-                            <p class="text-gray-600">The link is invalid or has expired. Please contact support.</p>
-                        </div>
-                    </body>
-                    </html>
-                """), 400
+            methods = [encryption_method] if encryption_method else ['aes_gcm', 'hmac_sha256']
+            for method in methods:
+                try:
+                    logger.debug(f"Trying decryption method: {method}")
+                    if method == 'aes_gcm':
+                        payload = decrypt_aes_gcm(encrypted_payload)
+                    else:
+                        payload = decrypt_hmac_sha256(encrypted_payload)
+                    logger.debug(f"Decryption successful with {method}")
+                    if valkey_client:
+                        try:
+                            expiry = json.loads(payload).get('expiry', int(time.time()) + 86400)
+                            ttl = max(1, int(expiry - time.time()))
+                            valkey_client.setex(f"url_payload:{url_id}", ttl, payload)
+                            logger.debug(f"Cached payload for URL ID: {url_id} with TTL {ttl}s")
+                        except Exception as e:
+                            logger.error(f"Valkey error caching payload: {str(e)}", exc_info=True)
+                    break
+                except ValueError as e:
+                    logger.debug(f"Decryption failed with {method}: {str(e)}")
+                    continue
+
+        if not payload:
+            logger.error(f"All decryption methods failed for payload: {encrypted_payload[:50]}...")
+            return render_template_string("""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Invalid Link</title>
+                    <script src="https://cdn.tailwindcss.com"></script>
+                </head>
+                <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+                    <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Invalid Link</h3>
+                        <p class="text-gray-600">The link is invalid or has expired. Please contact support.</p>
+                    </div>
+                </body>
+                </html>
+            """), 400
 
         try:
             data = json.loads(payload)

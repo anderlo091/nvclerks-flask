@@ -50,44 +50,19 @@ USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/ande
 # Load or generate HMAC_KEY
 def load_or_generate_hmac_key():
     try:
-        # Try to load from environment variable first
+        # Load from environment variable
         key = os.getenv("HMAC_KEY")
         if key:
             logger.debug("Loaded HMAC_KEY from environment variable")
             return base64.b64decode(key)
-        # Fallback to file
-        if os.path.exists(HMAC_KEY_FILE):
-            with open(HMAC_KEY_FILE, "rb") as f:
-                key = f.read()
-                logger.debug("Loaded HMAC_KEY from file")
-                return key
-        # Generate new key and save to file
+        # Fallback to transient key (warn about potential link invalidation)
         key = secrets.token_bytes(32)
-        with open(HMAC_KEY_FILE, "wb") as f:
-            f.write(key)
-        logger.debug("Generated and saved new HMAC_KEY")
-        # Also store in environment for subsequent runs
-        os.environ["HMAC_KEY"] = base64.b64encode(key).decode()
+        logger.warning("No HMAC_KEY set in environment variable. Using transient key, which may invalidate existing links on restart. "
+                       "Set HMAC_KEY environment variable to a base64-encoded 32-byte key to ensure link persistence.")
         return key
     except Exception as e:
         logger.error(f"Error loading/generating HMAC_KEY: {str(e)}", exc_info=True)
         raise
-
-HMAC_KEY = load_or_generate_hmac_key()
-
-# Flask configuration
-try:
-    app.config['SECRET_KEY'] = FLASK_SECRET_KEY
-    app.config['WTF_CSRF_SECRET_KEY'] = WTF_CSRF_SECRET_KEY
-    app.config['SESSION_COOKIE_HTTPONLY'] = True
-    app.config['SESSION_COOKIE_SECURE'] = True
-    app.config['SESSION_COOKIE_SAMESITE'] = 'Strict'
-    app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=1)
-    logger.debug("Flask configuration set successfully")
-except Exception as e:
-    logger.error(f"Error setting Flask config: {str(e)}", exc_info=True)
-    raise
-
 # CSRF protection
 csrf = CSRFProtect(app)
 
@@ -1993,16 +1968,6 @@ def catch_all(path):
         </body>
         </html>
     """), 404
-
-def generate_random_string(length):
-    try:
-        characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-        result = "".join(secrets.choice(characters) for _ in range(length))
-        logger.debug(f"Generated random string: {result[:10]}...")
-        return result
-    except Exception as e:
-        logger.error(f"Error generating random string: {str(e)}", exc_info=True)
-        return secrets.token_hex(length // 2)
 
 if __name__ == "__main__":
     try:

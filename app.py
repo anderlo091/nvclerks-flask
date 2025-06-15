@@ -36,13 +36,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration values
-app.config['SECRET_KEY'] = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
-app.config['WTF_CSRF_SECRET_KEY'] = os.getenv("WTF_CSRF_SECRET_KEY", secrets.token_hex(32))
+app.config['SECRET_KEY'] = os.getenv("FLASK_SECRET_KEY", "b8f9a3c2d7e4f1a9b0c3d6e8f2a7b4c9")
+app.config['WTF_CSRF_SECRET_KEY'] = os.getenv("WTF_CSRF_SECRET_KEY", "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6")
 app.config['SESSION_COOKIE_SECURE'] = True
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=7)
 
+HMAC_KEY_FILE = "hmac_key.bin"  # Retained for consistency
 VALKEY_HOST = os.getenv("VALKEY_HOST", "valkey-137d99b9-reign.e.aivencloud.com")
 VALKEY_PORT = int(os.getenv("VALKEY_PORT", 25708))
 VALKEY_USERNAME = os.getenv("VALKEY_USERNAME", "default")
@@ -69,8 +70,8 @@ csrf = CSRFProtect(app)
 class LoginForm(FlaskForm):
     username = StringField('Username', validators=[
         DataRequired(message="Username is required"),
-        Length(min=2, message="Username must be at least 2 characters"),
-        Regexp(r'^[A-Za-z0-9_@.]+$', message="Username can only contain letters, numbers, _, @, or .")
+        Length(min=2, max=100),
+        Regexp(r'^[A-Za-z0-9_@.]+$')
     ])
     next_url = HiddenField('Next')
     submit = SubmitField('Login')
@@ -78,27 +79,27 @@ class LoginForm(FlaskForm):
 class GenerateURLForm(FlaskForm):
     subdomain = StringField('Subdomain', validators=[
         DataRequired(message="Subdomain is required"),
-        Length(min=2, message="Subdomain must be at least 2 characters"),
-        Regexp(r'^[A-Za-z0-9-]+$', message="Subdomain can only contain letters, numbers, or hyphens")
+        Length(min=2, max=200),
+        Regexp(r'^[A-Za-z0-9-]+$')
     ])
     randomstring1 = StringField('Randomstring1', validators=[
         DataRequired(message="Randomstring1 is required"),
-        Length(min=2, message="Randomstring1 must be at least 2 characters"),
-        Regexp(r'^[A-Za-z0-9_@.]+$', message="Randomstring1 can only contain letters, numbers, _, @, or .")
+        Length(min=2, max=200),
+        Regexp(r'^[A-Za-z0-9_@.]+$')
     ])
     base64email = StringField('Base64email', validators=[
         DataRequired(message="Base64email is required"),
-        Length(min=2, message="Base64email must be at least 2 characters"),
-        Regexp(r'^[A-Za-z0-9_@.]+$', message="Base64email can only contain letters, numbers, _, @, or .")
+        Length(min=2, max=200),
+        Regexp(r'^[A-Za-z0-9_@.]+$')
     ])
     destination_link = StringField('Destination Link', validators=[
         DataRequired(message="Destination link is required"),
-        URL(message="Invalid URL format (must start with http:// or https://)")
+        URL(message="Invalid URL format")
     ])
     randomstring2 = StringField('Randomstring2', validators=[
         DataRequired(message="Randomstring2 is required"),
-        Length(min=2, message="Randomstring2 must be at least 2 characters"),
-        Regexp(r'^[A-Za-z0-9_@.]+$', message="Randomstring2 can only contain letters, numbers, _, @, or .")
+        Length(min=2, max=200),
+        Regexp(r'^[A-Za-z0-9_@.]+$')
     ])
     expiry = SelectField('Expiry', choices=[
         ('3600', '1 Hour'),
@@ -128,54 +129,45 @@ except Exception as e:
     logger.error(f"Valkey connection failed: {str(e)}")
     valkey_client = None
 
-# Custom Jinja2 filter
+# Jinja2 filter
 def datetime_filter(timestamp):
     try:
         return datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
     except (TypeError, ValueError):
-        return "Not Available"
+        return "N/A"
 
 app.jinja_env.filters['datetime'] = datetime_filter
 
-# Bot detection patterns
+# Bot detection
 BOT_PATTERNS = ["googlebot", "bingbot", "yandex", "duckduckbot", "curl/", "wget/", "headless"]
 
 def is_bot(user_agent, headers, ip, endpoint):
-    if 'username' in session:
-        return False, "Authenticated user"
-    if endpoint.startswith("/") and endpoint != "/login":
-        return False, "Generated link access"
+    if 'username' in session or (endpoint.startswith("/") and endpoint != "/login"):
+        return False, "Allowed access"
     if not user_agent:
-        logger.warning(f"Blocked IP {ip}: No User-Agent")
         return True, "Missing User-Agent"
     user_agent_lower = user_agent.lower()
     for pattern in BOT_PATTERNS:
         if pattern in user_agent_lower:
-            logger.warning(f"Blocked IP {ip}: Bot pattern {pattern}")
             return True, f"Known bot: {pattern}"
     if 'HeadlessChrome' in user_agent or 'PhantomJS' in user_agent:
-        logger.warning(f"Blocked IP {ip}: Headless browser")
         return True, "Headless browser"
     if valkey_client:
         key = f"bot_check:{ip}"
         count = valkey_client.get(key)
         if count and int(count) > 10:
-            logger.warning(f"Blocked IP {ip}: Rapid requests")
             return True, "Rapid requests"
         valkey_client.incr(key)
         valkey_client.expire(key, 60)
     if ip.startswith(('162.249.', '5.62.', '84.39.')):
-        logger.warning(f"Blocked IP {ip}: Data center IP")
         return True, "Data center IP"
     if endpoint == "/login" and headers.get('Referer') and 'Mozilla' in user_agent:
-        return False, "Likely human (login attempt)"
+        return False, "Likely human"
     if 'js_verified' not in session:
-        logger.warning(f"Blocked IP {ip}: Missing JS verification")
         return True, "Missing JS verification"
     return False, "Human"
 
 def check_asn(ip):
-    logger.info("Skipping ASN check (no MaxMind key)")
     return False
 
 def get_geoip(ip):
@@ -186,85 +178,61 @@ def get_geoip(ip):
         data = response.json()
         if data.get('status') == 'success':
             return {
-                "country": data.get('country', 'Not Available'),
+                "country": data.get('country', 'N/A'),
                 "country_code": data.get('countryCode', 'N/A'),
-                "region": data.get('regionName', 'Not Available'),
+                "region": data.get('regionName', 'N/A'),
                 "region_code": data.get('region', 'N/A'),
-                "city": data.get('city', 'Not Available'),
+                "city": data.get('city', 'N/A'),
                 "zip": data.get('zip', 'N/A'),
                 "latitude": float(data.get('lat', 0.0)),
                 "longitude": float(data.get('lon', 0.0)),
                 "timezone": data.get('timezone', 'UTC'),
-                "isp": data.get('isp', 'Not Available'),
-                "organization": data.get('org', 'Not Available'),
+                "isp": data.get('isp', 'N/A'),
+                "organization": data.get('org', 'N/A'),
                 "as_number": data.get('as', 'N/A')
             }
-        logger.info(f"Falling back to freegeoip.app for IP {ip}")
         fallback_url = f"https://freegeoip.app/json/{ip}"
         response = requests.get(fallback_url, timeout=3)
         response.raise_for_status()
         data = response.json()
         if data.get('ip'):
             return {
-                "country": data.get('country_name', 'Not Available'),
+                "country": data.get('country_name', 'N/A'),
                 "country_code": data.get('country_code', 'N/A'),
-                "region": data.get('region_name', 'Not Available'),
+                "region": data.get('region_name', 'N/A'),
                 "region_code": data.get('region_code', 'N/A'),
-                "city": data.get('city', 'Not Available'),
+                "city": data.get('city', 'N/A'),
                 "zip": data.get('zip_code', 'N/A'),
                 "latitude": float(data.get('latitude', 0.0)),
                 "longitude": float(data.get('longitude', 0.0)),
                 "timezone": data.get('time_zone', 'UTC'),
-                "isp": 'Not Available',
-                "organization": 'Not Available',
+                "isp": 'N/A',
+                "organization": 'N/A',
                 "as_number": 'N/A'
             }
-        return {
-            "country": "Not Available",
-            "country_code": "N/A",
-            "region": "Not Available",
-            "region_code": "N/A",
-            "city": "Not Available",
-            "zip": "N/A",
-            "latitude": 0.0,
-            "longitude": 0.0,
-            "timezone": "UTC",
-            "isp": "Not Available",
-            "organization": "Not Available",
-            "as_number": "N/A"
-        }
-    except Exception as e:
-        logger.error(f"GeoIP lookup failed for IP {ip}: {str(e)}")
-        return {
-            "country": "Not Available",
-            "country_code": "N/A",
-            "region": "Not Available",
-            "region_code": "N/A",
-            "city": "Not Available",
-            "zip": "N/A",
-            "latitude": 0.0,
-            "longitude": 0.0,
-            "timezone": "UTC",
-            "isp": "Not Available",
-            "organization": "Not Available",
-            "as_number": "N/A"
-        }
+    except Exception:
+        pass
+    return {
+        "country": "N/A",
+        "country_code": "N/A",
+        "region": "N/A",
+        "region_code": "N/A",
+        "city": "N/A",
+        "zip": "N/A",
+        "latitude": 0.0,
+        "longitude": 0.0,
+        "timezone": "UTC",
+        "isp": "N/A",
+        "organization": "N/A",
+        "as_number": "N/A"
+    }
 
 def get_device_info(user_agent_string):
     try:
         ua = parse(user_agent_string)
-        device_type = "Desktop"
-        screen_type = "Standard"
-        if ua.is_mobile:
-            device_type = "Mobile"
-            screen_type = "Touchscreen"
-        elif ua.is_tablet:
-            device_type = "Tablet"
-            screen_type = "Touchscreen"
-        elif ua.is_pc:
-            device_type = "Desktop"
-            screen_type = "Standard"
-        app = ua.browser.family if ua.browser.family else "Not Available"
+        device_type = "Desktop" if ua.is_pc else "Mobile" if ua.is_mobile else "Tablet" if ua.is_tablet else "N/A"
+        screen_type = "Touchscreen" if device_type in ["Mobile", "Tablet"] else "Standard"
+        app = ua.browser.family or "N/A"
         if "Outlook" in user_agent_string:
             app = "Outlook"
         return {
@@ -274,9 +242,9 @@ def get_device_info(user_agent_string):
         }
     except Exception:
         return {
-            "device_type": "Not Available",
-            "screen_type": "Not Available",
-            "application": "Not Available"
+            "device_type": "N/A",
+            "screen_type": "N/A",
+            "application": "N/A"
         }
 
 def rate_limit(limit=5, per=60):
@@ -289,17 +257,14 @@ def rate_limit(limit=5, per=60):
             endpoint = request.path
             is_bot_flag, bot_reason = is_bot(user_agent, headers, ip, endpoint)
             if is_bot_flag:
-                logger.warning(f"Blocked request from IP {ip}: {bot_reason}")
                 abort(403, f"Access denied: {bot_reason}")
             if not valkey_client:
-                logger.warning("Valkey unavailable, skipping rate limit")
                 return f(*args, **kwargs)
             key = f"rate_limit:{ip}:{f.__name__}"
             current = valkey_client.get(key)
             if current is None:
                 valkey_client.setex(key, per, 1)
             elif int(current) >= limit:
-                logger.warning(f"Rate limit exceeded for IP: {ip}")
                 abort(429, "Too Many Requests")
             else:
                 valkey_client.incr(key)
@@ -316,7 +281,6 @@ def generate_fingerprint():
 
 def verify_browser():
     if not valkey_client:
-        logger.warning("Valkey unavailable, skipping browser verification")
         return True
     fingerprint = generate_fingerprint()
     session_key = f"browser:{fingerprint}"
@@ -329,11 +293,11 @@ def verify_browser():
 def encrypt_slugstorm(payload):
     expiry = (datetime.utcnow() + timedelta(hours=24)).timestamp() * 1000
     data = json.dumps({"payload": payload, "expires": expiry})
+    uuid_chain = secrets.token_hex(10)
     h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
     h.update(data.encode('utf-8'))
     signature = h.finalize()
-    result = f"{base64.urlsafe_b64encode(data.encode()).decode()}.{secrets.token_hex(20)}.{base64.urlsafe_b64encode(signature).decode()}"
-    return result
+    return f"{base64.urlsafe_b64encode(data.encode()).decode()}.{uuid_chain}.{base64.urlsafe_b64encode(signature).decode()}"
 
 def decrypt_slugstorm(encrypted):
     parts = encrypted.split('.')
@@ -365,8 +329,7 @@ def get_valid_usernames():
         if valkey_client:
             valkey_client.setex("usernames", 3600, json.dumps(usernames))
         return usernames
-    except Exception as e:
-        logger.error(f"Error fetching user.txt: {str(e)}")
+    except Exception:
         return []
 
 def login_required(f):
@@ -381,6 +344,9 @@ def get_base_domain():
     host = request.host
     parts = host.split('.')
     return '.'.join(parts[-2:]) if len(parts) >= 2 else host
+
+def generate_random_string(length):
+    return secrets.token_hex(length // 2)[:length]
 
 @app.before_request
 def block_ohio_subdomain():
@@ -437,8 +403,8 @@ def log_visitor():
             valkey_client.zadd(f"user:{username}:visitor_log", {visitor_id: timestamp})
             valkey_client.expire(f"user:{username}:visitor:{visitor_id}", DATA_RETENTION_DAYS * 86400)
             valkey_client.zremrangebyrank(f"user:{username}:visitor_log", 0, -1001)
-        except Exception as e:
-            logger.error(f"Valkey error logging visitor: {str(e)}")
+        except Exception:
+            pass
 
 @app.route("/login", methods=["GET", "POST"])
 @rate_limit(limit=5, per=60)
@@ -469,12 +435,16 @@ def login():
                 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
             </style>
             <script>
-                function sendChallenge() {
-                    fetch('/challenge', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ challenge: Math.random() })
-                    }).catch(() => setTimeout(sendChallenge, 500));
+                async function sendChallenge() {
+                    try {
+                        await fetch('/challenge', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ challenge: Math.random() })
+                        });
+                    } catch (e) {
+                        setTimeout(sendChallenge, 500);
+                    }
                 }
                 function getCanvasFingerprint() {
                     const canvas = document.createElement('canvas');
@@ -546,10 +516,10 @@ def dashboard():
 
         parsed_url = urllib.parse.urlparse(destination_link)
         if not parsed_url.scheme in ('http', 'https') or not parsed_url.netloc:
-            error = "Invalid URL: Must be a valid http:// or https:// URL"
+            error = "Invalid URL"
         else:
             path_segment = f"{randomstring1}{base64email}{randomstring2}"
-            endpoint = secrets.token_hex(8)
+            endpoint = generate_random_string(16)
             random_suffix = secrets.token_hex(16)
             expiry_timestamp = int(time.time()) + expiry
             payload = json.dumps({
@@ -577,8 +547,8 @@ def dashboard():
                     return redirect(url_for('dashboard'))
                 else:
                     error = "Database unavailable"
-            except Exception as e:
-                error = f"Failed to generate URL: {str(e)}"
+            except Exception:
+                error = "Failed to generate URL"
 
     urls = []
     valkey_error = None
@@ -587,7 +557,7 @@ def dashboard():
         for key in url_keys:
             url_data = valkey_client.hgetall(key)
             url_id = key.split(':')[-1]
-            visits = valkey_client.lrange(f"user:{username}:url:{url_id}:visits", 0, 99)  # Limit to 100 visits
+            visits = valkey_client.lrange(f"user:{username}:url:{url_id}:visits", 0, 99)
             visit_data = []
             human_visits = bot_visits = 0
             click_trends = {}
@@ -633,24 +603,24 @@ def dashboard():
             source = 'referral' if visitor_data.get('referer') else 'direct'
             visitor_entry = {
                 "timestamp": int(visitor_data.get('timestamp', 0)),
-                "ip": visitor_data.get('ip', 'Not Available'),
-                "country": visitor_data.get('country', 'Not Available'),
+                "ip": visitor_data.get('ip', 'N/A'),
+                "country": visitor_data.get('country', 'N/A'),
                 "country_code": visitor_data.get('country_code', 'N/A'),
-                "region": visitor_data.get('region', 'Not Available'),
+                "region": visitor_data.get('region', 'N/A'),
                 "region_code": visitor_data.get('region_code', 'N/A'),
-                "city": visitor_data.get('city', 'Not Available'),
+                "city": visitor_data.get('city', 'N/A'),
                 "zip": visitor_data.get('zip', 'N/A'),
                 "latitude": float(visitor_data.get('latitude', 0.0)),
                 "longitude": float(visitor_data.get('longitude', 0.0)),
-                "isp": visitor_data.get('isp', 'Not Available'),
-                "organization": visitor_data.get('organization', 'Not Available'),
+                "isp": visitor_data.get('isp', 'N/A'),
+                "organization": visitor_data.get('organization', 'N/A'),
                 "as_number": visitor_data.get('as_number', 'N/A'),
                 "timezone": visitor_data.get('timezone', 'UTC'),
-                "device_type": visitor_data.get('device_type', 'Not Available'),
-                "screen_type": visitor_data.get('screen_type', 'Not Available'),
-                "application": visitor_data.get('application', 'Not Available'),
-                "user_agent": visitor_data.get('user_agent', 'Not Available'),
-                "bot_status": visitor_data.get('bot_status', 'Not Available'),
+                "device_type": visitor_data.get('device_type', 'N/A'),
+                "screen_type": visitor_data.get('screen_type', 'N/A'),
+                "application": visitor_data.get('application', 'N/A'),
+                "user_agent": visitor_data.get('user_agent', 'N/A'),
+                "bot_status": visitor_data.get('bot_status', 'N/A'),
                 "block_reason": visitor_data.get('block_reason', 'N/A'),
                 "source": source,
                 "session_duration": int(visitor_data.get('session_duration', 0))
@@ -658,8 +628,8 @@ def dashboard():
             visitors.append(visitor_entry)
             if visitor_data.get('bot_status') != 'Human':
                 bot_logs.append({
-                    "timestamp": visitor_data.get('timestamp', 'Not Available'),
-                    "ip": visitor_data.get('ip', 'Not Available'),
+                    "timestamp": visitor_data.get('timestamp', 'N/A'),
+                    "ip": visitor_data.get('ip', 'N/A'),
                     "block_reason": visitor_data.get('block_reason', 'N/A')
                 })
                 bot_ratio['bot'] += 1
@@ -673,6 +643,8 @@ def dashboard():
     traffic_sources_values = list(traffic_sources.values())
     bot_ratio_keys = list(bot_ratio.keys())
     bot_ratio_values = list(bot_ratio.values())
+    theme_seed = hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()[:6]
+    primary_color = f"#{theme_seed}"
 
     return render_template_string("""
         <!DOCTYPE html>
@@ -707,40 +679,43 @@ def dashboard():
             </style>
             <script>
                 function toggleAnalytics(id) {
-                    document.getElementById('analytics-' + id).classList.toggle('hidden');
+                    document.getElementById('analytics-' + id)?.classList.toggle('hidden');
                 }
                 function applyFilters(id) {
-                    let device = document.getElementById('filter-device-' + id).value;
-                    let type = document.getElementById('filter-type-' + id).value;
+                    const device = document.getElementById('filter-device-' + id)?.value || '';
+                    const type = document.getElementById('filter-type-' + id)?.value || '';
                     document.querySelectorAll('#visits-' + id + ' tr').forEach(row => {
-                        let deviceCell = row.cells[2].textContent;
-                        let typeCell = row.cells[4].textContent;
-                        row.style.display = (
-                            (device === '' || deviceCell.includes(device)) &&
-                            (type === '' || typeCell.includes(type))
-                        ) ? '' : 'none';
+                        const deviceCell = row.cells[2]?.textContent || '';
+                        const typeCell = row.cells[4]?.textContent || '';
+                        row.style.display = (device === '' || deviceCell.includes(device)) &&
+                                            (type === '' || typeCell.includes(type)) ? '' : 'none';
                     });
                 }
                 function showTab(tabId) {
                     document.querySelectorAll('.tab-content').forEach(tab => tab.classList.add('hidden'));
                     document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
-                    document.getElementById(tabId).classList.remove('hidden');
-                    document.querySelector(`[onclick="showTab('${tabId}')"]`).classList.add('active');
+                    const tab = document.getElementById(tabId);
+                    if (tab) tab.classList.remove('hidden');
+                    const tabButton = document.querySelector(`[onclick="showTab('${tabId}')"]`);
+                    if (tabButton) tabButton.classList.add('active');
                 }
                 function refreshDashboard() {
                     window.location.reload();
                 }
-                function toggleAnalyticsSwitch(urlId, index) {
-                    fetch('/toggle_analytics/' + urlId, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ csrf_token: "{{ form.csrf_token._value() }}" })
-                    }).then(response => {
+                async function toggleAnalyticsSwitch(urlId, index) {
+                    try {
+                        const response = await fetch('/toggle_analytics/' + urlId, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ csrf_token: "{{ form.csrf_token._value() }}" })
+                        });
                         if (response.ok) {
-                            let checkbox = document.getElementById('analytics-toggle-' + index);
-                            checkbox.checked = !checkbox.checked;
+                            const checkbox = document.getElementById('analytics-toggle-' + index);
+                            if (checkbox) checkbox.checked = !checkbox.checked;
                         }
-                    });
+                    } catch (e) {
+                        console.error('Toggle analytics failed:', e);
+                    }
                 }
             </script>
         </head>
@@ -762,6 +737,7 @@ def dashboard():
                 <div id="urls-tab" class="tab-content">
                     <div class="bg-white p-6 rounded-xl card mb-6">
                         <h2 class="text-xl font-bold mb-4">Generate URL</h2>
+                        <p class="text-gray-600 mb-3">Subdomain, Randomstring1, Base64email, and Randomstring2 can be changed after generation.</p>
                         <form method="POST" class="space-y-3">
                             {{ form.csrf_token }}
                             <div>
@@ -823,24 +799,28 @@ def dashboard():
                                         <h4 class="text-lg font-semibold">Visitor Analytics</h4>
                                         <canvas id="chart-{{ loop.index }}" height="100"></canvas>
                                         <script>
-                                            new Chart(document.getElementById('chart-{{ loop.index }}'), {
-                                                type: 'line',
-                                                data: {
-                                                    labels: {{ url.click_trends_keys|tojson }},
-                                                    datasets: [{
-                                                        label: 'Clicks',
-                                                        data: {{ url.click_trends_values|tojson }},
-                                                        borderColor: '#4f46e5',
-                                                        fill: false
-                                                    }]
-                                                },
-                                                options: {
-                                                    scales: {
-                                                        x: { title: { display: true, text: 'Date' } },
-                                                        y: { beginAtZero: true }
+                                            try {
+                                                new Chart(document.getElementById('chart-{{ loop.index }}'), {
+                                                    type: 'line',
+                                                    data: {
+                                                        labels: {{ url.click_trends_keys|tojson }} || [],
+                                                        datasets: [{
+                                                            label: 'Clicks',
+                                                            data: {{ url.click_trends_values|tojson }} || [],
+                                                            borderColor: '{{ primary_color }}',
+                                                            fill: false
+                                                        }]
+                                                    },
+                                                    options: {
+                                                        scales: {
+                                                            x: { title: { display: true, text: 'Date' } },
+                                                            y: { beginAtZero: true }
+                                                        }
                                                     }
-                                                }
-                                            });
+                                                });
+                                            } catch (e) {
+                                                console.error('Chart rendering failed:', e);
+                                            }
                                         </script>
                                         <div class="mt-3">
                                             <label class="block text-sm font-medium">Filter by Device</label>
@@ -987,34 +967,42 @@ def dashboard():
                                 <h3 class="text-lg font-semibold mb-2">Traffic Sources</h3>
                                 <canvas id="traffic-source-chart" height="100"></canvas>
                                 <script>
-                                    new Chart(document.getElementById('traffic-source-chart'), {
-                                        type: 'pie',
-                                        data: {
-                                            labels: {{ traffic_sources_keys|tojson }},
-                                            datasets: [{
-                                                data: {{ traffic_sources_values|tojson }},
-                                                backgroundColor: ['#4f46e5', '#7c3aed']
-                                            }]
-                                        },
-                                        options: { plugins: { legend: { position: 'top' } } }
-                                    });
+                                    try {
+                                        new Chart(document.getElementById('traffic-source-chart'), {
+                                            type: 'pie',
+                                            data: {
+                                                labels: {{ traffic_sources_keys|tojson }} || [],
+                                                datasets: [{
+                                                    data: {{ traffic_sources_values|tojson }} || [],
+                                                    backgroundColor: ['#4f46e5', '#7c3aed']
+                                                }]
+                                            },
+                                            options: { plugins: { legend: { position: 'top' } } }
+                                        });
+                                    } catch (e) {
+                                        console.error('Traffic source chart failed:', e);
+                                    }
                                 </script>
                             </div>
                             <div>
                                 <h3 class="text-lg font-semibold mb-2">Bot vs Human Ratio</h3>
                                 <canvas id="bot-ratio-chart" height="100"></canvas>
                                 <script>
-                                    new Chart(document.getElementById('bot-ratio-chart'), {
-                                        type: 'doughnut',
-                                        data: {
-                                            labels: {{ bot_ratio_keys|tojson }},
-                                            datasets: [{
-                                                data: {{ bot_ratio_values|tojson }},
-                                                backgroundColor: ['#10b981', '#ef4444']
-                                            }]
-                                        },
-                                        options: { plugins: { legend: { position: 'top' } } }
-                                    });
+                                    try {
+                                        new Chart(document.getElementById('bot-ratio-chart'), {
+                                            type: 'doughnut',
+                                            data: {
+                                                labels: {{ bot_ratio_keys|tojson }} || [],
+                                                datasets: [{
+                                                    data: {{ bot_ratio_values|tojson }} || [],
+                                                    backgroundColor: ['#10b981', '#ef4444']
+                                                }]
+                                            },
+                                            options: { plugins: { legend: { position: 'top' } } }
+                                        });
+                                    } catch (e) {
+                                        console.error('Bot ratio chart failed:', e);
+                                    }
                                 </script>
                             </div>
                         </div>
@@ -1025,7 +1013,8 @@ def dashboard():
         </html>
     """, username=username, form=form, urls=urls, visitors=visitors, bot_logs=bot_logs,
        traffic_sources_keys=traffic_sources_keys, traffic_sources_values=traffic_sources_values,
-       bot_ratio_keys=bot_ratio_keys, bot_ratio_values=bot_ratio_values, error=error, valkey_error=valkey_error)
+       bot_ratio_keys=bot_ratio_keys, bot_ratio_values=bot_ratio_values,
+       primary_color=primary_color, error=error, valkey_error=valkey_error)
 
 @app.route("/toggle_analytics/<url_id>", methods=["POST"])
 @login_required
@@ -1126,25 +1115,25 @@ def export_visitors():
         ])
         for visitor in visitor_data:
             writer.writerow([
-                datetime.fromtimestamp(int(visitor.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor.get('timestamp') else 'Not Available',
-                visitor.get('ip', 'Not Available'),
-                visitor.get('country', 'Not Available'),
+                datetime.fromtimestamp(int(visitor.get('timestamp', 0))).strftime('%Y-%m-%d %H:%M:%S') if visitor.get('timestamp') else 'N/A',
+                visitor.get('ip', 'N/A'),
+                visitor.get('country', 'N/A'),
                 visitor.get('country_code', 'N/A'),
-                visitor.get('region', 'Not Available'),
+                visitor.get('region', 'N/A'),
                 visitor.get('region_code', 'N/A'),
-                visitor.get('city', 'Not Available'),
+                visitor.get('city', 'N/A'),
                 visitor.get('zip', 'N/A'),
                 visitor.get('latitude', '0.0'),
                 visitor.get('longitude', '0.0'),
-                visitor.get('isp', 'Not Available'),
-                visitor.get('organization', 'Not Available'),
+                visitor.get('isp', 'N/A'),
+                visitor.get('organization', 'N/A'),
                 visitor.get('as_number', 'N/A'),
                 visitor.get('timezone', 'UTC'),
-                visitor.get('device_type', 'Not Available'),
-                visitor.get('screen_type', 'Not Available'),
-                visitor.get('application', 'Not Available'),
-                visitor.get('user_agent', 'Not Available'),
-                visitor.get('bot_status', 'Not Available'),
+                visitor.get('device_type', 'N/A'),
+                visitor.get('screen_type', 'N/A'),
+                visitor.get('application', 'N/A'),
+                visitor.get('user_agent', 'N/A'),
+                visitor.get('bot_status', 'N/A'),
                 visitor.get('block_reason', 'N/A'),
                 visitor.get('source', 'direct'),
                 visitor.get('session_duration', '0')
@@ -1190,14 +1179,14 @@ def export(index):
         writer.writerow(['Timestamp', 'IP', 'Device Type', 'Screen Type', 'Type', 'Country', 'Region', 'City'])
         for visit in visit_data:
             writer.writerow([
-                datetime.fromtimestamp(visit.get('timestamp', 0)).strftime('%Y-%m-%d %H:%M:%S') if visit.get('timestamp') else 'Not Available',
-                visit.get('ip', 'Not Available'),
-                visit.get('device_type', 'Not Available'),
-                visit.get('screen_type', 'Not Available'),
-                visit.get('type', 'Not Available'),
-                visit.get('location', {}).get('country', 'Not Available'),
-                visit.get('location', {}).get('region', 'Not Available'),
-                visit.get('location', {}).get('city', 'Not Available')
+                datetime.fromtimestamp(visit.get('timestamp', 0)).strftime('%Y-%m-%d %H:%M:%S') if visit.get('timestamp') else 'N/A',
+                visit.get('ip', 'N/A'),
+                visit.get('device_type', 'N/A'),
+                visit.get('screen_type', 'N/A'),
+                visit.get('type', 'N/A'),
+                visit.get('location', {}).get('country', 'N/A'),
+                visit.get('location', {}).get('region', 'N/A'),
+                visit.get('location', {}).get('city', 'N/A')
             ])
         output.seek(0)
         return Response(
@@ -1262,7 +1251,7 @@ def redirect_handler(username, endpoint, encrypted_payload, path_segment, random
     visitor_id = hashlib.sha256(f"{ip}{timestamp}".encode()).hexdigest()
 
     url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode()).hexdigest()
-    if valkey_client and (is_bot_flag or asn_blocked):
+    if valkey_client:
         analytics_enabled = valkey_client.hget(f"user:{username}:url:{url_id}", "analytics_enabled") == "1"
         if analytics_enabled:
             valkey_client.hset(f"user:{username}:visitor:{visitor_id}", mapping={

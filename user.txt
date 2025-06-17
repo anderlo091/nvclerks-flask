@@ -13,3 +13,6 @@ jumper
 nailo
 trainer
 reflect
+newt
+newm
+newz

